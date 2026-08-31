@@ -1,3 +1,7 @@
+# 스크립트 위치
+https://github.com/LH-GWAN/whs-project
+여기있는 final integration 폴더에 있다
+
 # GPS Tracer
 
 블랙박스 영상(AVI/MP4)에서 GPS·속도·G센서 메타데이터를 추출해 지도와 그래프로
@@ -303,10 +307,3 @@ Land Rover `20250901_215728D`의 GPS 수신 36개(끊김 24개)는 엔진 README
 - 재열람이 엔진 재실행 없이 동일 결과, **원본 파일 삭제 후에도** 조회 가능
 - 실제 샘플로 PDF 리포트 생성 (133KB)
 - 얼린 exe에서 실제 fragmented MP4 추출
-
-### 아직 확인 못 한 것
-
-- **화면에 실제로 보이는 모습** — 개발 환경이 헤드리스라 지도/UI의 시각적 확인 불가.
-  실제 디스플레이가 있는 Windows에서 봐야 한다.
-- **Windows exe 실물** — PyInstaller는 크로스 컴파일을 지원하지 않는다.
-  빌드 설정은 macOS에서 실제로 얼려 검증했다(엔진 실행·지도 자산 번들 포함).
