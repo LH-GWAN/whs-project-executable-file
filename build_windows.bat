@@ -1,52 +1,97 @@
 @echo off
 REM ============================================================
-REM  GPS Tracer - Windows exe 빌드 스크립트
+REM  GPS Tracer - Windows exe build script
 REM
-REM  ※ 반드시 Windows에서 실행할 것. PyInstaller는 크로스 컴파일을
-REM     지원하지 않아서 Windows exe는 Windows에서만 만들 수 있다.
+REM  NOTE: This file is intentionally ASCII-only. Korean text in a
+REM  .bat breaks under CP949 consoles and mangled bytes can be parsed
+REM  as commands. See BUILD.md for the Korean guide.
 REM
-REM  사전 준비: Python 3.11 또는 3.12 (64bit) 설치
-REM             https://www.python.org/downloads/windows/
-REM             설치 시 "Add python.exe to PATH" 체크
+REM  Requires: Python 3.11 or 3.12 (64-bit), "Add python.exe to PATH"
+REM            https://www.python.org/downloads/windows/
 REM ============================================================
 
 setlocal
 cd /d "%~dp0"
 
+where python >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Python not found on PATH.
+    echo         Install Python 3.12 64-bit and check
+    echo         "Add python.exe to PATH" during setup.
+    echo.
+    pause
+    exit /b 1
+)
+
 echo.
-echo [1/4] 가상환경 준비...
-if not exist ".venv\" (
+echo [1/5] Creating virtual environment...
+if not exist ".venv\Scripts\python.exe" (
     python -m venv .venv
     if errorlevel 1 goto :error
 )
 call .venv\Scripts\activate.bat
 
 echo.
-echo [2/4] 의존성 설치...
+echo [2/5] Installing dependencies...
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 if errorlevel 1 goto :error
 
-echo.
-echo [3/4] 이전 빌드 정리...
-if exist "build\" rmdir /s /q build
-if exist "dist\"  rmdir /s /q dist
+if not exist "assets\korea.pmtiles" (
+    echo.
+    echo [WARN] assets\korea.pmtiles not found ^(about 371 MB^).
+    echo        The app still works, but the map will show the GPS track
+    echo        on a blank background instead of real roads.
+    echo        See assets\README.md to create it.
+    echo.
+    choice /c YN /t 10 /d Y /m "Continue without the basemap (auto-yes in 10s)"
+    if errorlevel 2 exit /b 1
+)
 
 echo.
-echo [4/4] exe 빌드 중... (수 분 소요)
+echo [3/5] Cleaning previous build...
+if exist "build\" rmdir /s /q build
+if exist "dist\"  rmdir /s /q dist
+if exist "GPSTracer.lnk" del /q "GPSTracer.lnk"
+
+echo.
+echo [4/5] Building exe (this takes a few minutes)...
 pyinstaller gpstracer.spec --noconfirm
 if errorlevel 1 goto :error
 
+if not exist "dist\GPSTracer\GPSTracer.exe" (
+    echo.
+    echo [ERROR] Build finished but GPSTracer.exe was not found.
+    echo         Check the PyInstaller output above.
+    pause
+    exit /b 1
+)
+
+echo.
+echo [5/5] Creating shortcut in this folder...
+REM The exe cannot be moved out of dist\GPSTracer on its own: a one-dir
+REM build needs the _internal folder sitting right next to it. So we put
+REM a shortcut here instead - double-click it and the app starts.
+set "APPDIR=%CD%\dist\GPSTracer"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%CD%\GPSTracer.lnk');$s.TargetPath='%APPDIR%\GPSTracer.exe';$s.WorkingDirectory='%APPDIR%';$s.Description='GPS Tracer';$s.Save()"
+if not exist "GPSTracer.lnk" (
+    echo [WARN] Could not create the shortcut.
+    echo        Run the app directly: dist\GPSTracer\GPSTracer.exe
+)
+
 echo.
 echo ============================================================
-echo  빌드 완료
+echo  BUILD OK
 echo.
-echo  결과물 : dist\GPSTracer\GPSTracer.exe
+echo  To run : double-click GPSTracer.lnk in this folder.
 echo.
-echo  배포할 때는 GPSTracer.exe 하나가 아니라 dist\GPSTracer\
-echo  폴더 전체를 통째로 옮겨야 한다(one-dir 방식).
-echo  exe 옆의 _internal\ 폴더에 Qt 라이브러리와 분석 엔진이
-echo  들어 있어서, exe만 떼어내면 실행되지 않는다.
+echo  Real exe : dist\GPSTracer\GPSTracer.exe
+echo.
+echo  To ship: copy the WHOLE dist\GPSTracer folder, not just the
+echo           exe. The _internal folder next to the exe holds Qt,
+echo           the analysis engine and the offline basemap.
+echo           The shortcut only works on this machine.
 echo ============================================================
 echo.
 pause
@@ -54,6 +99,6 @@ exit /b 0
 
 :error
 echo.
-echo *** 빌드 실패 - 위 오류 메시지를 확인하세요 ***
+echo *** BUILD FAILED - see the error message above ***
 pause
 exit /b 1

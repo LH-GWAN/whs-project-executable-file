@@ -63,6 +63,10 @@ class SpeedChartWidget(QWidget):
             x1 = x_for(seg.end_index)
             painter.drawRect(QRectF(x0, plot.top(), max(2.0, x1 - x0), plot.height()))
 
+        # drawPath는 현재 브러시로 경로 내부까지 칠한다. 위에서 급가속 구간을 칠하려고
+        # 세워둔 브러시를 그대로 두면 속도 곡선 아래가 통째로 빨갛게 채워진다.
+        painter.setBrush(Qt.NoBrush)
+
         path = QPainterPath()
         started = False
         saw_dropout = False

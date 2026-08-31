@@ -19,7 +19,19 @@ pip install -r requirements.txt
 pyinstaller gpstracer.spec --noconfirm
 ```
 
-결과물: `dist\GPSTracer\GPSTracer.exe`
+결과물:
+- **`GPSTracer.lnk`** — 프로젝트 폴더에 바로 생기는 실행 바로가기. **이걸 더블클릭**하면 실행된다.
+- `dist\GPSTracer\GPSTracer.exe` — 실제 실행파일
+
+### exe를 폴더 밖으로 옮길 수 없는 이유
+
+one-dir 방식이라 **exe 옆에 `_internal\` 폴더가 반드시 같이 있어야** 한다
+(Qt 라이브러리·분석 엔진·오프라인 지도 약 896MB). exe만 떼면 실행되지 않는다.
+그래서 exe는 `dist\GPSTracer\`에 두고, 폴더 루트에는 바로가기만 만든다.
+
+**바로가기는 이 PC에서만 동작한다** — 절대 경로를 가리키므로 다른 PC로 복사해도
+소용없다. 배포할 때는 `dist\GPSTracer\` 폴더 전체를 옮기고, 받는 쪽에서
+`GPSTracer.exe`를 직접 실행하거나 바탕화면 바로가기를 새로 만들면 된다.
 
 ### ⚠ 배포 시 주의
 **exe 파일 하나만 떼어내면 실행되지 않는다.** `dist\GPSTracer\` **폴더 전체**를
