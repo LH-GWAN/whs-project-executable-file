@@ -38,12 +38,13 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 if errorlevel 1 goto :error
 
-if not exist "assets\korea.pmtiles" (
+dir /b "assets\*.pmtiles" >nul 2>&1
+if errorlevel 1 (
     echo.
-    echo [WARN] assets\korea.pmtiles not found ^(about 371 MB^).
+    echo [WARN] No .pmtiles basemap found in assets\.
     echo        The app still works, but the map will show the GPS track
     echo        on a blank background instead of real roads.
-    echo        See assets\README.md to create it.
+    echo        See assets\README.md to create one.
     echo.
     choice /c YN /t 10 /d Y /m "Continue without the basemap (auto-yes in 10s)"
     if errorlevel 2 exit /b 1

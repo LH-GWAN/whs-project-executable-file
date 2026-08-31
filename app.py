@@ -14,7 +14,59 @@ def _ensure_std_streams() -> None:
 _ensure_std_streams()
 
 
+def _diagnose() -> int:
+    import os
+
+    from core.paths import is_frozen, resource_root, vendor_dir
+    from ui.map_server import basemap_path, vendor_dir as web_vendor_dir, web_dir
+
+    print("=" * 60)
+    print("GPS Tracer 진단")
+    print("=" * 60)
+    print(f"실행 형태        : {'exe (frozen)' if is_frozen() else '소스'}")
+    print(f"sys.executable   : {sys.executable}")
+    print(f"리소스 루트      : {resource_root()}")
+    print()
+
+    def show(label, path, is_dir=False):
+        exists = os.path.isdir(path) if is_dir else os.path.isfile(path)
+        mark = "OK  " if exists else "없음"
+        size = ""
+        if exists and not is_dir:
+            size = f"  ({os.path.getsize(path) / (1024 * 1024):.1f} MB)"
+        print(f"  [{mark}] {label}{size}")
+        print(f"         {path}")
+        return exists
+
+    print("분석 엔진")
+    show("integration_blackbox.py", os.path.join(vendor_dir(), "integration_blackbox.py"))
+    show("integration_avi.py", os.path.join(vendor_dir(), "integration_avi.py"))
+    show("integration_mp4.py", os.path.join(vendor_dir(), "integration_mp4.py"))
+    print()
+
+    print("지도")
+    show("map.html", os.path.join(web_dir(), "map.html"))
+    show("maplibre-gl.js", os.path.join(web_vendor_dir(), "maplibre-gl.js"))
+    bm = basemap_path()
+    expected = os.path.join(resource_root(), "assets", "(*.pmtiles 없음)")
+    if bm:
+        show(f"배경지도 {os.path.basename(bm)}", bm)
+        print("\n  -> 배경지도가 인식됩니다. 지도에 도로/건물이 표시됩니다.")
+    else:
+        show("배경지도 (assets 안 .pmtiles 파일)", expected)
+        print("\n  -> 배경지도가 없어 궤적만 표시됩니다(정상 동작).")
+        print("     이 파일은 371MB라 GitHub(파일당 100MB 제한)에 올릴 수 없어")
+        print("     .gitignore로 제외돼 있습니다. git pull로는 절대 받아지지 않으니")
+        print("     USB/클라우드로 위 경로에 직접 넣고 다시 빌드하세요.")
+        print("     만드는 방법은 assets/README.md 참고.")
+    print("=" * 60)
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--diagnose":
+        return _diagnose()
+
     if len(sys.argv) >= 2 and sys.argv[1] == "--run-engine":
         if len(sys.argv) < 4:
             print(

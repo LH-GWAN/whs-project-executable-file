@@ -26,9 +26,9 @@ web_datas = [
     (os.path.join("ui", "vendor", "pmtiles.js"), os.path.join("ui", "vendor")),
 ]
 
-basemap_src = os.path.join("assets", "korea.pmtiles")
-if os.path.isfile(basemap_src):
-    web_datas.append((basemap_src, "assets"))
+import glob as _glob
+for _bm in _glob.glob(os.path.join("assets", "*.pmtiles")):
+    web_datas.append((_bm, "assets"))
 
 a = Analysis(
     ["app.py"],
