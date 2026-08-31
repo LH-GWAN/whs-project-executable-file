@@ -122,6 +122,7 @@ class _Handler(BaseHTTPRequestHandler):
 class MapServer:
 
     _instance: Optional["MapServer"] = None
+    _lock = threading.Lock()
 
     def __init__(self):
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
@@ -133,9 +134,17 @@ class MapServer:
 
     @classmethod
     def instance(cls) -> "MapServer":
-        if cls._instance is None:
-            cls._instance = MapServer()
-        return cls._instance
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = MapServer()
+            return cls._instance
+
+    @classmethod
+    def shutdown_if_running(cls) -> None:
+        with cls._lock:
+            if cls._instance is not None:
+                cls._instance.shutdown()
+                cls._instance = None
 
     @property
     def base_url(self) -> str:

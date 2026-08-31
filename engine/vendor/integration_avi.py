@@ -11,7 +11,11 @@ import struct
 import sys
 from dataclasses import dataclass, field
 
-if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
+# PyInstaller windowed(console=False) 빌드나 pythonw에서는 sys.stdout이 아예
+# None이다. 여기서 .encoding을 바로 읽으면 import 단계에서 AttributeError로
+# 죽고, 콘솔이 없어 트레이스백조차 안 보인다.
+if sys.stdout is not None and (
+        sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -2016,8 +2020,38 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if not args.dry_run:
         os.makedirs(args.output, exist_ok=True)
+
+    # 파일 하나가 죽어도 나머지는 계속 처리한다(integration_mp4.py와 같은 방식).
+    # 앞쪽 손상 파일 하나 때문에 배치 전체가 안 돌아가는 걸 막기 위함.
+    results = []
     for input_path in args.inputs:
-        process_single_file(input_path, args.output, args)
+        name = os.path.basename(input_path)
+        if not os.path.isfile(input_path):
+            info(f"[SKIP] {input_path}: 파일을 찾을 수 없음")
+            results.append((name, "파일을 찾을 수 없음"))
+            continue
+        try:
+            process_single_file(input_path, args.output, args)
+            results.append((name, None))
+        except SystemExit as exc:
+            # assert_riff_file 등이 sys.exit()으로 빠져나온다. 여기서 잡아야
+            # 배치의 나머지 파일이 같이 죽지 않는다.
+            results.append((name, f"처리 중단 (종료 코드 {exc.code})"))
+            warn(f"{name}: 처리 중단 (종료 코드 {exc.code})")
+        except Exception as exc:
+            results.append((name, f"예외: {exc}"))
+            warn(f"{name}: 예외 발생으로 처리 중단: {exc}")
+
+    if len(results) > 1:
+        info("\n" + "=" * 70)
+        info("[전체 요약]")
+        for name, err in results:
+            info(f"  {'OK  ' if err is None else 'FAIL'} {name:44}"
+                 f"{'' if err is None else '  ' + err}")
+        info("=" * 70)
+
+    if results and all(err is not None for _, err in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

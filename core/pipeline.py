@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ from core import acceleration, duration as duration_mod, format_sniffer, hashing
 from core.acceleration import FlaggedSegment
 from core.format_sniffer import RoutingResult
 from engine.engine_adapter import (
+    CancelledError,
     ExtractionResult,
     TrackPoint,
     load_existing_results,
@@ -53,14 +55,21 @@ def run_analysis_pipeline(
     accel_threshold_mps2: float = acceleration.DEFAULT_THRESHOLD_MPS2,
     carve_slack: bool = False,
     progress_cb: ProgressCallback = None,
+    cancel_event=None,
 ) -> PipelineResult:
     def report(msg: str) -> None:
         if progress_cb:
             progress_cb(msg)
 
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("분석이 취소되었습니다.")
+
+    check_cancelled()
     report("파일 해시 계산 중 (SHA-256)...")
     sha256 = hashing.sha256_file(video_path)
 
+    check_cancelled()
     report("파일 형식 확인 중...")
     routing = format_sniffer.sniff(video_path)
 
@@ -84,15 +93,29 @@ def run_analysis_pipeline(
     os.makedirs(source_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
+    check_cancelled()
     report("원본 영상을 사건 폴더로 복사 중 (무결성 보존)...")
     source_copy_path = os.path.join(source_dir, os.path.basename(video_path))
-    shutil.copy2(video_path, source_copy_path)
+    try:
+        shutil.copy2(video_path, source_copy_path)
+    except BaseException:
+        history_store.delete_case(case_id)
+        raise
 
     report("GPS/센서 메타데이터 추출 중..." + (" (슬랙 카빙 포함)" if carve_slack else ""))
-    extraction = run_full_extraction(video_path, output_dir, slack=carve_slack)
+    # 여기서부터 실패하거나 취소되면 방금 만든 사건 레코드를 되돌린다 -
+    # 안 그러면 output_folder가 빈 고아 레코드가 History에 그대로 쌓인다.
+    try:
+        extraction = run_full_extraction(source_copy_path, output_dir, slack=carve_slack,
+                                         cancel_event=cancel_event)
+    except BaseException:
+        history_store.delete_case(case_id)
+        shutil.rmtree(case_folder, ignore_errors=True)
+        raise
 
     report("영상 길이 계산 중...")
-    dur = duration_mod.get_duration_sec(video_path, routing.container, engine_output_dir=output_dir)
+    dur = duration_mod.get_duration_sec(source_copy_path, routing.container,
+                                        engine_output_dir=output_dir)
 
     report("급가속 구간 분석 중...")
     flagged = acceleration.compute_flagged_segments(extraction.points, accel_threshold_mps2)
@@ -119,7 +142,8 @@ def run_analysis_pipeline(
         )
 
     history_store.update_case_extraction(
-        case_id, duration_sec=dur, avi_repaired=False, output_folder=output_dir,
+        case_id, duration_sec=dur, avi_repaired=_avi_was_repaired(output_dir),
+        output_folder=output_dir,
     )
 
     report("완료")
@@ -167,6 +191,10 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
     )
 
 
+def _avi_was_repaired(output_dir: str) -> bool:
+    return bool(glob.glob(os.path.join(output_dir, "**", "*_wo_slack.avi"), recursive=True))
+
+
 def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
                       routing, extraction: ExtractionResult, dur, settings, flagged,
                       carve_slack) -> None:
@@ -180,6 +208,10 @@ def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_pa
             "source_video_filename": os.path.basename(video_path),
             "source_video_sha256": sha256,
             "detected_format": routing.container,
+            "avi_repaired": _avi_was_repaired(os.path.join(case_folder, "engine_output")),
+            "status": extraction.status,
+            "status_detail": extraction.status_detail,
+            "slack_point_count": len(extraction.slack_points),
             "extension_mismatch": routing.extension_mismatch,
             "engine": "integration_blackbox",
             "slack_carving": carve_slack,

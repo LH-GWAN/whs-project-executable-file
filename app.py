@@ -1,6 +1,17 @@
 from __future__ import annotations
 
+import io
 import sys
+
+
+def _ensure_std_streams() -> None:
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, io.TextIOWrapper(
+                io.BytesIO(), encoding="utf-8", errors="replace", write_through=True))
+
+
+_ensure_std_streams()
 
 
 def main() -> int:

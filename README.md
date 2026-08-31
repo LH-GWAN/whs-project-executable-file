@@ -198,10 +198,11 @@ Report 버튼 → report.report_builder → PDF
 
 단, `detect_container()`처럼 `sys.exit()`을 부르지 않는 순수 함수는 직접 import해도 안전하다.
 
-### 2. `engine/vendor/`는 수정하지 말 것
+### 2. `engine/vendor/`는 직접 수정하지 말 것
 
-원본 저장소에서 그대로 가져온 파일이다. 여기를 고치면 원본과 갈라져 다음 갱신 때
-충돌한다. 갱신 절차와 확인 항목은 [`engine/vendor/README_VENDOR.md`](engine/vendor/README_VENDOR.md) 참고.
+원본 저장소(`../whs-project/`)에서 그대로 가져온 파일이다. 여기만 고치면 원본과
+갈라져 다음 갱신 때 충돌한다. **엔진 버그는 원본 저장소에서 고치고 vendor로
+복사**해서 두 곳이 항상 바이트 동일하게 유지한다(`diff -q`로 확인). 갱신 절차와 확인 항목은 [`engine/vendor/README_VENDOR.md`](engine/vendor/README_VENDOR.md) 참고.
 
 특히 **엔진 갱신 시 `gpstracer.spec`의 `hiddenimports`를 반드시 다시 확인**해야 한다.
 vendor는 데이터 파일로 번들되어 PyInstaller의 정적 분석 대상이 아니라서, 엔진이 새로
@@ -275,6 +276,36 @@ OpenMapTiles의 `transportation` / `building` 이 **아니다**.
 
 수천~수만 지점이 나오므로 급가속 구간을 우선 포함하고 나머지는 앞부분 일부만 싣는다
 (최대 200행). 원본 전체는 `engine_output/`의 CSV에 그대로 보존돼 있다.
+
+
+### 11. 엔진 실패는 종료 코드로 알 수 없다
+
+`integration_blackbox.main()`은 하위 스크립트의 예외를 잡아 요약만 찍고 `None`을
+반환한다. 모든 파일이 SKIP돼도 프로세스 종료 코드는 0이다. 그래서
+`engine_adapter._classify_outcome()`은 종료 코드가 아니라 **산출물**로 판정한다:
+좌표가 있으면 정상, 좌표는 없지만 다른 산출물이 있으면 이 영상에 GPS가 없는 것,
+산출물이 아예 없으면 엔진 실패. `ExtractionResult.status`로 UI에 노출된다.
+
+### 12. 슬랙 카빙 결과는 본 궤적과 절대 합치지 않는다
+
+`--slack`으로 나오는 `slack_coordinates.csv`는 **과거 녹화분**이라 현재 영상의
+재생 시각이 없다(sample table 밖 영역이라 절대 offset만 남는다). 지도·타임라인·
+재생 동기화에 쓰면 안 되므로 `ExtractionResult.slack_points`에 따로 담는다.
+
+### 13. G센서는 개별 축이 아니라 합력으로 본다
+
+엔진의 자가 보정(`*_g_cal`)은 크기만 맞추고 **장착 각도는 보정하지 않는다**.
+어느 축이 진행 방향인지 모르므로 개별 축값은 기기 간 비교 기준이 못 된다.
+`TrackPoint.g_magnitude`는 방향과 무관한 합력(√(x²+y²+z²))을 쓴다 —
+정상 주행이면 중력 때문에 1g 근처로 나온다(실측 0.69~1.41g).
+
+### 14. PyInstaller windowed 빌드에서는 sys.stdout이 None이다
+
+vendor 엔진 세 파일 모두 `sys.stdout.encoding`을 None 검사 없이 읽는다.
+`console=False` 빌드에서 GUI 프로세스가 `format_sniffer` → `integration_blackbox`를
+import하는 순간 `AttributeError`로 죽고, 콘솔이 없어 트레이스백도 안 보인다.
+vendor는 수정하지 않는 원칙이라 `app.py`의 `_ensure_std_streams()`가 import 전에
+더미 스트림을 채워 방어한다. **이 함수를 지우면 exe가 안 켜진다.**
 
 ---
 

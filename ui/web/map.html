@@ -280,7 +280,7 @@ function boot() {
     style: EMPTY_STYLE,
     center: [127.0, 37.5],
     zoom: 10,
-    attributionControl: false,
+    attributionControl: { compact: true },
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
   map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }));

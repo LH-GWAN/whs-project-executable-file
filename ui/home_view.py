@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -70,7 +70,7 @@ class HomeView(QWidget):
             self.video_selected.emit(path)
 
     def _on_history_double_clicked(self, item: QListWidgetItem) -> None:
-        case_id = item.data(1)
+        case_id = item.data(Qt.UserRole)
         if case_id is not None:
             self.history_item_opened.emit(case_id)
 
@@ -79,5 +79,5 @@ class HomeView(QWidget):
         for case in cases:
             label = f"{case.case_number} - {case.source_video_filename} ({case.created_at})"
             item = QListWidgetItem(label)
-            item.setData(1, case.id)
+            item.setData(Qt.UserRole, case.id)
             self._history_list.addItem(item)

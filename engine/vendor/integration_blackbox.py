@@ -16,7 +16,11 @@ import os
 import shlex
 import sys
 
-if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
+# PyInstaller windowed(console=False) 빌드나 pythonw에서는 sys.stdout이 아예
+# None이다. 여기서 .encoding을 바로 읽으면 import 단계에서 AttributeError로
+# 죽고, 콘솔이 없어 트레이스백조차 안 보인다.
+if sys.stdout is not None and (
+        sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")

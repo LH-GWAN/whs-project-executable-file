@@ -24,7 +24,9 @@ def _format_duration(seconds) -> str:
     if seconds is None:
         return "알 수 없음"
     total = int(round(seconds))
-    return f"{total // 60:02d}:{total % 60:02d}"
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
 class AnalysisView(QWidget):
@@ -55,7 +57,7 @@ class AnalysisView(QWidget):
         header_layout.addWidget(report_btn)
         header_layout.addWidget(home_btn)
 
-        self._file_badge = QLabel("MP4")
+        self._file_badge = QLabel("-")
         self._file_name_label = QLabel("")
         self._file_size_label = QLabel("")
         self._duration_label = QLabel("")
@@ -89,6 +91,8 @@ class AnalysisView(QWidget):
         filename = os.path.basename(video_path) if video_path else "-"
         size_bytes = os.path.getsize(video_path) if video_path and os.path.isfile(video_path) else 0
 
+        container = (result.extraction.routing.container or "").upper()
+        self._file_badge.setText(container or "-")
         self._file_name_label.setText(filename)
         self._file_size_label.setText(f"Size : {_format_size(size_bytes)}")
         self._duration_label.setText(f"Duration : {_format_duration(result.duration_sec)}")

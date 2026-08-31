@@ -22,7 +22,9 @@ from ui.map_view import MapView
 
 def _fmt_ms(ms: int) -> str:
     total = max(0, int(ms // 1000))
-    return f"{total // 60:02d}:{total % 60:02d}"
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
 class TrackerTab(QWidget):

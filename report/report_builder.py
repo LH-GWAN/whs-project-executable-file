@@ -18,7 +18,9 @@ def _fmt_duration(seconds: Optional[float]) -> str:
     if seconds is None:
         return "알 수 없음"
     total = int(round(seconds))
-    return f"{total // 60:02d}:{total % 60:02d}"
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
 def _esc(value) -> str:
@@ -34,9 +36,24 @@ def _select_row_indices(records: List[TrackPoint], segments: List[FlaggedSegment
     if len(records) <= max_rows:
         return list(range(len(records)))
 
-    remaining = max(max_rows - len(flagged_indices), 0)
-    head_indices = set(range(min(remaining, len(records))))
-    return sorted(flagged_indices | head_indices)
+    flagged = sorted(flagged_indices)
+    if len(flagged) >= max_rows:
+        step = len(flagged) / max_rows
+        return [flagged[int(i * step)] for i in range(max_rows)]
+
+    remaining = max_rows - len(flagged)
+    stride = max(1, len(records) // remaining)
+    sampled = set(range(0, len(records), stride))
+    combined = sorted(flagged_indices | sampled)
+    if len(combined) <= max_rows:
+        return combined
+
+    keep = set(flagged_indices)
+    for index in combined:
+        if len(keep) >= max_rows:
+            break
+        keep.add(index)
+    return sorted(keep)
 
 
 def render_report_html(pipeline_result: PipelineResult, case_number: str, examiner: str,
@@ -53,11 +70,13 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     prev_index: Optional[int] = None
     for idx in row_indices:
         if prev_index is not None and idx != prev_index + 1:
-            rows_html.append('<tr class="gap"><td colspan="5">...</td></tr>')
+            rows_html.append('<tr class="gap"><td colspan="6">...</td></tr>')
         rec = records[idx]
         row_class = "flagged" if idx in flagged_indices else ""
         time_text = f"{rec.start_time_sec:.2f}" if rec.start_time_sec is not None else "-"
         speed_text = f"{rec.speed_kmh:.1f}" if rec.speed_kmh is not None else "-"
+        g_value = rec.g_magnitude
+        g_text = f"{g_value:.2f}" if g_value is not None else "-"
         if rec.has_fix:
             lat_text, lon_text = f"{rec.latitude:.6f}", f"{rec.longitude:.6f}"
         elif rec.is_dropout:
@@ -71,11 +90,12 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
             f"<td>{_esc(lat_text)}</td>"
             f"<td>{_esc(lon_text)}</td>"
             f"<td>{_esc(speed_text)}</td>"
+            f"<td>{_esc(g_text)}</td>"
             "</tr>"
         )
         prev_index = idx
 
-    body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="5">추출된 좌표가 없습니다.</td></tr>'
+    body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="6">추출된 좌표가 없습니다.</td></tr>'
     extraction = pipeline_result.extraction
     routing = extraction.routing
     video_filename = os.path.basename(pipeline_result.source_copy_path or "")
@@ -112,7 +132,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
 
   <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 급가속 구간 우선)</h2>
   <table>
-    <thead><tr><th>#</th><th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th></tr></thead>
+    <thead><tr><th>#</th><th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th><th>충격(g)</th></tr></thead>
     <tbody>{body_rows}</tbody>
   </table>
 </body></html>

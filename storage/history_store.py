@@ -152,6 +152,10 @@ class HistoryStore:
         )
         self._conn.commit()
 
+    def delete_case(self, case_id: int) -> None:
+        self._conn.execute("DELETE FROM cases WHERE id = ?", (case_id,))
+        self._conn.commit()
+
     def set_report_path(self, case_id: int, report_pdf_path: str) -> None:
         self._conn.execute(
             "UPDATE cases SET report_pdf_path = ? WHERE id = ?", (report_pdf_path, case_id),

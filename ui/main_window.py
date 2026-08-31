@@ -73,10 +73,10 @@ class MainWindow(QMainWindow):
         self._pending_examiner = info.examiner
         self._pending_memo = info.memo
 
-        self._progress = QProgressDialog("분석 준비 중...", None, 0, 0, self)
+        self._progress = QProgressDialog("분석 준비 중...", "취소", 0, 0, self)
         self._progress.setWindowTitle("GPS Tracer")
-        self._progress.setCancelButton(None)
         self._progress.setMinimumDuration(0)
+        self._progress.canceled.connect(self._on_cancel_requested)
         self._progress.show()
 
         self._worker = AnalysisWorker(
@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_ok.connect(self._on_worker_finished)
         self._worker.failed.connect(self._on_worker_failed)
+        self._worker.cancelled.connect(self._on_worker_cancelled)
         self._worker.start()
 
     def _on_worker_progress(self, message: str) -> None:
@@ -103,6 +104,10 @@ class MainWindow(QMainWindow):
         if self._progress is not None:
             self._progress.close()
             self._progress = None
+        extraction = result.extraction
+        if not extraction.succeeded:
+            box = QMessageBox.warning if extraction.status == "no_gps" else QMessageBox.critical
+            box(self, "분석 결과", extraction.status_message)
         self._current_case_id = result.case_id
         self._current_case_number = self._pending_case_number
         self._current_examiner = self._pending_examiner
@@ -110,6 +115,18 @@ class MainWindow(QMainWindow):
         self._current_settings = self._pending_settings
         self._analysis_view.load_result(result, self._pending_case_number, self._pending_settings)
         self._stack.setCurrentWidget(self._analysis_view)
+
+    def _on_cancel_requested(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+        if self._progress is not None:
+            self._progress.setLabelText("취소하는 중...")
+
+    def _on_worker_cancelled(self) -> None:
+        if self._progress is not None:
+            self._progress.close()
+            self._progress = None
+        self._refresh_history()
 
     def _on_worker_failed(self, message: str) -> None:
         if self._progress is not None:
@@ -143,7 +160,9 @@ class MainWindow(QMainWindow):
         )
 
         def on_done(success: bool, error_message: str) -> None:
-            self._report_exporter = None
+            exporter, self._report_exporter = self._report_exporter, None
+            if exporter is not None:
+                exporter.deleteLater()
             if not success:
                 QMessageBox.critical(self, "Report", f"리포트 생성에 실패했습니다: {error_message}")
                 return

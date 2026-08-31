@@ -51,12 +51,15 @@ class MapView(QWidget):
         if not ok:
             return
         self._reload_attempts = 0
-        for script in (self._last_track_js, self._last_time_js):
-            if script:
+        pending = self._pending_js
+        self._pending_js = []
+        if pending:
+            for script in pending:
                 self._view.page().runJavaScript(script)
-        for script in self._pending_js:
-            self._view.page().runJavaScript(script)
-        self._pending_js.clear()
+        else:
+            for script in (self._last_track_js, self._last_time_js):
+                if script:
+                    self._view.page().runJavaScript(script)
 
     def _on_render_process_gone(self, status, exit_code: int) -> None:
         self._loaded = False

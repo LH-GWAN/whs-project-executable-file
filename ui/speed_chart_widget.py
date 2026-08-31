@@ -43,8 +43,15 @@ class SpeedChartWidget(QWidget):
         max_speed = max(speeds) or 1.0
         n = len(self._records)
 
+        times = [r.start_time_sec for r in self._records if r.start_time_sec is not None]
+        t0, t1 = (min(times), max(times)) if times else (0.0, 0.0)
+        span = (t1 - t0) or 1.0
+
         def x_for(i: int) -> float:
-            return plot.left() + plot.width() * (i / max(1, n - 1))
+            t = self._records[i].start_time_sec if 0 <= i < n else None
+            if t is None or not times:
+                return plot.left() + plot.width() * (i / max(1, n - 1))
+            return plot.left() + plot.width() * ((t - t0) / span)
 
         def y_for(v: float) -> float:
             return plot.bottom() - plot.height() * (v / max_speed)
@@ -58,21 +65,26 @@ class SpeedChartWidget(QWidget):
 
         path = QPainterPath()
         started = False
+        saw_dropout = False
         for i, r in enumerate(self._records):
             if r.speed_kmh is None:
+                if r.is_dropout:
+                    saw_dropout = True
                 continue
             x, y = x_for(i), y_for(r.speed_kmh)
-            if not started:
+            if not started or saw_dropout:
                 path.moveTo(x, y)
                 started = True
             else:
                 path.lineTo(x, y)
+            saw_dropout = False
         painter.setPen(QPen(_LINE, 2))
         painter.drawPath(path)
 
         painter.setPen(_AXIS)
         painter.drawText(4, int(plot.top()) + 10, f"{max_speed:.0f} km/h")
         painter.drawText(4, int(plot.bottom()), "0")
-        painter.drawText(plot.left(), self.rect().bottom() - 6, "시작")
-        painter.drawText(plot.right() - 24, self.rect().bottom() - 6, "끝")
+        if times:
+            painter.drawText(plot.left(), self.rect().bottom() - 6, f"{t0:.0f}s")
+            painter.drawText(plot.right() - 30, self.rect().bottom() - 6, f"{t1:.0f}s")
         painter.end()

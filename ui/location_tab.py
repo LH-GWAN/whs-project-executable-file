@@ -13,14 +13,17 @@ from ui.map_view import MapView
 _FLAG_COLOR = QColor(255, 200, 200)
 _DROPOUT_COLOR = QColor(190, 110, 40)
 _NOGPS_COLOR = QColor(170, 170, 170)
+_IMPACT_COLOR = QColor(200, 60, 60)
+_IMPACT_G = 2.0
 
 
 class LocationTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._map = MapView()
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(["시각(초)", "위도", "경도", "속도(km/h)"])
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(
+            ["시각(초)", "위도", "경도", "속도(km/h)", "충격(g)"])
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -76,7 +79,11 @@ class LocationTab(QWidget):
                 lon_item.setForeground(_NOGPS_COLOR)
             speed_item = QTableWidgetItem(
                 f"{rec.speed_kmh:.1f}" if rec.speed_kmh is not None else "-")
-            items = (time_item, lat_item, lon_item, speed_item)
+            g = rec.g_magnitude
+            g_item = QTableWidgetItem(f"{g:.2f}" if g is not None else "-")
+            if g is not None and g >= _IMPACT_G:
+                g_item.setForeground(_IMPACT_COLOR)
+            items = (time_item, lat_item, lon_item, speed_item, g_item)
             if row in flagged_indices:
                 for item in items:
                     item.setBackground(_FLAG_COLOR)
