@@ -18,7 +18,8 @@ def _diagnose() -> int:
     import os
 
     from core.paths import is_frozen, resource_root, vendor_dir
-    from ui.map_server import basemap_path, vendor_dir as web_vendor_dir, web_dir
+    from core.basemap import basemap_path, extract_zipped_basemap
+    from ui.map_server import vendor_dir as web_vendor_dir, web_dir
 
     print("=" * 60)
     print("GPS Tracer 진단")
@@ -47,6 +48,9 @@ def _diagnose() -> int:
     print("지도")
     show("map.html", os.path.join(web_dir(), "map.html"))
     show("maplibre-gl.js", os.path.join(web_vendor_dir(), "maplibre-gl.js"))
+    extracted = extract_zipped_basemap()
+    if extracted:
+        print(f"  [해제] zip에서 지도를 풀었습니다: {os.path.basename(extracted)}")
     bm = basemap_path()
     expected = os.path.join(resource_root(), "assets", "(*.pmtiles 없음)")
     if bm:
@@ -78,6 +82,12 @@ def main() -> int:
         import engine_entry
 
         return engine_entry.run(sys.argv[2], sys.argv[3:])
+
+    # 지도 zip 해제는 Qt를 불러오기 전에 끝낸다. Qt import/초기화가 막히는 환경이
+    # 있는데, 그 뒤에 두면 "지도를 넣었는데 안 나온다"로 조용히 넘어간다.
+    from core.basemap import extract_zipped_basemap
+
+    extract_zipped_basemap()
 
     from PySide6.QtWidgets import QApplication
 

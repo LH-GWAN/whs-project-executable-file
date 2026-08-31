@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFileDialog, QMainWindow, QMessageBox, QProgressDialog, QStackedWidget
 
 from core.pipeline import PipelineResult, reopen_case
 from report.report_builder import ReportExporter, render_report_html
 from storage.history_store import HistoryStore, default_app_data_dir
 from ui.analysis_view import AnalysisView
+from ui.basemap_notice import should_show_notice, show_basemap_notice
 from ui.case_info_dialog import CaseInfoDialog
 from ui.home_view import HomeView
 from ui.workers import AnalysisWorker
@@ -54,6 +56,11 @@ class MainWindow(QMainWindow):
         self._pending_memo: str = ""
 
         self._refresh_history()
+
+        # 배경지도가 없으면 처음 한 번 안내한다. 없어도 분석은 정상 동작하므로
+        # 막는 게 아니라 알려주기만 하고, 사용자가 끄면 다시 띄우지 않는다.
+        if should_show_notice():
+            QTimer.singleShot(0, lambda: show_basemap_notice(self))
 
     def _refresh_history(self) -> None:
         with HistoryStore(self._history_db_path) as store:

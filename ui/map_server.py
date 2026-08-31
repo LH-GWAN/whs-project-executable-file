@@ -6,6 +6,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
+from core.basemap import basemap_path  # noqa: F401  (핸들러가 사용)
 from core.paths import resource_root
 
 _MIME = {
@@ -25,22 +26,6 @@ def web_dir() -> str:
 
 def vendor_dir() -> str:
     return os.path.join(resource_root(), "ui", "vendor")
-
-
-def basemap_path() -> Optional[str]:
-    # 파일명을 korea.pmtiles로 고정하지 않는다. 관할 구역만 잘라 만든 지도
-    # (seoul.pmtiles 등)를 이름 안 바꾸고 그대로 넣을 수 있게 assets 안의
-    # .pmtiles를 찾아 쓴다. 여러 개면 큰 것(더 넓거나 상세한 쪽)을 고른다.
-    assets = os.path.join(resource_root(), "assets")
-    try:
-        found = [os.path.join(assets, n) for n in os.listdir(assets)
-                 if n.lower().endswith(".pmtiles")]
-    except OSError:
-        return None
-    found = [p for p in found if os.path.isfile(p)]
-    if not found:
-        return None
-    return max(found, key=os.path.getsize)
 
 
 class _Handler(BaseHTTPRequestHandler):
