@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QBuffer, QIODevice, QPointF, QRect, QRectF, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
 from core.acceleration import FlaggedSegment, _distinct_fix_indices
@@ -18,6 +19,27 @@ _GRID = QColor(255, 255, 255, 22)
 
 _Y_PADDING_RATIO = 0.18
 
+# 눈금 간격 후보. 영상 길이에 맞춰 눈금이 5~10개쯤 되도록 고른다.
+_TICK_STEPS = (1, 2, 5, 10, 15, 20, 30, 60, 120, 300, 600, 900, 1800, 3600)
+
+
+def _time_tick_step(span_sec: float) -> float:
+    for step in _TICK_STEPS:
+        if span_sec / step <= 8:
+            return float(step)
+    return float(_TICK_STEPS[-1])
+
+
+def _fmt_tick(seconds: float) -> str:
+    total = int(round(seconds))
+    if total < 60:
+        return f"{total}s"
+    m, sec = divmod(total, 60)
+    if m < 60:
+        return f"{m}:{sec:02d}"
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{sec:02d}"
+
 
 class SpeedChartWidget(QWidget):
     def __init__(self, parent=None):
@@ -30,6 +52,22 @@ class SpeedChartWidget(QWidget):
         self._records = records
         self._segments = segments
         self.update()
+
+    def grab_png(self, width: int = 900, height: int = 300) -> Optional[bytes]:
+        """그래프를 PNG로 캡처한다. 화면 크기와 무관하게 리포트용 크기로 그린다."""
+        if len(self._plot_points()) < 2:
+            return None
+        image = QImage(width, height, QImage.Format_ARGB32)
+        image.fill(_BG)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing)
+        self._paint_to(painter, QRect(0, 0, width, height))
+        painter.end()
+        buffer = QBuffer()
+        buffer.open(QIODevice.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            return None
+        return bytes(buffer.data())
 
     def _plot_points(self) -> List[Tuple[int, float, float]]:
         """(원본 인덱스, 시각, 속도) 목록.
@@ -50,15 +88,19 @@ class SpeedChartWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), _BG)
+        self._paint_to(painter, self.rect())
+        painter.end()
 
+    def _paint_to(self, painter, area) -> None:
+        """화면과 리포트 이미지가 같은 코드로 그려지도록 분리했다.
+        area만 다르고 나머지는 동일하다."""
         pts = self._plot_points()
         if len(pts) < 2:
             painter.setPen(_AXIS)
-            painter.drawText(self.rect(), Qt.AlignCenter, "표시할 속도 데이터가 없습니다.")
-            painter.end()
+            painter.drawText(area, Qt.AlignCenter, "표시할 속도 데이터가 없습니다.")
             return
 
-        plot = self.rect().adjusted(52, 16, -16, -26)
+        plot = area.adjusted(52, 16, -16, -26)
 
         speeds = [v for _, _, v in pts]
         lo_raw, hi_raw = min(speeds), max(speeds)
@@ -90,6 +132,21 @@ class SpeedChartWidget(QWidget):
             y = plot.bottom() - plot.height() * frac
             painter.drawLine(int(plot.left()), int(y), int(plot.right()), int(y))
 
+        # 시간 눈금. 시작/끝만 있으면 중간 지점이 몇 초인지 읽을 수 없다.
+        tick_step = _time_tick_step(span_x)
+        ticks = []
+        t = tick_step * math.ceil(t0 / tick_step)
+        while t <= t1 + 1e-6:
+            ticks.append(t)
+            t += tick_step
+        for t in ticks:
+            x = x_for_time(t)
+            painter.setPen(QPen(_GRID, 1))
+            painter.drawLine(int(x), int(plot.top()), int(x), int(plot.bottom()))
+            painter.setPen(_AXIS)
+            label = _fmt_tick(t)
+            painter.drawText(int(x) - 14, area.bottom() - 6, label)
+
         painter.setPen(Qt.NoPen)
         painter.setBrush(_BAND)
         for seg in self._segments:
@@ -116,9 +173,6 @@ class SpeedChartWidget(QWidget):
         painter.setPen(_AXIS)
         painter.drawText(4, int(plot.top()) + 10, f"{hi:.0f} km/h")
         painter.drawText(4, int(plot.bottom()) + 4, f"{lo:.0f} km/h")
-        painter.drawText(int(plot.left()), self.rect().bottom() - 6, f"{t0:.0f}s")
-        painter.drawText(int(plot.right()) - 34, self.rect().bottom() - 6, f"{t1:.0f}s")
-        painter.end()
 
     def _build_path(self, pts, x_for_time, y_for) -> QPainterPath:
         """실측 지점들을 부드러운 곡선으로 잇는다.

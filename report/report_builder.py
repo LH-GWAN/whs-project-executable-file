@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html
 import os
 from typing import List, Optional
@@ -56,8 +57,18 @@ def _select_row_indices(records: List[TrackPoint], segments: List[FlaggedSegment
     return sorted(keep)
 
 
+def _image_section(title: str, png_bytes: Optional[bytes], caption: str) -> str:
+    if not png_bytes:
+        return ""
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return (f"  <h2>{_esc(title)}</h2>\n"
+            f'  <figure><img src="data:image/png;base64,{encoded}">'
+            f"<figcaption>{_esc(caption)}</figcaption></figure>\n")
+
+
 def render_report_html(pipeline_result: PipelineResult, case_number: str, examiner: str,
-                        memo: str) -> str:
+                        memo: str, chart_png: Optional[bytes] = None,
+                        map_png: Optional[bytes] = None) -> str:
     records = pipeline_result.extraction.points
     segments = pipeline_result.flagged_segments
     row_indices = _select_row_indices(records, segments)
@@ -102,9 +113,28 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     fix_count = extraction.fix_count
     dropout_count = extraction.dropout_count
 
+    # 그래프와 지도는 캡처 시점의 정적 이미지로 넣는다. 리포트 안에서 지도를 다시
+    # 살려 그리면 타일 로딩 타이밍에 따라 결과가 달라져, 증거 문서로 쓰기 어렵다.
+    visuals_html = (
+        _image_section("속도 분석", chart_png,
+                        "급가속 의심 구간은 붉게 표시됩니다. 점은 실제 GPS 측정 지점입니다.")
+        + _image_section("이동 경로", map_png,
+                          "초록 실선은 주행 경로, 붉은 구간은 급가속 의심 구간, "
+                          "회색 점선은 GPS 수신이 끊긴 구간입니다.")
+    )
+
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
-  body {{ font-family: -apple-system, "Malgun Gothic", sans-serif; color: #111; margin: 24px; }}
+  /* 다음 장으로 넘어갈 때 내용이 종이 맨 위에 붙어 인쇄되던 문제 - 페이지마다
+     위아래 여백을 준다. printToPdf는 이 @page 여백을 그대로 반영한다. */
+  @page {{ margin: 18mm 14mm; }}
+  body {{ font-family: -apple-system, "Malgun Gothic", sans-serif; color: #111; margin: 0; }}
+  h2 {{ break-after: avoid; page-break-after: avoid; }}
+  figure {{ margin: 0 0 14px; break-inside: avoid; page-break-inside: avoid; }}
+  figure img {{ width: 100%; border: 1px solid #ccc; }}
+  figcaption {{ font-size: 11px; color: #666; padding-top: 4px; }}
+  thead {{ display: table-header-group; }}
+  tr {{ break-inside: avoid; page-break-inside: avoid; }}
   h1 {{ font-size: 18px; border-bottom: 2px solid #111; padding-bottom: 6px; }}
   h2 {{ font-size: 14px; margin-top: 24px; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
@@ -130,6 +160,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>급가속 임계값</b>{_esc(pipeline_result.accel_threshold_mps2)} m/s&sup2;</div>
   <div class="kv"><b>급가속 의심 구간</b>{_esc(len(segments))}개</div>
 
+  {visuals_html}
   <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 급가속 구간 우선)</h2>
   <table>
     <thead><tr><th>#</th><th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th><th>충격(g)</th></tr></thead>

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 
-from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtCore import QBuffer, QIODevice, QTimer, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
@@ -92,6 +92,23 @@ class MapView(QWidget):
         self._last_track_js = f"renderTrack({json.dumps(payload, ensure_ascii=False)});"
         self._last_time_js = None
         self._run_js(self._last_track_js)
+
+    def grab_png(self) -> Optional[bytes]:
+        """현재 지도 화면을 PNG로 캡처한다. 리포트에 넣기 위한 것.
+
+        지도가 아직 안 떴거나 그려지지 않았으면 None을 돌려준다 - 빈 이미지를
+        리포트에 넣는 것보다 아예 넣지 않는 편이 낫다.
+        """
+        if not self._loaded:
+            return None
+        pixmap = self._view.grab()
+        if pixmap.isNull() or pixmap.width() < 2 or pixmap.height() < 2:
+            return None
+        buffer = QBuffer()
+        buffer.open(QIODevice.WriteOnly)
+        if not pixmap.save(buffer, "PNG"):
+            return None
+        return bytes(buffer.data())
 
     def set_playback_time(self, seconds: float) -> None:
         self._last_time_js = f"setPlaybackTime({float(seconds)});"

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from core.basemap import basemap_path  # noqa: F401  (핸들러가 사용)
+from core.appconfig import MAP_MODE_OFFLINE, get_map_mode, online_tile_config
+from core.basemap import basemap_path
 from core.paths import resource_root
 
 _MIME = {
@@ -50,8 +52,16 @@ class _Handler(BaseHTTPRequestHandler):
         self._serve(head_only=True)
 
     def do_GET(self):  # noqa: N802
-        if self.path.split("?", 1)[0] == "/basemap-info":
-            body = b'{"available": true}' if basemap_path() else b'{"available": false}'
+        route = self.path.split("?", 1)[0]
+        if route in ("/basemap-info", "/map-config"):
+            tiles = online_tile_config()
+            payload = {
+                "available": basemap_path() is not None,
+                "mode": get_map_mode() or MAP_MODE_OFFLINE,
+                "onlineTileUrl": tiles["url"],
+                "onlineAttribution": tiles["attribution"],
+            }
+            body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

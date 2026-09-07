@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from core.acceleration import FlaggedSegment
 from engine.engine_adapter import TrackPoint
+from core.geocode import describe_location
 from ui.map_view import MapView
 
 
@@ -51,13 +52,32 @@ class TrackerTab(QWidget):
         controls.addWidget(self._seek_slider, 1)
         controls.addWidget(self._time_label)
 
+        # 재생 중인 지점의 속도/좌표를 영상 바로 아래에 보여준다. 위경도만으로는
+        # 어디인지 바로 읽기 어려워서 주소도 함께 둘 자리를 만들어 뒀다
+        # (주소 변환은 외부 조회가 필요해 온라인 모드에서만 채워진다).
+        self._speed_label = QLabel("속도 -")
+        self._speed_label.setStyleSheet("font-weight: 600;")
+        self._coord_label = QLabel("위치 -")
+        self._addr_label = QLabel("")
+        self._addr_label.setStyleSheet("color: #666;")
+
+        info_row = QHBoxLayout()
+        info_row.setContentsMargins(4, 2, 4, 2)
+        info_row.addWidget(self._speed_label)
+        info_row.addSpacing(14)
+        info_row.addWidget(self._coord_label)
+        info_row.addSpacing(10)
+        info_row.addWidget(self._addr_label, 1)
+
         video_panel = QVBoxLayout()
         video_panel.setContentsMargins(0, 0, 0, 0)
         video_panel.addWidget(self._video_widget, 1)
         video_panel.addLayout(controls)
+        video_panel.addLayout(info_row)
         video_container = QWidget()
         video_container.setLayout(video_panel)
 
+        self._points: List[TrackPoint] = []
         self._map = MapView()
 
         splitter = QSplitter(Qt.Horizontal)
@@ -74,7 +94,41 @@ class TrackerTab(QWidget):
 
     def load_track(self, points: List[TrackPoint],
                     segments: Optional[List[FlaggedSegment]] = None) -> None:
+        self._points = points
         self._map.set_track(points, segments)
+        self._update_info(0.0)
+
+    def _point_at(self, seconds: float) -> Optional[TrackPoint]:
+        found = None
+        for p in self._points:
+            if p.start_time_sec is None:
+                continue
+            if p.start_time_sec <= seconds:
+                found = p
+            else:
+                break
+        return found
+
+    def _update_info(self, seconds: float) -> None:
+        point = self._point_at(seconds)
+        if point is None:
+            self._speed_label.setText("속도 -")
+            self._coord_label.setText("위치 -")
+            self._addr_label.setText("")
+            return
+
+        self._speed_label.setText(
+            f"속도 {point.speed_kmh:.1f} km/h" if point.speed_kmh is not None else "속도 -")
+
+        if point.has_fix:
+            self._coord_label.setText(f"위치 {point.latitude:.6f}, {point.longitude:.6f}")
+        elif point.is_dropout:
+            self._coord_label.setText("위치 (GPS 끊김)")
+        else:
+            self._coord_label.setText("위치 (GPS 미기록)")
+
+        address = describe_location(point.latitude, point.longitude) if point.has_fix else ""
+        self._addr_label.setText(f"({address})" if address else "")
 
     def _toggle_play(self) -> None:
         if self._player.playbackState() == QMediaPlayer.PlayingState:
@@ -88,6 +142,7 @@ class TrackerTab(QWidget):
     def _on_slider_moved(self, position: int) -> None:
         self._player.setPosition(position)
         self._map.set_playback_time(position / 1000.0)
+        self._update_info(position / 1000.0)
 
     def _on_duration_changed(self, duration: int) -> None:
         self._seek_slider.setRange(0, max(0, duration))
@@ -98,6 +153,10 @@ class TrackerTab(QWidget):
             self._seek_slider.setValue(position)
         self._time_label.setText(f"{_fmt_ms(position)} / {_fmt_ms(self._player.duration())}")
         self._map.set_playback_time(position / 1000.0)
+        self._update_info(position / 1000.0)
+
+    def grab_map_png(self):
+        return self._map.grab_png()
 
     def ensure_map_loaded(self) -> None:
         self._map.ensure_loaded()

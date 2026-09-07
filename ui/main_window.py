@@ -10,7 +10,9 @@ from core.pipeline import PipelineResult, reopen_case
 from report.report_builder import ReportExporter, render_report_html
 from storage.history_store import HistoryStore, default_app_data_dir
 from ui.analysis_view import AnalysisView
+from core.appconfig import MAP_MODE_OFFLINE, get_map_mode
 from ui.basemap_notice import should_show_notice, show_basemap_notice
+from ui.map_mode_dialog import ask_map_mode
 from ui.case_info_dialog import CaseInfoDialog
 from ui.home_view import HomeView
 from ui.workers import AnalysisWorker
@@ -59,8 +61,17 @@ class MainWindow(QMainWindow):
 
         # 배경지도가 없으면 처음 한 번 안내한다. 없어도 분석은 정상 동작하므로
         # 막는 게 아니라 알려주기만 하고, 사용자가 끄면 다시 띄우지 않는다.
-        if should_show_notice():
-            QTimer.singleShot(0, lambda: show_basemap_notice(self))
+        QTimer.singleShot(0, self._first_run_setup)
+
+    def _first_run_setup(self) -> None:
+        # 처음 실행이면 지도 사용 방식부터 고르게 한다. 외부 접속 여부는 사용자가
+        # 알고 선택해야 하는 사항이라 조용히 정하지 않는다.
+        mode = get_map_mode()
+        if mode is None:
+            mode = ask_map_mode(self)
+        # 오프라인인데 지도 파일이 없으면 받는 방법을 안내한다.
+        if mode == MAP_MODE_OFFLINE and should_show_notice():
+            show_basemap_notice(self)
 
     def _refresh_history(self) -> None:
         with HistoryStore(self._history_db_path) as store:
@@ -162,8 +173,10 @@ class MainWindow(QMainWindow):
         if not out_path:
             return
 
+        chart_png, map_png = self._analysis_view.capture_visuals()
         html_str = render_report_html(
             result, self._current_case_number, self._current_examiner, self._current_memo,
+            chart_png=chart_png, map_png=map_png,
         )
 
         def on_done(success: bool, error_message: str) -> None:

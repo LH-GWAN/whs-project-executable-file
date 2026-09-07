@@ -24,6 +24,13 @@
     padding: 6px 9px; font: 11px -apple-system, "Malgun Gothic", sans-serif; color: #333;
   }
   #legend div { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  #followBtn {
+    position: absolute; right: 8px; bottom: 8px; z-index: 6;
+    border: 1px solid #ccc; border-radius: 3px; padding: 5px 10px; cursor: pointer;
+    font: 11px -apple-system, "Malgun Gothic", sans-serif;
+    background: rgba(255,255,255,.92); color: #666;
+  }
+  #followBtn.on { background: #1c7ed6; border-color: #1c7ed6; color: #fff; }
   #legend i { width: 16px; height: 0; border-top-width: 3px; border-top-style: solid; }
 </style>
 </head>
@@ -34,6 +41,7 @@
   <div><i style="border-color:#e03131"></i> 급가속 의심 구간</div>
   <div><i style="border-color:#9aa4ad; border-top-style:dashed"></i> GPS 끊김 구간</div>
 </div>
+<button id="followBtn" class="on" title="영상 재생에 맞춰 지도를 따라 움직입니다">따라가기 켜짐</button>
 <div id="status">지도 준비 중…</div>
 
 <script>
@@ -49,18 +57,35 @@ const EMPTY_STYLE = {
 let map = null;
 let trackData = null;
 let pendingTrack = null;
+let followEnabled = true;
+let selfMove = false;
 
 function setStatus(text) {
   document.getElementById("status").textContent = text;
 }
 
 async function addBasemapIfAvailable() {
-  let available = false;
+  let cfg = {};
   try {
-    const r = await fetch("basemap-info");
-    available = (await r.json()).available;
+    cfg = await (await fetch("map-config")).json();
   } catch (e) { return false; }
-  if (!available) return false;
+
+  if (cfg.mode === "online") {
+    if (!cfg.onlineTileUrl) {
+      setStatus("온라인 지도가 아직 설정되지 않았습니다 · 궤적만 표시");
+      return false;
+    }
+    map.addSource("basemap", {
+      type: "raster",
+      tiles: [cfg.onlineTileUrl],
+      tileSize: 256,
+      attribution: cfg.onlineAttribution || "",
+    });
+    map.addLayer({ id: "bm-raster", type: "raster", source: "basemap" });
+    return true;
+  }
+
+  if (!cfg.available) return false;
 
   try {
     const protocol = new pmtiles.Protocol();
@@ -222,6 +247,29 @@ function setPlaybackTime(sec) {
       geometry: { type: "Point", coordinates: [best.lon, best.lat] } });
   }
   map.getSource("trk-pos").setData(fc);
+
+  // 확대해서 보면 차량이 금방 화면 밖으로 나가서 사용자가 마우스로 계속 따라가야 했다.
+  // 마커가 가장자리에 가까워지면 지도를 그쪽으로 밀어준다. 사용자가 직접 지도를
+  // 움직이면 따라가기를 꺼서, 보고 싶은 곳을 뺏지 않는다.
+  if (best && followEnabled) {
+    const pt = map.project([best.lon, best.lat]);
+    const c = map.getCanvas();
+    const mx = c.clientWidth * 0.25;
+    const my = c.clientHeight * 0.25;
+    if (pt.x < mx || pt.x > c.clientWidth - mx || pt.y < my || pt.y > c.clientHeight - my) {
+      selfMove = true;
+      map.easeTo({ center: [best.lon, best.lat], duration: 420 });
+    }
+  }
+}
+
+function setFollow(on) {
+  followEnabled = !!on;
+  const btn = document.getElementById("followBtn");
+  if (btn) {
+    btn.classList.toggle("on", followEnabled);
+    btn.textContent = followEnabled ? "따라가기 켜짐" : "따라가기 꺼짐";
+  }
 }
 
 function addTrackLayers() {
@@ -283,6 +331,13 @@ function boot() {
     attributionControl: { compact: true },
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
+
+  document.getElementById("followBtn").addEventListener("click", function () {
+    setFollow(!followEnabled);
+  });
+  // 사용자가 끌면 따라가기를 끈다. 우리가 easeTo로 움직인 건 제외한다.
+  map.on("dragstart", function () { setFollow(false); });
+  map.on("moveend", function () { selfMove = false; });
   map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }));
 
   map.on("load", initOnce);
@@ -316,6 +371,7 @@ boot();
 
 window.renderTrack = renderTrack;
 window.setPlaybackTime = setPlaybackTime;
+window.setFollow = setFollow;
 </script>
 </body>
 </html>

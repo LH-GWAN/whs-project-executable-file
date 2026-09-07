@@ -2,15 +2,19 @@ from __future__ import annotations
 
 from typing import List
 
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import QHBoxLayout, QSplitter, QTableWidget, QTableWidgetItem, QWidget
 from PySide6.QtCore import Qt
 
 from core.acceleration import FlaggedSegment
 from engine.engine_adapter import TrackPoint
+from core.geocode import external_map_url
 from ui.map_view import MapView
 
 _FLAG_COLOR = QColor(255, 200, 200)
+_LINK_COLOR = QColor(30, 100, 200)
+_MAP_LINK_COLUMN = 5
 _DROPOUT_COLOR = QColor(190, 110, 40)
 _NOGPS_COLOR = QColor(170, 170, 170)
 _IMPACT_COLOR = QColor(200, 60, 60)
@@ -21,13 +25,14 @@ class LocationTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._map = MapView()
-        self._table = QTableWidget(0, 5)
+        self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
-            ["시각(초)", "위도", "경도", "속도(km/h)", "충격(g)"])
+            ["시각(초)", "위도", "경도", "속도(km/h)", "충격(g)", "지도"])
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.itemSelectionChanged.connect(self._on_row_selected)
+        self._table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self._points: List[TrackPoint] = []
 
         splitter = QSplitter(Qt.Horizontal)
@@ -38,6 +43,17 @@ class LocationTab(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(splitter)
+
+    def _on_cell_double_clicked(self, row: int, column: int) -> None:
+        if column != _MAP_LINK_COLUMN or not (0 <= row < len(self._points)):
+            return
+        point = self._points[row]
+        if not point.has_fix:
+            return
+        QDesktopServices.openUrl(QUrl(external_map_url(point.latitude, point.longitude)))
+
+    def grab_map_png(self):
+        return self._map.grab_png()
 
     def ensure_map_loaded(self) -> None:
         self._map.ensure_loaded()
@@ -83,7 +99,15 @@ class LocationTab(QWidget):
             g_item = QTableWidgetItem(f"{g:.2f}" if g is not None else "-")
             if g is not None and g >= _IMPACT_G:
                 g_item.setForeground(_IMPACT_COLOR)
-            items = (time_item, lat_item, lon_item, speed_item, g_item)
+            # 위경도만 보면 어디인지 바로 알기 어려워서, 외부 지도로 바로 열 수 있는
+            # 칸을 둔다. 클릭하면 기본 브라우저에서 해당 좌표가 열린다.
+            if rec.has_fix:
+                link_item = QTableWidgetItem("지도에서 보기")
+                link_item.setForeground(_LINK_COLOR)
+                link_item.setToolTip("클릭하면 브라우저에서 이 좌표를 엽니다")
+            else:
+                link_item = QTableWidgetItem("-")
+            items = (time_item, lat_item, lon_item, speed_item, g_item, link_item)
             if row in flagged_indices:
                 for item in items:
                     item.setBackground(_FLAG_COLOR)

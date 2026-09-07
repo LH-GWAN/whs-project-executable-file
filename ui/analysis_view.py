@@ -120,6 +120,28 @@ class AnalysisView(QWidget):
         if callable(loader):
             loader()
 
+    def capture_visuals(self) -> tuple:
+        """리포트에 넣을 그래프/지도 이미지. 못 만들면 None을 돌려준다(리포트는 계속 나간다).
+
+        지도는 탭을 열어야 로드되는 지연 로딩이라, 사용자가 Location 탭을 한 번도
+        안 열었으면 그 지도는 비어 있다. Tracker 탭 지도로 대신 잡는다.
+        """
+        chart = None
+        try:
+            chart = self._speed_tab.grab_chart_png()
+        except Exception:
+            chart = None
+
+        map_png = None
+        for tab in (self._location_tab, self._tracker_tab):
+            try:
+                map_png = tab.grab_map_png()
+            except Exception:
+                map_png = None
+            if map_png:
+                break
+        return chart, map_png
+
     def _on_report_clicked(self) -> None:
         if self._result is not None:
             self.report_requested.emit(self._result)

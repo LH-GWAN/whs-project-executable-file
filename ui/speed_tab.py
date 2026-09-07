@@ -41,3 +41,6 @@ class SpeedTab(QWidget):
             self._avg_label.setText("평균 속도: -")
             self._max_label.setText("최고 속도: -")
         self._flag_label.setText(f"급가속 의심 구간: {len(segments)}개")
+
+    def grab_chart_png(self):
+        return self._chart.grab_png()
