@@ -1,6 +1,6 @@
-# 스크립트 위치
+# 스크립트 모음
 https://github.com/LH-GWAN/whs-project
-여기있는 final integration 폴더에 있다
+여기에 모아 놨다
 
 # GPS Tracer
 
