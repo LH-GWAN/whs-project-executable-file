@@ -46,6 +46,17 @@ one-file(단일 exe) 대신 one-dir(폴더)로 만든 이유는 `gpstracer.spec`
 
 ---
 
+### clean 해도 남는 것
+
+`clean_windows.bat`은 `.venv\`, `dist\`, `build\`, 바로가기, `__pycache__\`만 지운다.
+지도 온라인/오프라인 선택(`%LOCALAPPDATA%\GPSTracer\settings.json`)과 안내 창의 "다시
+표시하지 않음"(레지스트리 `HKCU\Software\GPSTracer`)은 사용자 데이터라 남고, 그래서
+재빌드 후에도 처음처럼 묻지 않는다. 스크립트 끝에서 "Reset app settings"에 Y를 답하거나
+앱의 **설정 > 지도 설정 초기화**를 쓰면 다시 묻는다. 사건 이력(`history.db`)과 증거
+폴더(`cases\`)는 어느 쪽도 지우지 않는다.
+
+---
+
 ## 확인된 사항 (macOS에서 검증)
 
 exe 자체는 Windows에서 만들어야 하지만, 빌드 설정(spec)과 패키징 로직은

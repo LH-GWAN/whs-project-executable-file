@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Optional, Set
 
-from PySide6.QtCore import QEventLoop, Qt, QTimer
+from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -20,6 +20,7 @@ from core.appconfig import (
     MAP_MODE_OFFLINE,
     MAP_SERVER_PREFERRED_PORTS,
     get_map_mode,
+    reset_map_mode,
     set_map_mode,
 )
 from core.pipeline import PipelineResult, reopen_case
@@ -78,6 +79,10 @@ class MainWindow(QMainWindow):
         basemap_action = QAction("오프라인 지도 파일 안내…", self)
         basemap_action.triggered.connect(lambda: show_basemap_notice(self))
         settings_menu.addAction(basemap_action)
+        settings_menu.addSeparator()
+        reset_action = QAction("지도 설정 초기화 (처음 실행처럼 다시 묻기)", self)
+        reset_action.triggered.connect(self._on_reset_map_settings)
+        settings_menu.addAction(reset_action)
 
         self._worker: Optional[AnalysisWorker] = None
         self._progress: Optional[QProgressDialog] = None
@@ -131,6 +136,22 @@ class MainWindow(QMainWindow):
         mode = ask_map_mode(self, current)
         if mode != current:
             self._apply_map_mode(mode)
+
+    def _on_reset_map_settings(self) -> None:
+        """지도 사용 방식 선택과 '다시 표시하지 않음' 표시를 지우고 첫 실행 절차를 다시 밟는다.
+
+        이 값들은 %LOCALAPPDATA%/GPSTracer 와 레지스트리(QSettings)에 있어서 clean 스크립트나
+        재빌드로는 지워지지 않는다. 사건 이력·증거 폴더는 건드리지 않는다.
+        """
+        previous = get_map_mode()
+        reset_map_mode()
+        settings = QSettings("GPSTracer", "GPSTracer")
+        settings.remove("basemap_notice/suppressed")
+        settings.remove("online_keys_notice/suppressed")
+        self._online_notified.clear()
+        self._first_run_setup()
+        if get_map_mode() != previous:
+            self._apply_map_mode(get_map_mode() or MAP_MODE_OFFLINE)
 
     def _apply_map_mode(self, mode: str) -> None:
         set_map_mode(mode)

@@ -49,6 +49,25 @@ for /d /r %%d in (__pycache__) do @if exist "%%d" rmdir /s /q "%%d"
 
 echo Done.
 echo.
+
+REM The online/offline map choice and the "do not show again" boxes live in the
+REM user's data area, not in this folder, so they survive clean + rebuild:
+REM   %LOCALAPPDATA%\GPSTracer\settings.json   (map mode, key overrides)
+REM   HKCU\Software\GPSTracer                    (notice preferences, QSettings)
+REM Case history and evidence folders (history.db, cases\) are NEVER touched here.
+echo The map online/offline choice and notice preferences are stored in
+echo   %LOCALAPPDATA%\GPSTracer\settings.json  and  HKCU\Software\GPSTracer
+echo They are NOT deleted by this script. Reset them so the app asks again
+echo at the next start? Case history and evidence folders are kept either way.
+choice /c YN /d N /t 15 /m "Reset app settings (auto-no in 15s)"
+if not errorlevel 2 (
+    if exist "%LOCALAPPDATA%\GPSTracer\settings.json" del /q "%LOCALAPPDATA%\GPSTracer\settings.json"
+    reg delete "HKCU\Software\GPSTracer" /f >nul 2>&1
+    echo App settings reset. The app will ask online/offline at the next start.
+) else (
+    echo App settings kept. Use Settings ^> Reset map settings inside the app instead.
+)
+echo.
 if exist "assets\korea.pmtiles" (
     echo Basemap kept: assets\korea.pmtiles
 ) else (

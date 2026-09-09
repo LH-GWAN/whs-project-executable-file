@@ -96,6 +96,19 @@ def set_map_mode(mode: str) -> None:
     save_config(data)
 
 
+def reset_map_mode() -> None:
+    """선택을 지워 다음 시작(또는 첫 실행 절차)에서 다시 묻게 한다. 다른 설정은 그대로."""
+    data = load_config()
+    if "map_mode" in data:
+        del data["map_mode"]
+        save_config(data)
+
+
+def config_path() -> str:
+    """설정 파일 위치(안내·문서용). clean 스크립트가 지우지 않는 사용자 데이터 영역이다."""
+    return _config_path()
+
+
 def keys_dir() -> str:
     """키 파일을 찾는 폴더. 소스 실행은 프로젝트의 assets/, exe는 _internal/assets/."""
     return os.path.join(resource_root(), "assets")
