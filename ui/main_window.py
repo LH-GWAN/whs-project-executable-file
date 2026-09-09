@@ -209,15 +209,15 @@ class MainWindow(QMainWindow):
         self._refresh_history()
         self._stack.setCurrentWidget(self._home)
 
-    def _compute_hash_with_progress(self, video_path: str) -> str:
-        """영상 해시를 진행률 창과 함께 계산한다. 취소하면 빈 문자열."""
+    def _compute_hash_with_progress(self, video_path: str) -> tuple:
+        """영상 해시를 진행률 창과 함께 계산한다. (해시, 오류) - 취소하면 ("", ""), 실패하면 ("", 사유)."""
         progress = QProgressDialog("파일 확인 중 (SHA-256)...", "취소", 0, 100, self)
         progress.setWindowTitle("GPS Tracer")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(300)
         worker = HashWorker(video_path, self)
         worker.progress.connect(progress.setValue)
-        result = {"sha": "", "cancelled": False}
+        result = {"sha": "", "error": "", "cancelled": False}
         loop = QEventLoop()
 
         def on_cancel() -> None:
@@ -226,19 +226,31 @@ class MainWindow(QMainWindow):
 
         def on_done(sha: str) -> None:
             result["sha"] = sha
-            loop.quit()
+
+        def on_failed(message: str) -> None:
+            result["error"] = message
 
         # QProgressDialog는 close()할 때도 canceled를 내고 wasCanceled()가 True가 되므로,
-        # 사용자가 누른 취소만 따로 기록한다.
+        # 사용자가 누른 취소만 따로 기록한다. 루프 종료는 결과 시그널이 아니라 스레드 종료에
+        # 걸어, 워커가 어떤 경로로 끝나든 여기서 멈추지 않게 한다.
         progress.canceled.connect(on_cancel)
         worker.finished_hash.connect(on_done)
-        worker.start()
-        loop.exec()
-        worker.wait(2000)
-        progress.canceled.disconnect(on_cancel)
-        progress.close()
-        worker.deleteLater()
-        return "" if result["cancelled"] else result["sha"]
+        worker.failed.connect(on_failed)
+        worker.finished.connect(loop.quit)
+        # 계산하는 동안 홈 화면을 잠가 Upload를 또 누르는 중첩 진입을 막는다.
+        self._home.setEnabled(False)
+        try:
+            worker.start()
+            loop.exec()
+            worker.wait(2000)
+        finally:
+            self._home.setEnabled(True)
+            progress.canceled.disconnect(on_cancel)
+            progress.close()
+            worker.deleteLater()
+        if result["cancelled"]:
+            return "", ""
+        return result["sha"], result["error"]
 
     def _confirm_reanalysis(self, previous: list) -> bool:
         """같은 파일을 이미 분석한 적이 있을 때. 예: 새 사건으로 다시 분석, 아니요: 홈으로."""
@@ -262,9 +274,15 @@ class MainWindow(QMainWindow):
         return box.clickedButton() is yes_btn
 
     def _on_video_selected(self, video_path: str) -> None:
-        sha256 = self._compute_hash_with_progress(video_path)
+        sha256, error = self._compute_hash_with_progress(video_path)
+        if error:
+            QMessageBox.critical(
+                self, "파일 읽기 실패",
+                f"영상 파일을 읽을 수 없습니다:\n{video_path}\n\n{error}\n\n"
+                "이동식 매체가 빠졌거나 네트워크 경로가 끊겼는지, 읽기 권한이 있는지 확인하세요.")
+            return
         if not sha256:
-            return  # 취소했거나 읽지 못함
+            return  # 취소
         with HistoryStore(self._history_db_path) as store:
             previous = store.find_cases_by_sha256(sha256)
         if previous and not self._confirm_reanalysis(previous):
@@ -281,6 +299,9 @@ class MainWindow(QMainWindow):
 
         self._progress = QProgressDialog("분석 준비 중...", "취소", 0, 0, self)
         self._progress.setWindowTitle("GPS Tracer")
+        # 모달로 띄워 분석 중에 Home의 삭제 조작이 안 되게 한다. 진행 중인 사건의 레코드가
+        # 지워지면 워커가 마지막에 외래키 오류로 죽고 사건 폴더만 고아로 남는다.
+        self._progress.setWindowModality(Qt.WindowModal)
         self._progress.setMinimumDuration(0)
         self._progress.canceled.connect(self._on_cancel_requested)
         self._progress.show()
@@ -356,13 +377,27 @@ class MainWindow(QMainWindow):
         self._analysis_view.load_result(result, case.case_number, case.analysis_settings)
         self._stack.setCurrentWidget(self._analysis_view)
 
+    def _analysis_running(self) -> bool:
+        return self._worker is not None and self._worker.isRunning()
+
+    def _refuse_delete_while_running(self) -> bool:
+        if not self._analysis_running():
+            return False
+        QMessageBox.information(self, "이력 삭제",
+                                "분석이 진행 중일 때는 이력을 지울 수 없습니다. 분석이 끝난 뒤 다시 시도하세요.")
+        return True
+
     def _on_history_delete_requested(self, case_ids: list) -> None:
+        if self._refuse_delete_while_running():
+            return
         with HistoryStore(self._history_db_path) as store:
             cases = [c for c in (store.get_case(int(i)) for i in case_ids) if c is not None]
         if cases:
             self._confirm_and_delete(cases, clear_all=False)
 
     def _on_history_clear_requested(self) -> None:
+        if self._refuse_delete_while_running():
+            return
         with HistoryStore(self._history_db_path) as store:
             cases = store.list_cases()
         if cases:
@@ -401,9 +436,13 @@ class MainWindow(QMainWindow):
 
         remove_folders = folder_check.isChecked()
         ids = [c.id for c in cases]
+        if self._analysis_running():
+            return
+        # 재생기는 마지막으로 Tracker를 켠 사건의 영상을 계속 잡고 있을 수 있다(Tracker를 끈
+        # 사건을 열면 재생기를 건드리지 않는다). 어느 사건을 지우든 먼저 잠금을 푼다 -
+        # Windows에서는 열린 파일이 있으면 폴더 삭제가 실패한다.
+        self._analysis_view.release_media()
         if self._current_case_id in ids:
-            # 보고 있던 사건이면 재생기가 영상 사본을 잡고 있어 폴더 삭제가 막힌다.
-            self._analysis_view.release_media()
             self._current_case_id = None
         with HistoryStore(self._history_db_path) as store:
             results = delete_cases(store, self._cases_root_dir, ids, remove_folders)
@@ -411,11 +450,12 @@ class MainWindow(QMainWindow):
 
         failed = [r for r in results if not r.ok]
         if failed:
+            kept = [r for r in failed if not r.record_removed]
             detail = "\n\n".join(f"· {r.case_number or r.case_id}: {r.error}" for r in failed[:6])
-            QMessageBox.warning(
-                self, "일부 삭제 실패",
-                f"{len(results) - len(failed)}건 삭제, {len(failed)}건 실패. 실패한 이력은 목록에 남아 있으니 "
-                f"원인을 해결한 뒤 다시 지우면 됩니다.\n\n{detail}")
+            summary = f"{len(results) - len(failed)}건 삭제, {len(failed)}건은 문제가 있었습니다."
+            if kept:
+                summary += f"\n목록에 남은 {len(kept)}건은 원인을 해결한 뒤 다시 지우면 됩니다."
+            QMessageBox.warning(self, "일부 삭제 실패", f"{summary}\n\n{detail}")
 
     def _on_report_requested(self, result: PipelineResult) -> None:
         default_name = f"{self._current_case_number or 'case'}_report.pdf"

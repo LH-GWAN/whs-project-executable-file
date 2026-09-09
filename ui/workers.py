@@ -15,7 +15,8 @@ class HashWorker(QThread):
     """영상 SHA-256을 화면 밖에서 계산한다. 같은 파일을 다시 올렸는지 확인하는 데 쓴다."""
 
     progress = Signal(int)        # 0~100
-    finished_hash = Signal(str)   # 취소했거나 실패하면 빈 문자열
+    finished_hash = Signal(str)   # 취소하면 빈 문자열
+    failed = Signal(str)          # 파일을 읽지 못함 (사유)
 
     def __init__(self, path: str, parent=None):
         super().__init__(parent)
@@ -32,8 +33,8 @@ class HashWorker(QThread):
 
         try:
             self.finished_hash.emit(hashing.sha256_file(self._path, progress_cb=on_progress))
-        except OSError:
-            self.finished_hash.emit("")
+        except Exception as exc:  # noqa: BLE001 - 어떤 이유든 화면에 알려야 한다
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
 class AnalysisWorker(QThread):
