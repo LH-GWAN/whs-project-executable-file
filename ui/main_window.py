@@ -223,6 +223,12 @@ class MainWindow(QMainWindow):
         def on_cancel() -> None:
             result["cancelled"] = True
             worker.cancel()
+            if worker.isRunning():
+                # 같은 canceled 시그널에 먼저 연결된 QProgressDialog.cancel()이 창을 이미 숨겼다.
+                # 읽기가 막혀 있으면 스레드가 바로 안 끝나므로, 끝날 때까지 모달 창을 다시 띄워
+                # 홈 화면 조작을 막는다.
+                progress.setLabelText("취소하는 중...")
+                progress.show()
 
         def on_done(sha: str) -> None:
             result["sha"] = sha
@@ -242,7 +248,10 @@ class MainWindow(QMainWindow):
         try:
             worker.start()
             loop.exec()
-            worker.wait(2000)
+            if not worker.wait(2000):
+                # 앱 종료 등으로 루프가 먼저 끝났는데 읽기가 아직 막혀 있으면, 실행 중인 QThread를
+                # 지우는 순간 프로세스가 죽는다("Destroyed while thread is still running"). 끝날 때까지 기다린다.
+                worker.wait()
         finally:
             self._home.setEnabled(True)
             progress.canceled.disconnect(on_cancel)
