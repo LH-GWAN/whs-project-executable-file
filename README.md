@@ -66,7 +66,11 @@ core/                     플랫폼/UI 무관 핵심 로직
 ├── duration.py           영상 재생시간 계산
 ├── acceleration.py       급가속 의심 구간 판정
 ├── hashing.py            SHA-256 무결성 해시
-└── pipeline.py           전체 분석 파이프라인 (위 모듈들을 순서대로 엮음)
+├── pipeline.py           전체 분석 파이프라인 (위 모듈들을 순서대로 엮음)
+├── appconfig.py          지도 사용 방식(오프라인/온라인) 설정 + 온라인 API 키 로딩
+├── kakao_api.py          카카오맵 HTTP 호출 (SDK 진단, 좌표→주소). 표준 라이브러리만 사용
+├── geocode.py            좌표→주소 변환 (캐시, 한도 초과 시 세션 동안 차단)
+└── basemap.py            오프라인 배경지도 파일 탐색 / zip 자동 해제
 
 engine/                   분석 엔진 오케스트레이션
 ├── registry.py           엔진 진입 모듈 이름 (엔진 교체 시 여기만 수정)
@@ -86,13 +90,18 @@ ui/                       PySide6 화면
 ├── speed_chart_widget.py 속도 그래프 렌더링 (QPainter)
 ├── location_tab.py       지도 + 좌표 테이블
 ├── map_view.py           지도 위젯 (QWebEngineView 래퍼)
-├── map_server.py         지도 리소스 로컬 서버
+├── map_server.py         지도 리소스 로컬 서버 (고정 포트, map-config / 진단 엔드포인트)
+├── map_mode_dialog.py    오프라인/온라인 선택 창 (첫 실행, 설정 > 지도 사용 방식)
+├── basemap_notice.py     오프라인 지도 파일이 없을 때 안내 창
+├── address_resolver.py   주소 조회 워커 (최신 요청 하나만, 0.4초 간격)
 ├── workers.py            분석을 백그라운드 스레드에서 실행
 ├── styles.py             QSS
-├── web/map.html          MapLibre 지도 페이지
+├── web/map.html          오프라인 지도 페이지 (MapLibre + PMTiles)
+├── web/map_kakao.html    온라인 지도 페이지 (카카오맵 JavaScript SDK). JS 함수 이름은 map.html과 동일
 └── vendor/               MapLibre GL JS, PMTiles (로컬 번들, CDN 금지)
 
 assets/korea.pmtiles      오프라인 배경지도 (371MB, git 제외)
+assets/online_keys.json   카카오 API 키 (git 제외, 빌드 시 번들). 예시는 online_keys.example.json
 gpstracer.spec            PyInstaller 빌드 정의
 ```
 
@@ -174,6 +183,35 @@ Range(206) 의미론이 필요하다. Qt 커스텀 URL 스킴으로는 206을 �
 Python → JS는 `runJavaScript()` 단방향 주입만 쓴다(지도가 되물어볼 일이 없어 채널 유지
 불필요, 준비 경쟁조건도 사라짐). 렌더 프로세스가 죽으면 최대 3회까지 자동 복구하고,
 복구 후 보던 궤적을 다시 그린다.
+
+### 지도 사용 방식 — 오프라인 / 온라인(카카오맵)
+
+첫 실행 때 `ui/map_mode_dialog.py`가 오프라인·온라인 중 하나를 고르게 하고, 값은
+`%LOCALAPPDATA%/GPSTracer/settings.json`(`map_mode`)에 남는다. 나중에 **설정 > 지도
+사용 방식** 메뉴에서 바꿀 수 있다. 수사 자료를 다루는 도구라 "외부로 나가는가"는
+사용자가 알고 고르는 것이지 프로그램이 조용히 정할 일이 아니다.
+
+| | 오프라인 (기본) | 온라인 |
+|---|---|---|
+| 페이지 | `map.html` (MapLibre + `assets/*.pmtiles`) | `map_kakao.html` (카카오맵 JavaScript SDK) |
+| 외부 통신 | 없음 | 지도: 화면 범위가 카카오로 전송. 주소: 좌표가 카카오로 전송 |
+| 필요한 것 | 지도 파일 | `assets/online_keys.json` (JavaScript 키 + REST API 키) + 인터넷 |
+| 주소 표시 | 안 됨 | Tracker 하단·Location 선택 행에 지번 주소 |
+
+어느 페이지를 띄울지는 `MapServer.map_url()` 하나가 정한다 — 온라인인데 키가 없으면
+오프라인 페이지로 간다. 두 페이지는 `renderTrack` / `setPlaybackTime` / `setFollow`
+함수 이름이 같아서 `ui/map_view.py`는 어느 쪽인지 모른다.
+
+키는 `core/appconfig.online_keys()`가 읽는다. 우선순위는 `settings.json`의
+`kakao_js_key` / `kakao_rest_key` > 번들된 `assets/online_keys.json`. 재빌드 없이 키를
+바꿀 수 있게 설정 쪽을 위에 뒀다. 세 종류 키 중 **JavaScript 키는 지도, REST API 키는
+주소 변환**에 쓰고 네이티브 앱 키는 쓰지 않는다(Android/iOS 전용).
+
+온라인 페이지의 준비/실패는 페이지 안의 `window.__onlineMapState`(`loading` → `ready`
+또는 `error:<원인>`)로 알리고, `MapView`가 잠시 폴링해 `online_map_failed` 시그널로
+올린다. 원인 종류(`quota`/`domain`/`disabled`/`key`/`network`)는 `core/kakao_api.py`의
+`KIND_*`이고, `MainWindow`가 원인별로 한 번씩 안내 창을 띄운다(한도 초과면 "오프라인
+지도로 전환" 버튼을 기본으로).
 
 ---
 
@@ -328,6 +366,63 @@ import하는 순간 `AttributeError`로 죽고, 콘솔이 없어 트레이스백
 vendor는 수정하지 않는 원칙이라 `app.py`의 `_ensure_std_streams()`가 import 전에
 더미 스트림을 채워 방어한다. **이 함수를 지우면 exe가 안 켜진다.**
 
+### 15. 카카오 JavaScript 키는 페이지 출처(포트 포함)를 등록해야 응답한다
+
+카카오 SDK는 요청의 `Referer` 출처가 카카오 디벨로퍼스 **Web 플랫폼 사이트 도메인**과
+정확히 일치해야 응답한다. 실측: `401 domain mismatched! caller=http://127.0.0.1:48213`.
+지도 페이지는 로컬 서버에서 열리므로 포트가 매번 바뀌면 등록이 불가능하다. 그래서
+`ui/map_server.py`는 **48213 → 48214 → 48215 순으로 고정 포트**를 시도한다(모두 막혀
+있으면 임의 포트, 이때 온라인 지도는 "도메인 미등록" 안내가 뜬다).
+
+카카오 디벨로퍼스에서 할 일(계정 소유자만 가능):
+1. 내 애플리케이션 > **카카오맵 > 사용 설정 ON** (꺼져 있으면 `403 App disabled
+   OPEN_MAP_AND_LOCAL service`로 지도·주소 둘 다 거절된다)
+2. **[앱] > [플랫폼 키] > JavaScript 키 > [JavaScript SDK 도메인]**에 `http://127.0.0.1:48213`,
+   `http://127.0.0.1:48214`, `http://127.0.0.1:48215` 등록
+
+두 번째 항목에서 실제로 겪은 함정 두 가지:
+- **[제품 링크 관리 > 웹 도메인]은 다른 설정이다.** 카카오톡 공유 링크용이라 여기 넣으면
+  계속 `domain mismatched`가 난다(카카오 데브톡에 같은 사례 다수).
+- **JS SDK 도메인은 JavaScript 키별로 붙는다.** 앱에 JavaScript 키가 여러 개면 도메인이
+  등록된 키를 `online_keys.json`에 넣어야 한다. 현재 앱(IDAS, 1572145)은 대표 키가 아닌
+  두 번째 키(`9cfb…1967`)에 등록돼 있어 그 키를 쓴다. 대표 키로 바꾸면 지도가 안 뜬다.
+  어느 키에 등록됐는지는 콘솔 플랫폼 키 화면에서 "JS SDK 도메인" 배지로 구분된다.
+
+`GPSTracer.exe --diagnose`가 등록할 주소와 키 유무(마스킹)를 출력한다. 페이지가 SDK
+로드에 실패하면 브라우저는 이유를 숨기므로, 로컬 서버의 `/online-map-diagnose`가 같은
+조건으로 다시 받아 보고 원인을 돌려준다(성공 경로에서는 부르지 않는다 — SDK 로드
+횟수가 한도에 잡힌다).
+
+### 16. API 키 파일은 git에 넣지 말 것
+
+이 저장소는 공개돼 있다. `assets/online_keys.json`은 `.gitignore`에 있고, 빌드하는
+PC의 `assets/`에 있을 때만 `gpstracer.spec`이 번들에 넣는다. 배포된 exe 안에는 키가
+그대로 들어가므로(데스크톱 앱의 한계) 유출되면 카카오 디벨로퍼스에서 재발급하고,
+재빌드 없이 바꾸려면 `settings.json`에 새 키를 넣으면 된다(주의사항 15의 우선순위).
+
+### 17. 한도 초과(429)는 세션 동안 차단하고 한 번만 안내한다
+
+무료 한도는 앱 단위 일일 집계(지도 SDK 30만 건, 좌표→주소 10만 건, 2026-09 기준).
+초과하면 HTTP 429가 온다. `core/geocode.py`는 429나 키 오류를 한 번 보면 세션 동안
+`_block`에 담아 더 묻지 않고, `AddressResolver`가 `failed` 시그널을 한 번만 낸다.
+지도 사용 방식을 다시 고르면(`reset_block`) 재시도한다.
+
+카카오는 **짧은 시간에 몰린 요청도 429**로 거절하는데 일일 한도 초과와 구분할 수
+없다. 그래서 주소 워커는 요청 간격을 0.4초 이상 띄우고 가장 최근 지점 하나만 조회한다.
+같은 좌표는 약 11m(소수 4자리) 단위로 캐시해 재생 중 같은 지점을 반복 조회하지 않는다.
+
+### 18. 주소 조회는 GUI 스레드에서 직접 부르지 말 것
+
+`geocode.describe_location()`은 네트워크를 탄다. 화면은 `geocode.cached_address()`로
+즉시 확인하고, 없으면 `AddressResolver.request()`에 맡긴 뒤 `resolved` 시그널로 받는다.
+재생 중 초당 수십 번 불리는 `_update_info()`에서 동기 호출하면 창이 멈춘다.
+
+### 19. 온라인 페이지는 외부 스크립트를 받는다
+
+`ui/vendor/`의 "CDN 금지" 원칙은 오프라인 페이지 얘기다. `map_kakao.html`은 설계상
+`dapi.kakao.com`에서 SDK를 받고 타일도 카카오에서 온다. 오프라인 모드에서는 이 페이지가
+아예 열리지 않으므로(`map_url()`) 외부 통신 0이라는 보장은 그대로다.
+
 ---
 
 ## 검증 현황
@@ -355,3 +450,35 @@ Land Rover `20250901_215728D`의 GPS 수신 36개(끊김 24개)는 엔진 README
 - 재열람이 엔진 재실행 없이 동일 결과, **원본 파일 삭제 후에도** 조회 가능
 - 실제 샘플로 PDF 리포트 생성 (133KB)
 - 얼린 exe에서 실제 fragmented MP4 추출
+
+### 온라인 지도(카카오맵) — 2026-09-09
+
+**실제 카카오 지도 위에 궤적이 그려지는 것까지 확인했다.** 카카오맵 사용 설정 ON +
+JS SDK 도메인 등록 후, 도봉구 일대 40지점(끊김 2, 급가속 6) 궤적을 앱의 지도 페이지에
+넣어 도로·건물·지명 위에 실선/점선/빨간선과 시작·끝·현재위치 마커가 나오는 것을 브라우저로
+봤다. 헤드리스 WebEngine에서도 SDK `ready`, 타일 21장, 폴리라인 5개, 주소 변환
+(`서울 중구 태평로1가 31`)까지 통과. 단 헤드리스 `grab()`은 빈 이미지라 리포트용 지도
+캡처는 실제 화면에서 확인해야 한다(BUILD.md의 기존 주의와 동일).
+
+컨테이너 크기가 작을 때 초기화되면 지도가 구석에 작게 그려지고 범위 맞춤도 그 크기
+기준이 되는 것을 실측해서, `resize` 시 `map.relayout()` + 궤적 재맞춤(따라가기가 켜져
+있을 때만)을 넣었다.
+
+그 밖에 확인한 것:
+
+- 실제 SDK 호출 실패 경로: 헤드리스 WebEngine에서 `map_kakao.html`을 띄워 SDK 로드 실패
+  → 로컬 진단 → `error:domain` 상태 → `MapView.online_map_failed("domain", …)` 시그널까지
+  전 구간 동작. 상태 문구 "카카오 디벨로퍼스에 이 프로그램 주소가 등록되지 않음"
+- 가짜 SDK를 주입한 렌더링: 좌표 없음/GPS 끊김/급가속이 섞인 12지점 궤적이 실선 2·점선 1·
+  빨간선 1로 나뉘고(공유 정점 포함 13개 좌표), 시작/끝/현재위치 오버레이, 화면 맞춤,
+  가장자리 도달 시 `panTo`, 따라가기 끄면 이동 없음, 재렌더 시 이전 선 제거
+- 지도 서버: 48213 고정 포트, 두 번째 인스턴스는 48214, `/map-config`·`/online-map-diagnose`,
+  키 없으면 온라인이어도 오프라인 페이지, 경로 순회 차단 유지
+- 실측 응답 분류: 401 도메인 불일치 / 403 사용 설정 꺼짐 / 401 키 없음 / 429 → 한도 초과
+- 주소 변환: 캐시(11m), 일시 실패는 차단 안 함, 429·키 오류는 세션 차단 후 호출 0,
+  오프라인 모드에서 호출 0. 워커는 연속 요청 중 마지막 것만 조회하고 실패는 한 번만 보고
+- 안내 창: 원인별 한 번씩, 한도 초과 창의 "오프라인 지도로 전환" 버튼이 설정을 바꾸고
+  지도를 다시 띄움
+- 오프라인 페이지(`map.html`)는 온라인 분기를 걷어낸 뒤에도 배경지도·궤적 정상
+  (헤드리스 실측에서는 `--disable-gpu`를 붙이면 WebGL이 아예 안 잡혔고
+  `--enable-unsafe-swiftshader` 단독이 동작했다 — BUILD.md 참고)

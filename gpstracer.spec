@@ -21,6 +21,7 @@ vendor_datas = [
 
 web_datas = [
     (os.path.join("ui", "web", "map.html"), os.path.join("ui", "web")),
+    (os.path.join("ui", "web", "map_kakao.html"), os.path.join("ui", "web")),
     (os.path.join("ui", "vendor", "maplibre-gl.js"), os.path.join("ui", "vendor")),
     (os.path.join("ui", "vendor", "maplibre-gl.css"), os.path.join("ui", "vendor")),
     (os.path.join("ui", "vendor", "pmtiles.js"), os.path.join("ui", "vendor")),
@@ -29,6 +30,12 @@ web_datas = [
 import glob as _glob
 for _bm in _glob.glob(os.path.join("assets", "*.pmtiles")):
     web_datas.append((_bm, "assets"))
+
+# 온라인 지도(카카오맵) 키. git에는 없고(.gitignore) 빌드하는 PC의 assets/에 있을 때만
+# 번들에 들어간다. 없으면 온라인 모드를 골라도 오프라인 지도로 표시된다.
+_keys = os.path.join("assets", "online_keys.json")
+if os.path.isfile(_keys):
+    web_datas.append((_keys, "assets"))
 
 a = Analysis(
     ["app.py"],

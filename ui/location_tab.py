@@ -2,14 +2,23 @@ from __future__ import annotations
 
 from typing import List
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
-from PySide6.QtWidgets import QHBoxLayout, QSplitter, QTableWidget, QTableWidgetItem, QWidget
-from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
+from core import geocode
 from core.acceleration import FlaggedSegment
-from engine.engine_adapter import TrackPoint
 from core.geocode import external_map_url
+from engine.engine_adapter import TrackPoint
+from ui.address_resolver import AddressResolver
 from ui.map_view import MapView
 
 _FLAG_COLOR = QColor(255, 200, 200)
@@ -35,14 +44,32 @@ class LocationTab(QWidget):
         self._table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self._points: List[TrackPoint] = []
 
+        # 고른 행의 주소. 표 전체에 주소 열을 두면 지점 수만큼(수천 건) 조회가 나가므로
+        # 사용자가 고른 한 지점만 조회한다. 온라인 모드에서만 채워진다.
+        self._selected_label = QLabel("")
+        self._selected_label.setStyleSheet("color: #555; padding: 2px 4px;")
+        self._selected_key = None
+        self._resolver = AddressResolver.instance()
+        self._resolver.resolved.connect(self._on_address_resolved)
+
+        table_panel = QWidget()
+        table_layout = QVBoxLayout(table_panel)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(2)
+        table_layout.addWidget(self._selected_label)
+        table_layout.addWidget(self._table, 1)
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._map)
-        splitter.addWidget(self._table)
+        splitter.addWidget(table_panel)
         splitter.setSizes([500, 500])
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(splitter)
+
+    def map_view(self) -> MapView:
+        return self._map
 
     def _on_cell_double_clicked(self, row: int, column: int) -> None:
         if column != _MAP_LINK_COLUMN or not (0 <= row < len(self._points)):
@@ -67,10 +94,37 @@ class LocationTab(QWidget):
             point = self._points[index]
             if point.start_time_sec is not None:
                 self._map.set_playback_time(point.start_time_sec)
+            self._show_selected(index, point)
+
+    def _show_selected(self, index: int, point: TrackPoint) -> None:
+        if not point.has_fix:
+            self._selected_label.setText(f"#{index + 1}: 좌표 없음")
+            self._selected_key = None
+            return
+        base = f"#{index + 1}: {point.latitude:.6f}, {point.longitude:.6f}"
+        if not geocode.is_available():
+            self._selected_label.setText(base)
+            self._selected_key = None
+            return
+        self._selected_key = geocode.cache_key(point.latitude, point.longitude)
+        cached = geocode.cached_address(point.latitude, point.longitude)
+        if cached is not None:
+            self._selected_label.setText(f"{base}  ({cached})" if cached else base)
+            return
+        self._selected_label.setText(f"{base}  (주소 조회 중…)")
+        self._resolver.request(point.latitude, point.longitude)
+
+    def _on_address_resolved(self, lat: float, lon: float, address: str) -> None:
+        if self._selected_key is None or geocode.cache_key(lat, lon) != self._selected_key:
+            return
+        text = self._selected_label.text().split("  (", 1)[0]
+        self._selected_label.setText(f"{text}  ({address})" if address else text)
 
     def load(self, records: List[TrackPoint], segments: List[FlaggedSegment]) -> None:
         self._points = records
         self._map.set_track(records, segments)
+        self._selected_label.setText("")
+        self._selected_key = None
 
         flagged_indices = set()
         for seg in segments:

@@ -15,9 +15,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core import geocode
 from core.acceleration import FlaggedSegment
 from engine.engine_adapter import TrackPoint
-from core.geocode import describe_location
+from ui.address_resolver import AddressResolver
 from ui.map_view import MapView
 
 
@@ -53,8 +54,8 @@ class TrackerTab(QWidget):
         controls.addWidget(self._time_label)
 
         # 재생 중인 지점의 속도/좌표를 영상 바로 아래에 보여준다. 위경도만으로는
-        # 어디인지 바로 읽기 어려워서 주소도 함께 둘 자리를 만들어 뒀다
-        # (주소 변환은 외부 조회가 필요해 온라인 모드에서만 채워진다).
+        # 어디인지 바로 읽기 어려워서 주소도 함께 둔다. 주소는 외부 조회가 필요해
+        # 온라인 모드에서만 채워지고, 조회는 워커(AddressResolver)가 맡는다.
         self._speed_label = QLabel("속도 -")
         self._speed_label.setStyleSheet("font-weight: 600;")
         self._coord_label = QLabel("위치 -")
@@ -80,6 +81,10 @@ class TrackerTab(QWidget):
         self._points: List[TrackPoint] = []
         self._map = MapView()
 
+        self._resolver = AddressResolver.instance()
+        self._resolver.resolved.connect(self._on_address_resolved)
+        self._addr_key = None  # 지금 화면에 보이는(또는 조회 중인) 지점의 캐시 키
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(video_container)
         splitter.addWidget(self._map)
@@ -89,6 +94,9 @@ class TrackerTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(splitter)
 
+    def map_view(self) -> MapView:
+        return self._map
+
     def load_video(self, path: str) -> None:
         self._player.setSource(QUrl.fromLocalFile(path))
 
@@ -96,6 +104,7 @@ class TrackerTab(QWidget):
                     segments: Optional[List[FlaggedSegment]] = None) -> None:
         self._points = points
         self._map.set_track(points, segments)
+        self._addr_key = None
         self._update_info(0.0)
 
     def _point_at(self, seconds: float) -> Optional[TrackPoint]:
@@ -115,6 +124,7 @@ class TrackerTab(QWidget):
             self._speed_label.setText("속도 -")
             self._coord_label.setText("위치 -")
             self._addr_label.setText("")
+            self._addr_key = None
             return
 
         self._speed_label.setText(
@@ -122,13 +132,31 @@ class TrackerTab(QWidget):
 
         if point.has_fix:
             self._coord_label.setText(f"위치 {point.latitude:.6f}, {point.longitude:.6f}")
-        elif point.is_dropout:
-            self._coord_label.setText("위치 (GPS 끊김)")
+            self._show_address(point.latitude, point.longitude)
         else:
-            self._coord_label.setText("위치 (GPS 미기록)")
+            self._coord_label.setText("위치 (GPS 끊김)" if point.is_dropout else "위치 (GPS 미기록)")
+            self._addr_label.setText("")
+            self._addr_key = None
 
-        address = describe_location(point.latitude, point.longitude) if point.has_fix else ""
-        self._addr_label.setText(f"({address})" if address else "")
+    def _show_address(self, lat: float, lon: float) -> None:
+        if not geocode.is_available():
+            self._addr_label.setText("")
+            self._addr_key = None
+            return
+        key = geocode.cache_key(lat, lon)
+        if key == self._addr_key:
+            return
+        self._addr_key = key
+        cached = geocode.cached_address(lat, lon)
+        if cached is not None:
+            self._addr_label.setText(f"({cached})" if cached else "")
+            return
+        # 조회가 끝날 때까지 직전 주소를 그대로 둔다. 매초 비웠다 채우면 깜빡인다.
+        self._resolver.request(lat, lon)
+
+    def _on_address_resolved(self, lat: float, lon: float, address: str) -> None:
+        if geocode.cache_key(lat, lon) == self._addr_key:
+            self._addr_label.setText(f"({address})" if address else "")
 
     def _toggle_play(self) -> None:
         if self._player.playbackState() == QMediaPlayer.PlayingState:

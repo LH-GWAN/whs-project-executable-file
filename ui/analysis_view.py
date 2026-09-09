@@ -32,6 +32,9 @@ def _format_duration(seconds) -> str:
 class AnalysisView(QWidget):
     home_requested = Signal()
     report_requested = Signal(object)
+    # 온라인 지도(카카오맵)를 띄우지 못했을 때 (원인 종류, 서버 메시지). 두 탭의 지도가
+    # 각각 내는 신호를 하나로 모은다. 안내는 MainWindow가 한다.
+    online_map_failed = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -76,6 +79,8 @@ class AnalysisView(QWidget):
         self._tracker_tab = TrackerTab()
         self._speed_tab = SpeedTab()
         self._location_tab = LocationTab()
+        for tab in (self._tracker_tab, self._location_tab):
+            tab.map_view().online_map_failed.connect(self.online_map_failed)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -113,6 +118,11 @@ class AnalysisView(QWidget):
             self._location_tab.load(result.extraction.points, result.flagged_segments)
 
         self._on_tab_changed(self._tabs.currentIndex())
+
+    def reload_maps(self) -> None:
+        """지도 사용 방식(오프라인/온라인)이 바뀐 뒤 이미 떠 있는 지도를 새 방식으로 다시 띄운다."""
+        for tab in (self._tracker_tab, self._location_tab):
+            tab.map_view().reload()
 
     def _on_tab_changed(self, _index: int) -> None:
         widget = self._tabs.currentWidget()

@@ -59,6 +59,7 @@ let trackData = null;
 let pendingTrack = null;
 let followEnabled = true;
 let selfMove = false;
+let fallbackNote = "";
 
 function setStatus(text) {
   document.getElementById("status").textContent = text;
@@ -70,20 +71,9 @@ async function addBasemapIfAvailable() {
     cfg = await (await fetch("map-config")).json();
   } catch (e) { return false; }
 
-  if (cfg.mode === "online") {
-    if (!cfg.onlineTileUrl) {
-      setStatus("온라인 지도가 아직 설정되지 않았습니다 · 궤적만 표시");
-      return false;
-    }
-    map.addSource("basemap", {
-      type: "raster",
-      tiles: [cfg.onlineTileUrl],
-      tileSize: 256,
-      attribution: cfg.onlineAttribution || "",
-    });
-    map.addLayer({ id: "bm-raster", type: "raster", source: "basemap" });
-    return true;
-  }
+  // 온라인 지도는 별도 페이지(map_kakao.html)가 맡는다. 온라인을 골랐는데 키가 없어
+  // 이 페이지로 온 경우만 여기서 알 수 있으니 상태 문구에 그 사실을 남긴다.
+  if (cfg.mode === "online") fallbackNote = " · 온라인 지도 키 없음";
 
   if (!cfg.available) return false;
 
@@ -226,7 +216,7 @@ function renderTrack(payload) {
 
     const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
     setStatus(`좌표 ${fixes.length}개` + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : "")
-      + (window.__hasBasemap ? "" : " · 배경지도 없음(궤적만 표시)"));
+      + (window.__hasBasemap ? "" : " · 배경지도 없음(궤적만 표시)") + fallbackNote);
   } else {
     setStatus(pts.length ? "GPS 수신이 없는 구간뿐이라 표시할 좌표가 없습니다."
                           : "표시할 GPS 좌표가 없습니다.");
@@ -313,7 +303,7 @@ async function initOnce() {
     window.__mapReady = true;
     window.__hasBasemap = hasBasemap;
     if (pendingTrack) { const t = pendingTrack; pendingTrack = null; renderTrack(t); }
-    else setStatus(hasBasemap ? "지도 준비 완료" : "배경지도 없음 · 궤적만 표시합니다");
+    else setStatus((hasBasemap ? "지도 준비 완료" : "배경지도 없음 · 궤적만 표시합니다") + fallbackNote);
   } catch (e) {
 
     window.__mapError = String((e && e.stack) || e);
