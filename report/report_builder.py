@@ -5,7 +5,8 @@ import html
 import os
 from typing import List, Optional
 
-from PySide6.QtCore import QObject, QUrl
+from PySide6.QtCore import QMarginsF, QObject, QUrl
+from PySide6.QtGui import QPageLayout, QPageSize
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from core.acceleration import FlaggedSegment
@@ -125,9 +126,9 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
-  /* 다음 장으로 넘어갈 때 내용이 종이 맨 위에 붙어 인쇄되던 문제 - 페이지마다
-     위아래 여백을 준다. printToPdf는 이 @page 여백을 그대로 반영한다. */
-  @page {{ margin: 18mm 14mm; }}
+  /* 종이 여백은 ReportExporter가 printToPdf에 주는 QPageLayout(A4, 좌우 20mm·상하 18mm)이
+     정한다. CSS @page 여백은 QtWebEngine이 인자로 받은 레이아웃에 눌려 반영되지 않았고,
+     기본 레이아웃은 여백 0이라 내용이 종이 왼쪽 끝에 붙어 나왔다. */
   body {{ font-family: -apple-system, "Malgun Gothic", sans-serif; color: #111; margin: 0; }}
   h2 {{ break-after: avoid; page-break-after: avoid; }}
   figure {{ margin: 0 0 14px; break-inside: avoid; page-break-inside: avoid; }}
@@ -181,11 +182,15 @@ class ReportExporter(QObject):
         self._view.page().pdfPrintingFinished.connect(self._on_pdf_finished)
         self._view.setHtml(html_str, QUrl("about:blank"))
 
+    # A4에 글 쓸 때처럼 양쪽에 여백을 둔다. printToPdf의 기본 레이아웃은 여백 0이다.
+    PAGE_LAYOUT = QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait,
+                              QMarginsF(20, 18, 20, 18), QPageLayout.Millimeter)
+
     def _on_load_finished(self, ok: bool) -> None:
         if not ok:
             self._on_done(False, "리포트 HTML 로드 실패")
             return
-        self._view.page().printToPdf(self._out_path)
+        self._view.page().printToPdf(self._out_path, self.PAGE_LAYOUT)
 
     def _on_pdf_finished(self, file_path: str, success: bool) -> None:
         self._on_done(success, "" if success else "PDF 저장 실패")

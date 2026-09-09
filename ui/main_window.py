@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QStackedWidget,
@@ -69,7 +70,10 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._analysis_view)
         self.setCentralWidget(self._stack)
 
-        settings_menu = self.menuBar().addMenu("설정")
+        # 메뉴바는 눈에 안 띄어 찾기 어렵다는 피드백으로, 각 화면 우측 상단의 '⚙ 설정' 버튼에
+        # 같은 메뉴를 단다. 메뉴바는 만들지 않는다.
+        settings_menu = QMenu("설정", self)
+        self._settings_menu = settings_menu
         map_mode_action = QAction("지도 사용 방식…", self)
         map_mode_action.triggered.connect(self._on_map_mode_action)
         settings_menu.addAction(map_mode_action)
@@ -83,6 +87,8 @@ class MainWindow(QMainWindow):
         reset_action = QAction("지도 설정 초기화 (처음 실행처럼 다시 묻기)", self)
         reset_action.triggered.connect(self._on_reset_map_settings)
         settings_menu.addAction(reset_action)
+        self._home.set_settings_menu(settings_menu)
+        self._analysis_view.set_settings_menu(settings_menu)
 
         self._worker: Optional[AnalysisWorker] = None
         self._progress: Optional[QProgressDialog] = None

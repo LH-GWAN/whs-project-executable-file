@@ -50,6 +50,36 @@ QFrame[role="upload-box"] {
 #FileInfoBar {
     border-bottom: 1px solid #dddddd;
 }
+#FileInfoBar QLabel[role="badge"] {
+    border: 1px solid #111111;
+    border-radius: 2px;
+    padding: 1px 7px;
+    font-weight: 700;
+}
+#FileInfoBar QLabel[role="info-key"] {
+    color: #666666;
+}
+#FileInfoBar QFrame[role="vsep"] {
+    color: #cccccc;
+}
+#FileInfoBar QLabel[role="hash"] {
+    font-family: Menlo, Consolas, "Courier New", monospace;
+}
+
+/* 설정 메뉴 버튼(화면 우측 상단). 메뉴바 대신 눈에 띄는 자리에 둔다. */
+QToolButton[role="settings"] {
+    border: 1px solid #cccccc;
+    border-radius: 2px;
+    padding: 5px 10px;
+    background-color: #ffffff;
+}
+QToolButton[role="settings"]:hover {
+    background-color: #f0f0f0;
+}
+QToolButton[role="settings"]::menu-indicator {
+    image: none;
+    width: 0;
+}
 
 QTabBar::tab {
     padding: 8px 16px;

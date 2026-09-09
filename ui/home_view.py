@@ -88,10 +88,21 @@ class HomeView(QWidget):
         body.addLayout(left, 2)
         body.addLayout(right, 1)
 
+        title_row = QHBoxLayout()
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self._settings_slot = QHBoxLayout()
+        self._settings_slot.setContentsMargins(0, 0, 0, 0)
+        title_row.addLayout(self._settings_slot)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(title)
+        layout.addLayout(title_row)
         layout.addLayout(body, 1)
         self._update_buttons()
+
+    def set_settings_menu(self, menu) -> None:
+        from ui.analysis_view import make_settings_button
+        self._settings_slot.addWidget(make_settings_button(menu, self))
 
     def _on_upload_clicked(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "블랙박스 영상 선택", "", VIDEO_FILTER)

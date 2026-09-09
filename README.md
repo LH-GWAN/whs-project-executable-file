@@ -192,6 +192,13 @@ Range(206) 의미론이 필요하다. Qt 커스텀 URL 스킴으로는 206을 �
 표준 HTTP를 쓴다. **`127.0.0.1`에만 바인딩**하고 임의 포트를 쓰며, 앱 자신의 정적
 파일과 지도 파일만 서빙한다. 사건 GPS 좌표는 이 서버를 타지 않는다.
 
+### 리포트 PDF 여백
+
+`report/report_builder.py`의 `ReportExporter`는 `printToPdf`에 A4·좌우 20mm·상하 18mm의
+`QPageLayout`을 넘긴다. **CSS `@page` 여백은 QtWebEngine이 인자로 받은 레이아웃에 눌려
+반영되지 않았고**, 인자를 안 주면 기본 여백이 0이라 내용이 종이 왼쪽 끝에 붙어 나왔다
+(실측: 왼쪽 여백 20.1mm로 확인).
+
 ### `ui/map_view.py` — 지도 위젯
 
 Python → JS는 `runJavaScript()` 단방향 주입만 쓴다(지도가 되물어볼 일이 없어 채널 유지
@@ -201,8 +208,9 @@ Python → JS는 `runJavaScript()` 단방향 주입만 쓴다(지도가 되물�
 ### 지도 사용 방식 — 오프라인 / 온라인(카카오맵)
 
 첫 실행 때 `ui/map_mode_dialog.py`가 오프라인·온라인 중 하나를 고르게 하고, 값은
-`%LOCALAPPDATA%/GPSTracer/settings.json`(`map_mode`)에 남는다. 나중에 **설정 > 지도
-사용 방식** 메뉴에서 바꿀 수 있다. 이 값과 안내 창의 "다시 표시하지 않음"(레지스트리
+`%LOCALAPPDATA%/GPSTracer/settings.json`(`map_mode`)에 남는다. 나중에 화면 우측 상단
+**⚙ 설정 > 지도 사용 방식** 메뉴에서 바꿀 수 있다(메뉴바가 아니라 각 화면 헤더의 버튼이다 —
+메뉴바는 눈에 안 띈다는 피드백으로 옮겼다). 이 값과 안내 창의 "다시 표시하지 않음"(레지스트리
 `HKCU\Software\GPSTracer`, QSettings)은 **사용자 데이터 영역**이라 `clean_windows.bat`이나
 재빌드로는 지워지지 않는다 — 그래서 두 번째 실행부터는 묻지 않는다. 처음처럼 다시 묻게
 하려면 **설정 > 지도 설정 초기화** 메뉴를 쓰거나, clean 스크립트 끝의 "Reset app settings"에
