@@ -73,7 +73,7 @@ class MainWindow(QMainWindow):
         map_mode_action.triggered.connect(self._on_map_mode_action)
         settings_menu.addAction(map_mode_action)
         keys_action = QAction("온라인 지도 키 설정 안내…", self)
-        keys_action.triggered.connect(lambda: show_online_keys_notice(self, allow_suppress=False))
+        keys_action.triggered.connect(self._on_keys_notice_action)
         settings_menu.addAction(keys_action)
         basemap_action = QAction("오프라인 지도 파일 안내…", self)
         basemap_action.triggered.connect(lambda: show_basemap_notice(self))
@@ -118,7 +118,13 @@ class MainWindow(QMainWindow):
         if mode == MAP_MODE_OFFLINE and should_show_notice():
             show_basemap_notice(self)
         elif mode != MAP_MODE_OFFLINE and should_show_keys_notice():
-            show_online_keys_notice(self)
+            # 안내 창에서 [다시 확인]으로 키가 인식되면 떠 있는 지도를 온라인으로 바꿔 띄운다.
+            if show_online_keys_notice(self):
+                self._analysis_view.reload_maps()
+
+    def _on_keys_notice_action(self) -> None:
+        if show_online_keys_notice(self, allow_suppress=False):
+            self._analysis_view.reload_maps()
 
     def _on_map_mode_action(self) -> None:
         current = get_map_mode()

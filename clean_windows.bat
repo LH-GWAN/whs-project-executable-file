@@ -13,6 +13,15 @@ REM ============================================================
 setlocal
 cd /d "%~dp0"
 
+tasklist /FI "IMAGENAME eq GPSTracer.exe" 2>nul | find /I "GPSTracer.exe" >nul
+if not errorlevel 1 (
+    echo.
+    echo [ERROR] GPSTracer.exe is running. Close the app first.
+    echo.
+    pause
+    exit /b 1
+)
+
 echo.
 echo This will delete, in "%CD%":
 echo.

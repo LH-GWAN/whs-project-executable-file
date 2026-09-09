@@ -75,7 +75,7 @@ async function addBasemapIfAvailable() {
 
   // 온라인 지도는 별도 페이지(map_kakao.html)가 맡는다. 온라인을 골랐는데 키가 없어
   // 이 페이지로 온 경우만 여기서 알 수 있으니 상태 문구에 그 사실을 남긴다.
-  if (cfg.mode === "online") fallbackNote = " · 온라인 지도 키 없음";
+  if (cfg.mode === "online") fallbackNote = " · 온라인 지도 키를 찾지 못해 오프라인 지도로 표시 (설정 > 온라인 지도 키 설정 안내)";
 
   if (!cfg.available) return false;
 

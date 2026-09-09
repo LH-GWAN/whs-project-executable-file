@@ -1,6 +1,0 @@
-{
-  "_comment": "이 파일을 online_keys.json 으로 복사하고 카카오 디벨로퍼스에서 발급받은 키를 넣는다. online_keys.json 은 git에 올라가지 않는다.",
-  "provider": "kakao",
-  "kakao_js_key": "카카오 디벨로퍼스 > 앱 키 > JavaScript 키",
-  "kakao_rest_key": "카카오 디벨로퍼스 > 앱 키 > REST API 키"
-}

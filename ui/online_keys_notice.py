@@ -18,6 +18,8 @@ from core.appconfig import (
     ONLINE_KEYS_DOWNLOAD_URL,
     get_map_mode,
     is_online_map_ready,
+    key_status_report,
+    keys_dir,
     keys_file_path,
     online_keys,
 )
@@ -45,7 +47,10 @@ KEYS_TEMPLATE = {
 
 def should_show_notice() -> bool:
     """온라인을 골랐는데 지도용 키가 없고, 사용자가 안내를 끄지 않았을 때."""
-    if get_map_mode() != MAP_MODE_ONLINE or is_online_map_ready():
+    if get_map_mode() != MAP_MODE_ONLINE:
+        return False
+    online_keys(force=True)  # 방금 넣은 파일도 바로 반영
+    if is_online_map_ready():
         return False
     settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
     return not settings.value(_SUPPRESS_KEY, False, type=bool)
@@ -64,12 +69,21 @@ def ensure_keys_template() -> str:
 
 def notice_text() -> str:
     domains = "\n".join(f"      {'http://127.0.0.1:' + str(p)}" for p in MAP_SERVER_PREFERRED_PORTS)
-    keys = online_keys()
+    keys = online_keys(force=True)
     state = []
     if not keys["js"]:
         state.append("JavaScript 키 없음")
     if not keys["rest"]:
         state.append("REST API 키 없음")
+    # 어디를 봤고 어떤 파일을 왜 못 썼는지. "넣었는데 없다고 한다"를 여기서 풀어 준다.
+    report = "\n".join("   " + line for line in key_status_report().splitlines()[1:])
+    where_block = (
+        f"키 파일을 찾는 폴더 (exe로 쓸 때는 _internal\\assets 가 이 폴더입니다):\n   {keys_dir()}\n"
+        + (report + "\n" if report else "")
+        + "   ※ 이름은 online_keys.json 이 아니어도 되지만 .json 또는 .txt 여야 하고, 값은\n"
+        "      영문 소문자·숫자 32자여야 합니다. 파일을 넣은 뒤 [다시 확인]을 누르면 프로그램을\n"
+        "      다시 켜거나 빌드하지 않아도 바로 인식합니다.\n"
+    )
     shared_block = ""
     if download_available():
         shared_block = (
@@ -86,7 +100,7 @@ def notice_text() -> str:
     )
     return (
         f"현재 상태: {', '.join(state) if state else '키 설정됨'}\n"
-        f"키 파일 위치: {keys_file_path()}\n"
+        f"{where_block}"
         f"{shared_block}"
         "\n"
         "1. [카카오 디벨로퍼스 열기]를 눌러 로그인하고 [애플리케이션 추가]로 앱을 만듭니다\n"
@@ -108,12 +122,17 @@ def notice_text() -> str:
     )
 
 
-def show_online_keys_notice(parent=None, allow_suppress: bool = True) -> None:
+def show_online_keys_notice(parent=None, allow_suppress: bool = True) -> bool:
+    """안내 창을 띄운다. 창을 닫을 때 키가 인식된 상태면 True(호출한 쪽이 지도를 다시 띄운다)."""
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Information)
     box.setWindowTitle("온라인 지도 키 설정")
-    box.setText("온라인 지도(카카오맵)를 쓰려면 카카오 API 키가 필요합니다.")
+    ready_now = is_online_map_ready()
+    box.setText("온라인 지도 키가 인식됐습니다." if ready_now
+                else "온라인 지도(카카오맵)를 쓰려면 카카오 API 키가 필요한데, 아직 찾지 못했습니다.\n"
+                     "키를 넣기 전까지는 오프라인 지도(배경지도 파일)로 표시됩니다.")
     box.setInformativeText(notice_text())
+    recheck_btn = box.addButton("다시 확인", QMessageBox.ActionRole)
     download_btn = None
     if download_available():
         download_btn = box.addButton("키 파일 내려받기", QMessageBox.ActionRole)
@@ -130,8 +149,18 @@ def show_online_keys_notice(parent=None, allow_suppress: bool = True) -> None:
         box.setCheckBox(suppress)
     box.exec()
 
-    folder = os.path.dirname(keys_file_path())
+    folder = keys_dir()
     clicked = box.clickedButton()
+    if clicked is recheck_btn:
+        keys = online_keys(force=True)
+        if keys["js"]:
+            QMessageBox.information(
+                parent, "온라인 지도 키",
+                f"키를 찾았습니다: {keys['source']}\n온라인 지도를 켭니다."
+                + ("" if keys["rest"] else "\n(REST API 키가 없어 주소는 표시되지 않습니다)"))
+            return True
+        # 아직 못 찾았으면 이유가 갱신된 안내 창을 다시 띄운다.
+        return show_online_keys_notice(parent, allow_suppress)
     if download_btn is not None and clicked is download_btn:
         # 배경지도 안내와 같다 - 버튼을 누르면 창이 닫혀 [폴더 열기]를 따로 누를 수 없으니
         # 받는 동안 넣을 폴더도 같이 열어 둔다.
@@ -161,3 +190,4 @@ def show_online_keys_notice(parent=None, allow_suppress: bool = True) -> None:
 
     if suppress is not None and suppress.isChecked():
         QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(_SUPPRESS_KEY, True)
+    return bool(online_keys(force=True)["js"]) and not ready_now

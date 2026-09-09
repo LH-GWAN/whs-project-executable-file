@@ -8,6 +8,9 @@
 ### 준비물
 - Windows 10/11 64bit
 - Python 3.11 또는 3.12 (64bit) — 설치 시 **"Add python.exe to PATH"** 체크
+- **GPSTracer가 실행 중이면 먼저 끌 것.** 실행 중에 빌드하면 exe가 잡고 있는 `dist\` 파일을
+  PyInstaller가 바꾸지 못해 깨진다. `build_windows.bat`과 `clean_windows.bat`은 실행 중인
+  `GPSTracer.exe`가 있으면 시작하지 않고 안내 후 멈춘다.
 
 ### 빌드
 프로젝트 폴더에서 `build_windows.bat`을 더블클릭하거나:
@@ -122,7 +125,9 @@ dist\GPSTracer\GPSTracer.exe --diagnose
 [`assets/README.md`](assets/README.md)에 있고, 프로그램 안에서도 온라인을 고르면
 안내 창이 뜬다. 파일이 있으면 `gpstracer.spec`이 자동으로 번들에 넣고, 없으면 온라인을
 골라도 오프라인 지도로 표시된다. 빌드 후에 넣으려면 배경지도처럼
-`dist\GPSTracer\_internal\assets\`에 두면 된다.
+`dist\GPSTracer\_internal\assets\`에 두면 된다 — **재빌드도, 재시작도 필요 없다.**
+프로그램 안내 창의 [다시 확인]을 누르면 바로 인식한다. 넣었는데도 "키 없음"이면 안내 창에
+파일별 사유가 적혀 있고, `assets/README.md`의 "넣었는데 키 없음이 뜰 때"를 참고한다.
 
 이 파일은 `.gitignore`에 있어 **git으로는 절대 전달되지 않는다.** 저장소가 공개라
 키를 커밋하면 안 된다.

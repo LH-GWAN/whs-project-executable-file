@@ -19,7 +19,7 @@ def _diagnose() -> int:
 
     from core.paths import is_frozen, resource_root, vendor_dir
     from core.appconfig import (
-        MAP_SERVER_PREFERRED_PORTS, get_map_mode, keys_file_path, mask_key, online_keys,
+        MAP_SERVER_PREFERRED_PORTS, get_map_mode, key_status_report, mask_key, online_keys,
     )
     from core.basemap import basemap_path, extract_zipped_basemap
     from ui.map_server import vendor_dir as web_vendor_dir, web_dir
@@ -70,10 +70,11 @@ def _diagnose() -> int:
 
     print("온라인 지도 (카카오맵)")
     show("map_kakao.html", os.path.join(web_dir(), "map_kakao.html"))
-    show("키 파일 online_keys.json", keys_file_path())
-    keys = online_keys()
+    keys = online_keys(force=True)
     print(f"  JavaScript 키  : {mask_key(keys['js']) or '(없음 - 온라인 지도 불가)'}")
     print(f"  REST API 키    : {mask_key(keys['rest']) or '(없음 - 주소 표시 불가)'}")
+    for line in key_status_report().splitlines():
+        print("  " + line)
     print(f"  지도 사용 방식 : {get_map_mode() or '(아직 선택 안 함 - 첫 실행 때 물어봄)'}")
     print("  카카오 디벨로퍼스 Web 플랫폼에 등록할 사이트 도메인:")
     for port in MAP_SERVER_PREFERRED_PORTS:

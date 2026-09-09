@@ -103,7 +103,7 @@ ui/                       PySide6 화면
 └── vendor/               MapLibre GL JS, PMTiles (로컬 번들, CDN 금지)
 
 assets/korea.pmtiles      오프라인 배경지도 (371MB, git 제외)
-assets/online_keys.json   카카오 API 키 (git 제외, 빌드 시 번들). 예시는 online_keys.example.json
+assets/online_keys.json   카카오 API 키 (git 제외, 빌드 시 번들). 없으면 안내 창의 [키 파일 만들기]
 gpstracer.spec            PyInstaller 빌드 정의
 ```
 
@@ -221,8 +221,13 @@ Python → JS는 `runJavaScript()` 단방향 주입만 쓴다(지도가 되물�
 전체는 [`assets/README.md`](assets/README.md)에 있다.
 
 키는 `core/appconfig.online_keys()`가 읽는다. 우선순위는 `settings.json`의
-`kakao_js_key` / `kakao_rest_key` > 번들된 `assets/online_keys.json`. 재빌드 없이 키를
-바꿀 수 있게 설정 쪽을 위에 뒀다. 세 종류 키 중 **JavaScript 키는 지도, REST API 키는
+`kakao_js_key` / `kakao_rest_key` > `assets/` 안의 키 파일. 재빌드 없이 키를
+바꿀 수 있게 설정 쪽을 위에 뒀다. 키 파일은 이름을 고정하지 않고 폴더 안의 `.json`/`.txt`
+후보를 모두 읽어 **영문 소문자·숫자 32자 형식**인 값만 키로 인정한다(예시 문구·BOM·깨진
+따옴표 대응). 파일 목록/수정 시각이 바뀌면 2초 안에 다시 읽으므로 재시작이 필요 없고,
+안내 창의 [다시 확인]은 즉시 다시 읽어 지도를 온라인으로 바꿔 띄운다. 어떤 파일을 왜 못
+썼는지는 `key_status_report()`가 안내 창과 `--diagnose`에 파일별로 적어 준다.
+exe는 `_internal/assets/`를 보므로 빌드 뒤에 넣어도 된다(BUILD.md). 세 종류 키 중 **JavaScript 키는 지도, REST API 키는
 주소 변환**에 쓰고 네이티브 앱 키는 쓰지 않는다(Android/iOS 전용).
 
 온라인 페이지의 준비/실패는 페이지 안의 `window.__onlineMapState`(`loading` → `ready`

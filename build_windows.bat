@@ -13,6 +13,18 @@ REM ============================================================
 setlocal
 cd /d "%~dp0"
 
+REM Building while the app is running fails: PyInstaller cannot replace
+REM the files under dist\ that the running exe has open.
+tasklist /FI "IMAGENAME eq GPSTracer.exe" 2>nul | find /I "GPSTracer.exe" >nul
+if not errorlevel 1 (
+    echo.
+    echo [ERROR] GPSTracer.exe is running. Close the app first, then run
+    echo         this script again.
+    echo.
+    pause
+    exit /b 1
+)
+
 where python >nul 2>&1
 if errorlevel 1 (
     echo.
@@ -48,6 +60,14 @@ if errorlevel 1 (
     echo.
     choice /c YN /t 10 /d Y /m "Continue without the basemap (auto-yes in 10s)"
     if errorlevel 2 exit /b 1
+)
+
+if exist "assets\online_keys.json" (
+    echo [INFO] Online map key file found: assets\online_keys.json
+    echo        It will be bundled into dist\GPSTracer\_internal\assets\.
+) else (
+    echo [INFO] No assets\online_keys.json - online map stays off until a key
+    echo        file is put in dist\GPSTracer\_internal\assets\ after the build.
 )
 
 echo.
