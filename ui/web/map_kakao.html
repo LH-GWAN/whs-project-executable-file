@@ -77,6 +77,8 @@ let trackData = null;
 let pendingTrack = null;
 let followEnabled = true;
 let polylines = [];
+// 따라가기 상자: 화면의 80% (가장자리에서 10%씩 안쪽)
+const FOLLOW_MARGIN = 0.10;
 let startOverlay = null, endOverlay = null, posOverlay = null;
 
 function setStatus(text) {
@@ -302,13 +304,15 @@ function setPlaybackTime(sec) {
   posOverlay.setMap(map);
 
   // 확대해서 보면 차량이 금방 화면 밖으로 나가서 사용자가 마우스로 계속 따라가야 했다.
-  // 마커가 가장자리에 가까워지면 지도를 그쪽으로 밀어준다. 사용자가 직접 지도를
-  // 움직이면 따라가기를 꺼서, 보고 싶은 곳을 뺏지 않는다.
+  // 화면 가운데에 가로세로 80% 크기의 상자가 있다고 보고, 마커가 그 상자를 벗어나면
+  // 마커가 화면 가운데에 오도록 지도를 옮긴다(panTo는 가운데 정렬). 매번 가운데에
+  // 두면 GPS가 갱신되는 매초 지도가 움직여 읽기 어려워서, 상자 안에서는 가만히 둔다.
+  // 사용자가 직접 지도를 움직이면 따라가기를 꺼서, 보고 싶은 곳을 뺏지 않는다.
   if (followEnabled) {
     const el = document.getElementById("map");
     const pt = map.getProjection().containerPointFromCoords(pos);
-    const mx = el.clientWidth * 0.25;
-    const my = el.clientHeight * 0.25;
+    const mx = el.clientWidth * FOLLOW_MARGIN;
+    const my = el.clientHeight * FOLLOW_MARGIN;
     if (pt.x < mx || pt.x > el.clientWidth - mx || pt.y < my || pt.y > el.clientHeight - my) {
       map.panTo(pos);
     }

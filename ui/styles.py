@@ -61,51 +61,30 @@ QTabBar::tab:selected {
     border-bottom: 2px solid #111111;
 }
 
-/* 라디오/체크박스: 전역 QWidget 배경색 때문에 기본 스타일의 표시가 흐려져서
-   고른 항목이 눈에 안 띈다. 고른 쪽은 파란 테두리에 가운데 점이 켜지게 직접 그린다. */
+/* 라디오(지도 사용 방식 선택): 전역 QWidget 배경색 때문에 기본 표시가 흐려져서
+   고른 항목이 눈에 안 띈다. 고른 쪽은 동그라미 안을 지름의 80%쯤 되는 파란 점으로
+   채운다. 체크박스(분석 항목 설정)는 손대지 않는다. */
 QRadioButton {
     spacing: 8px;
     padding: 2px 0;
 }
-QRadioButton:checked {
-    color: #1c7ed6;
-    font-weight: 600;
-}
 QRadioButton::indicator {
-    width: 14px;
-    height: 14px;
+    width: 16px;
+    height: 16px;
     border-radius: 9px;
-    border: 2px solid #9a9a9a;
+    border: 1px solid #8a8a8a;
     background-color: #ffffff;
 }
 QRadioButton::indicator:hover {
     border-color: #1c7ed6;
 }
 QRadioButton::indicator:checked {
-    border: 2px solid #1c7ed6;
+    border: 1px solid #1c7ed6;
     background-color: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
-        stop:0 #1c7ed6, stop:0.55 #1c7ed6, stop:0.65 #ffffff, stop:1 #ffffff);
+        stop:0 #1c7ed6, stop:0.78 #1c7ed6, stop:0.84 #ffffff, stop:1 #ffffff);
 }
 QRadioButton::indicator:disabled {
     border-color: #cccccc;
-}
-
-QCheckBox {
-    spacing: 8px;
-}
-QCheckBox::indicator {
-    width: 14px;
-    height: 14px;
-    border-radius: 3px;
-    border: 2px solid #9a9a9a;
-    background-color: #ffffff;
-}
-QCheckBox::indicator:hover {
-    border-color: #1c7ed6;
-}
-QCheckBox::indicator:checked {
-    border: 2px solid #1c7ed6;
-    background-color: #1c7ed6;
 }
 
 QTableWidget {
