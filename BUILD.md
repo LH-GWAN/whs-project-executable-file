@@ -118,9 +118,11 @@ dist\GPSTracer\GPSTracer.exe --diagnose
 ## 온라인 지도 키 넣기 (선택)
 
 온라인 모드(카카오맵)를 쓰려면 빌드 전에 `assets/online_keys.json`을 만든다.
-`assets/online_keys.example.json`을 복사해 카카오 디벨로퍼스의 **JavaScript 키**와
-**REST API 키**를 넣으면 된다(네이티브 앱 키는 쓰지 않는다). 파일이 있으면
-`gpstracer.spec`이 자동으로 번들에 넣고, 없으면 온라인을 골라도 오프라인 지도로 표시된다.
+발급 절차(앱 생성 → 카카오맵 사용 설정 → 키 복사 → JS SDK 도메인 등록)는
+[`assets/README.md`](assets/README.md)에 있고, 프로그램 안에서도 온라인을 고르면
+안내 창이 뜬다. 파일이 있으면 `gpstracer.spec`이 자동으로 번들에 넣고, 없으면 온라인을
+골라도 오프라인 지도로 표시된다. 빌드 후에 넣으려면 배경지도처럼
+`dist\GPSTracer\_internal\assets\`에 두면 된다.
 
 이 파일은 `.gitignore`에 있어 **git으로는 절대 전달되지 않는다.** 저장소가 공개라
 키를 커밋하면 안 된다.

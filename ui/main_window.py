@@ -24,6 +24,10 @@ from ui.case_info_dialog import CaseInfoDialog
 from ui.home_view import HomeView
 from ui.map_mode_dialog import ask_map_mode
 from ui.map_server import MapServer
+from ui.online_keys_notice import (
+    should_show_notice as should_show_keys_notice,
+    show_online_keys_notice,
+)
 from ui.workers import AnalysisWorker
 
 
@@ -58,6 +62,12 @@ class MainWindow(QMainWindow):
         map_mode_action = QAction("지도 사용 방식…", self)
         map_mode_action.triggered.connect(self._on_map_mode_action)
         settings_menu.addAction(map_mode_action)
+        keys_action = QAction("온라인 지도 키 설정 안내…", self)
+        keys_action.triggered.connect(lambda: show_online_keys_notice(self, allow_suppress=False))
+        settings_menu.addAction(keys_action)
+        basemap_action = QAction("오프라인 지도 파일 안내…", self)
+        basemap_action.triggered.connect(lambda: show_basemap_notice(self))
+        settings_menu.addAction(basemap_action)
 
         self._worker: Optional[AnalysisWorker] = None
         self._progress: Optional[QProgressDialog] = None
@@ -90,9 +100,15 @@ class MainWindow(QMainWindow):
         mode = get_map_mode()
         if mode is None:
             mode = ask_map_mode(self)
-        # 오프라인인데 지도 파일이 없으면 받는 방법을 안내한다.
+        # 오프라인인데 지도 파일이 없으면 받는 방법을, 온라인인데 키가 없으면
+        # 발급받아 넣는 방법을 안내한다. 둘 다 없어도 분석은 정상 동작한다.
+        self._show_map_resource_notice(mode)
+
+    def _show_map_resource_notice(self, mode: str) -> None:
         if mode == MAP_MODE_OFFLINE and should_show_notice():
             show_basemap_notice(self)
+        elif mode != MAP_MODE_OFFLINE and should_show_keys_notice():
+            show_online_keys_notice(self)
 
     def _on_map_mode_action(self) -> None:
         current = get_map_mode()
@@ -107,8 +123,7 @@ class MainWindow(QMainWindow):
         AddressResolver.instance().reset()
         self._online_notified.clear()
         self._analysis_view.reload_maps()
-        if mode == MAP_MODE_OFFLINE and should_show_notice():
-            show_basemap_notice(self)
+        self._show_map_resource_notice(mode)
 
     def _on_online_map_failed(self, kind: str, message: str) -> None:
         if kind in self._online_notified:

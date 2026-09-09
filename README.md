@@ -93,6 +93,7 @@ ui/                       PySide6 화면
 ├── map_server.py         지도 리소스 로컬 서버 (고정 포트, map-config / 진단 엔드포인트)
 ├── map_mode_dialog.py    오프라인/온라인 선택 창 (첫 실행, 설정 > 지도 사용 방식)
 ├── basemap_notice.py     오프라인 지도 파일이 없을 때 안내 창
+├── online_keys_notice.py 온라인 키가 없을 때 발급·등록·저장 안내 창 (키 파일 틀 생성)
 ├── address_resolver.py   주소 조회 워커 (최신 요청 하나만, 0.4초 간격)
 ├── workers.py            분석을 백그라운드 스레드에서 실행
 ├── styles.py             QSS
@@ -201,6 +202,10 @@ Python → JS는 `runJavaScript()` 단방향 주입만 쓴다(지도가 되물�
 어느 페이지를 띄울지는 `MapServer.map_url()` 하나가 정한다 — 온라인인데 키가 없으면
 오프라인 페이지로 간다. 두 페이지는 `renderTrack` / `setPlaybackTime` / `setFollow`
 함수 이름이 같아서 `ui/map_view.py`는 어느 쪽인지 모른다.
+
+키가 없는 채로 온라인을 고르면 `ui/online_keys_notice.py`가 발급·도메인 등록·파일 저장
+절차를 안내한다(배경지도 안내와 같은 방식, [설정] 메뉴에서 다시 볼 수 있음). 발급 절차
+전체는 [`assets/README.md`](assets/README.md)에 있다.
 
 키는 `core/appconfig.online_keys()`가 읽는다. 우선순위는 `settings.json`의
 `kakao_js_key` / `kakao_rest_key` > 번들된 `assets/online_keys.json`. 재빌드 없이 키를

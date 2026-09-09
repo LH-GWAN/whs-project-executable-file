@@ -47,7 +47,8 @@ class MapModeDialog(QDialog):
             "  · 무료 사용 한도(일 단위)가 있어 초과하면 그날은 사용할 수 없습니다.",
         ]
         if not keys_ok:
-            online_lines.append("  ※ API 키가 설정되지 않아 지금 고르면 오프라인 지도로 표시됩니다.")
+            online_lines.append("  ※ API 키가 아직 없습니다. 고르면 발급·등록 방법을 안내하는 창이 뜨고,\n"
+                                "     키를 넣기 전까지는 오프라인 지도로 표시됩니다.")
         online_desc = QLabel("\n".join(online_lines))
         online_desc.setStyleSheet("color: #555;")
 
