@@ -191,3 +191,9 @@ class TrackerTab(QWidget):
 
     def stop(self) -> None:
         self._player.stop()
+
+    def release_media(self) -> None:
+        """영상 파일 잠금을 푼다. 사건 폴더를 지우기 전에 부른다 - Windows는 재생기가
+        열어 둔 파일이 있으면 폴더 삭제가 실패한다."""
+        self._player.stop()
+        self._player.setSource(QUrl())

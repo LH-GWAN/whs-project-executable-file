@@ -136,6 +136,16 @@ class HistoryStore:
             rows = self._conn.execute("SELECT * FROM cases ORDER BY created_at DESC").fetchall()
         return [_row_to_case(r) for r in rows]
 
+    def find_cases_by_sha256(self, sha256: str) -> List[CaseRecord]:
+        """같은 파일(내용 기준)을 분석한 이력. 같은 파일을 다시 올렸는지 확인할 때 쓴다."""
+        if not sha256:
+            return []
+        rows = self._conn.execute(
+            "SELECT * FROM cases WHERE source_video_sha256 = ? ORDER BY created_at DESC",
+            (sha256,),
+        ).fetchall()
+        return [_row_to_case(r) for r in rows]
+
     def touch_last_opened(self, case_id: int) -> None:
         self._conn.execute(
             "UPDATE cases SET last_opened_at = ? WHERE id = ?",

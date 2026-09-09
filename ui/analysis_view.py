@@ -119,6 +119,10 @@ class AnalysisView(QWidget):
 
         self._on_tab_changed(self._tabs.currentIndex())
 
+    def release_media(self) -> None:
+        """보고 있던 사건이 삭제될 때 영상 파일 잠금을 푼다."""
+        self._tracker_tab.release_media()
+
     def reload_maps(self) -> None:
         """지도 사용 방식(오프라인/온라인)이 바뀐 뒤 이미 떠 있는 지도를 새 방식으로 다시 띄운다."""
         for tab in (self._tracker_tab, self._location_tab):

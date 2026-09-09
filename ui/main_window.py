@@ -3,11 +3,19 @@ from __future__ import annotations
 import os
 from typing import Optional, Set
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEventLoop, Qt, QTimer
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QFileDialog, QMainWindow, QMessageBox, QProgressDialog, QStackedWidget
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFileDialog,
+    QMainWindow,
+    QMessageBox,
+    QProgressDialog,
+    QStackedWidget,
+)
 
 from core import geocode
+from core.case_deletion import case_folder_of, delete_cases
 from core.appconfig import (
     MAP_MODE_OFFLINE,
     MAP_SERVER_PREFERRED_PORTS,
@@ -28,7 +36,7 @@ from ui.online_keys_notice import (
     should_show_notice as should_show_keys_notice,
     show_online_keys_notice,
 )
-from ui.workers import AnalysisWorker
+from ui.workers import AnalysisWorker, HashWorker
 
 
 class MainWindow(QMainWindow):
@@ -45,6 +53,8 @@ class MainWindow(QMainWindow):
         self._home = HomeView()
         self._home.video_selected.connect(self._on_video_selected)
         self._home.history_item_opened.connect(self._on_history_item_opened)
+        self._home.history_delete_requested.connect(self._on_history_delete_requested)
+        self._home.history_clear_requested.connect(self._on_history_clear_requested)
 
         self._analysis_view = AnalysisView()
         self._analysis_view.home_requested.connect(self._show_home)
@@ -199,7 +209,67 @@ class MainWindow(QMainWindow):
         self._refresh_history()
         self._stack.setCurrentWidget(self._home)
 
+    def _compute_hash_with_progress(self, video_path: str) -> str:
+        """영상 해시를 진행률 창과 함께 계산한다. 취소하면 빈 문자열."""
+        progress = QProgressDialog("파일 확인 중 (SHA-256)...", "취소", 0, 100, self)
+        progress.setWindowTitle("GPS Tracer")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(300)
+        worker = HashWorker(video_path, self)
+        worker.progress.connect(progress.setValue)
+        result = {"sha": "", "cancelled": False}
+        loop = QEventLoop()
+
+        def on_cancel() -> None:
+            result["cancelled"] = True
+            worker.cancel()
+
+        def on_done(sha: str) -> None:
+            result["sha"] = sha
+            loop.quit()
+
+        # QProgressDialog는 close()할 때도 canceled를 내고 wasCanceled()가 True가 되므로,
+        # 사용자가 누른 취소만 따로 기록한다.
+        progress.canceled.connect(on_cancel)
+        worker.finished_hash.connect(on_done)
+        worker.start()
+        loop.exec()
+        worker.wait(2000)
+        progress.canceled.disconnect(on_cancel)
+        progress.close()
+        worker.deleteLater()
+        return "" if result["cancelled"] else result["sha"]
+
+    def _confirm_reanalysis(self, previous: list) -> bool:
+        """같은 파일을 이미 분석한 적이 있을 때. 예: 새 사건으로 다시 분석, 아니요: 홈으로."""
+        shown = previous[:5]
+        lines = [f"  · {c.case_number} ({c.created_at})" for c in shown]
+        if len(previous) > len(shown):
+            lines.append(f"  · … 외 {len(previous) - len(shown)}건")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("이미 분석한 파일")
+        box.setText("이미 분석한 파일입니다. 새롭게 다시 분석하시겠습니까?")
+        box.setInformativeText(
+            "같은 내용(SHA-256 동일)의 영상을 분석한 이력이 있습니다:\n" + "\n".join(lines) + "\n\n"
+            "'예'를 누르면 새 사건으로 다시 분석합니다(기존 이력은 그대로 남습니다).\n"
+            "'아니요'를 누르면 홈으로 돌아갑니다. 기존 결과는 History에서 열 수 있습니다.")
+        yes_btn = box.addButton("예", QMessageBox.YesRole)
+        no_btn = box.addButton("아니요", QMessageBox.NoRole)
+        box.setDefaultButton(no_btn)
+        box.setEscapeButton(no_btn)
+        box.exec()
+        return box.clickedButton() is yes_btn
+
     def _on_video_selected(self, video_path: str) -> None:
+        sha256 = self._compute_hash_with_progress(video_path)
+        if not sha256:
+            return  # 취소했거나 읽지 못함
+        with HistoryStore(self._history_db_path) as store:
+            previous = store.find_cases_by_sha256(sha256)
+        if previous and not self._confirm_reanalysis(previous):
+            return
+
         dialog = CaseInfoDialog(self)
         if dialog.exec() != CaseInfoDialog.Accepted or dialog.result_input is None:
             return
@@ -225,6 +295,7 @@ class MainWindow(QMainWindow):
             history_db_path=self._history_db_path,
             accel_threshold_mps2=info.accel_threshold_mps2,
             carve_slack=info.carve_slack,
+            sha256=sha256,
         )
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_ok.connect(self._on_worker_finished)
@@ -284,6 +355,67 @@ class MainWindow(QMainWindow):
         self._current_settings = case.analysis_settings
         self._analysis_view.load_result(result, case.case_number, case.analysis_settings)
         self._stack.setCurrentWidget(self._analysis_view)
+
+    def _on_history_delete_requested(self, case_ids: list) -> None:
+        with HistoryStore(self._history_db_path) as store:
+            cases = [c for c in (store.get_case(int(i)) for i in case_ids) if c is not None]
+        if cases:
+            self._confirm_and_delete(cases, clear_all=False)
+
+    def _on_history_clear_requested(self) -> None:
+        with HistoryStore(self._history_db_path) as store:
+            cases = store.list_cases()
+        if cases:
+            self._confirm_and_delete(cases, clear_all=True)
+
+    def _confirm_and_delete(self, cases: list, clear_all: bool) -> None:
+        """되돌릴 수 없는 동작이라 무엇을 지우는지 보여주고 확인받는다. 기본 버튼은 취소."""
+        n = len(cases)
+        shown = cases[:8]
+        lines = [f"  · {c.case_number} - {c.source_video_filename} ({c.created_at})" for c in shown]
+        if n > len(shown):
+            lines.append(f"  · … 외 {n - len(shown)}건")
+        with_folder = sum(1 for c in cases if case_folder_of(c))
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("이력 전체 삭제" if clear_all else "이력 삭제")
+        box.setText(("이력 전체 " if clear_all else "선택한 이력 ") + f"{n}건을 삭제합니다. 되돌릴 수 없습니다.")
+        box.setInformativeText(
+            "\n".join(lines) + "\n\n"
+            "사건 폴더에는 원본 영상 사본, 엔진 산출물(CSV·로그), case.json이 들어 있습니다.\n"
+            "함께 지우면 이 사건은 다시 열 수 없고, 남기면 목록에서만 사라지고 폴더는 그대로\n"
+            "남습니다. 직접 다른 곳에 저장한 리포트 PDF는 어느 쪽이든 지우지 않습니다."
+        )
+        folder_check = QCheckBox(f"사건 폴더도 함께 삭제 ({with_folder}건)")
+        folder_check.setChecked(with_folder > 0)
+        folder_check.setEnabled(with_folder > 0)
+        box.setCheckBox(folder_check)
+        delete_btn = box.addButton("전체 삭제" if clear_all else "삭제", QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        if box.clickedButton() is not delete_btn:
+            return
+
+        remove_folders = folder_check.isChecked()
+        ids = [c.id for c in cases]
+        if self._current_case_id in ids:
+            # 보고 있던 사건이면 재생기가 영상 사본을 잡고 있어 폴더 삭제가 막힌다.
+            self._analysis_view.release_media()
+            self._current_case_id = None
+        with HistoryStore(self._history_db_path) as store:
+            results = delete_cases(store, self._cases_root_dir, ids, remove_folders)
+        self._refresh_history()
+
+        failed = [r for r in results if not r.ok]
+        if failed:
+            detail = "\n\n".join(f"· {r.case_number or r.case_id}: {r.error}" for r in failed[:6])
+            QMessageBox.warning(
+                self, "일부 삭제 실패",
+                f"{len(results) - len(failed)}건 삭제, {len(failed)}건 실패. 실패한 이력은 목록에 남아 있으니 "
+                f"원인을 해결한 뒤 다시 지우면 됩니다.\n\n{detail}")
 
     def _on_report_requested(self, result: PipelineResult) -> None:
         default_name = f"{self._current_case_number or 'case'}_report.pdf"

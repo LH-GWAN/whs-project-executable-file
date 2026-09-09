@@ -56,6 +56,7 @@ def run_analysis_pipeline(
     carve_slack: bool = False,
     progress_cb: ProgressCallback = None,
     cancel_event=None,
+    precomputed_sha256: str = "",
 ) -> PipelineResult:
     def report(msg: str) -> None:
         if progress_cb:
@@ -66,8 +67,12 @@ def run_analysis_pipeline(
             raise CancelledError("분석이 취소되었습니다.")
 
     check_cancelled()
-    report("파일 해시 계산 중 (SHA-256)...")
-    sha256 = hashing.sha256_file(video_path)
+    # 같은 파일인지 확인하느라 화면에서 이미 계산했으면 다시 읽지 않는다(큰 영상은 수 초).
+    if precomputed_sha256:
+        sha256 = precomputed_sha256
+    else:
+        report("파일 해시 계산 중 (SHA-256)...")
+        sha256 = hashing.sha256_file(video_path)
 
     check_cancelled()
     report("파일 형식 확인 중...")

@@ -5,9 +5,35 @@ from typing import Dict, Optional
 
 from PySide6.QtCore import QThread, Signal
 
+from core import hashing
 from core.pipeline import PipelineResult, run_analysis_pipeline
 from engine.engine_adapter import CancelledError
 from storage.history_store import HistoryStore
+
+
+class HashWorker(QThread):
+    """영상 SHA-256을 화면 밖에서 계산한다. 같은 파일을 다시 올렸는지 확인하는 데 쓴다."""
+
+    progress = Signal(int)        # 0~100
+    finished_hash = Signal(str)   # 취소했거나 실패하면 빈 문자열
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        def on_progress(done: int, total: int) -> bool:
+            self.progress.emit(int(done * 100 / total) if total else 100)
+            return not self._cancel.is_set()
+
+        try:
+            self.finished_hash.emit(hashing.sha256_file(self._path, progress_cb=on_progress))
+        except OSError:
+            self.finished_hash.emit("")
 
 
 class AnalysisWorker(QThread):
@@ -18,9 +44,11 @@ class AnalysisWorker(QThread):
 
     def __init__(self, video_path: str, case_number: str, examiner: str, memo: str,
                  settings: Dict, cases_root_dir: str, history_db_path: Optional[str],
-                 accel_threshold_mps2: float, carve_slack: bool = False, parent=None):
+                 accel_threshold_mps2: float, carve_slack: bool = False,
+                 sha256: str = "", parent=None):
         super().__init__(parent)
         self._video_path = video_path
+        self._sha256 = sha256
         self._case_number = case_number
         self._examiner = examiner
         self._memo = memo
@@ -46,6 +74,7 @@ class AnalysisWorker(QThread):
                     carve_slack=self._carve_slack,
                     cancel_event=self._cancel_event,
                     progress_cb=self.progress.emit,
+                    precomputed_sha256=self._sha256,
                 )
             self.finished_ok.emit(result)
         except CancelledError:
