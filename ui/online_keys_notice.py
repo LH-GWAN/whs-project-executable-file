@@ -8,13 +8,14 @@ from __future__ import annotations
 import json
 import os
 
-from PySide6.QtCore import QSettings, QUrl
+from PySide6.QtCore import QSettings, Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QCheckBox, QMessageBox
 
 from core.appconfig import (
     MAP_MODE_ONLINE,
     MAP_SERVER_PREFERRED_PORTS,
+    ONLINE_KEYS_DOWNLOAD_URL,
     get_map_mode,
     is_online_map_ready,
     keys_file_path,
@@ -26,6 +27,11 @@ _SETTINGS_APP = "GPSTracer"
 _SUPPRESS_KEY = "online_keys_notice/suppressed"
 
 KAKAO_CONSOLE_URL = "https://developers.kakao.com/console/app"
+
+
+def download_available() -> bool:
+    """팀 공용 키 파일의 공유 링크가 설정돼 있는가. 없으면 직접 발급 절차만 안내한다."""
+    return bool(ONLINE_KEYS_DOWNLOAD_URL)
 
 # 키 파일 틀. 값이 비어 있으면 is_online_map_ready()가 False라 외부 요청이 나가지 않는다.
 # 자리표시 문자열을 넣어 두면 카카오가 "키 없음"으로 거절해 엉뚱한 안내가 뜨므로 빈 값으로 둔다.
@@ -64,9 +70,24 @@ def notice_text() -> str:
         state.append("JavaScript 키 없음")
     if not keys["rest"]:
         state.append("REST API 키 없음")
+    shared_block = ""
+    if download_available():
+        shared_block = (
+            "\n"
+            "▶ 팀 공용 키 파일이 준비돼 있어 직접 발급받지 않아도 됩니다.\n"
+            "   [키 파일 내려받기]를 누르면 브라우저에서 online_keys.json 을 받을 수 있고,\n"
+            "   넣을 폴더도 같이 열립니다. 받은 파일을 그 폴더에 그대로 넣고 프로그램을\n"
+            "   껐다 켜면 됩니다. 아래 1~5번은 직접 발급받을 때의 절차입니다.\n"
+        )
+    step4 = (
+        "4. [키 파일 만들기]를 누르면 위 위치에 빈 키 파일이 생기고 열립니다.\n"
+        "   같은 화면의 JavaScript 키(3번에서 도메인을 등록한 그 키)와 REST API 키를\n"
+        "   따옴표 안에 붙여 넣고 저장합니다. 네이티브 앱 키는 쓰지 않습니다.\n"
+    )
     return (
         f"현재 상태: {', '.join(state) if state else '키 설정됨'}\n"
         f"키 파일 위치: {keys_file_path()}\n"
+        f"{shared_block}"
         "\n"
         "1. [카카오 디벨로퍼스 열기]를 눌러 로그인하고 [애플리케이션 추가]로 앱을 만듭니다\n"
         "   (이미 있으면 그 앱을 씁니다)\n"
@@ -78,9 +99,7 @@ def notice_text() -> str:
         "   아래 3개를 등록합니다 (제품 링크 관리의 '웹 도메인'이 아닙니다)\n"
         f"{domains}\n"
         "\n"
-        "4. [키 파일 만들기]를 누르면 위 위치에 빈 키 파일이 생기고 열립니다.\n"
-        "   같은 화면의 JavaScript 키(3번에서 도메인을 등록한 그 키)와 REST API 키를\n"
-        "   따옴표 안에 붙여 넣고 저장합니다. 네이티브 앱 키는 쓰지 않습니다.\n"
+        f"{step4}"
         "\n"
         "5. 프로그램을 껐다 켭니다\n"
         "\n"
@@ -95,11 +114,15 @@ def show_online_keys_notice(parent=None, allow_suppress: bool = True) -> None:
     box.setWindowTitle("온라인 지도 키 설정")
     box.setText("온라인 지도(카카오맵)를 쓰려면 카카오 API 키가 필요합니다.")
     box.setInformativeText(notice_text())
+    download_btn = None
+    if download_available():
+        download_btn = box.addButton("키 파일 내려받기", QMessageBox.ActionRole)
     console_btn = box.addButton("카카오 디벨로퍼스 열기", QMessageBox.ActionRole)
     file_btn = box.addButton("키 파일 만들기", QMessageBox.ActionRole)
     folder_btn = box.addButton("폴더 열기", QMessageBox.ActionRole)
     box.addButton(QMessageBox.Ok)
-    box.setDefaultButton(console_btn)
+    box.setDefaultButton(download_btn if download_btn is not None else console_btn)
+    box.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
     suppress = None
     if allow_suppress:
@@ -107,8 +130,18 @@ def show_online_keys_notice(parent=None, allow_suppress: bool = True) -> None:
         box.setCheckBox(suppress)
     box.exec()
 
+    folder = os.path.dirname(keys_file_path())
     clicked = box.clickedButton()
-    if clicked is console_btn:
+    if download_btn is not None and clicked is download_btn:
+        # 배경지도 안내와 같다 - 버튼을 누르면 창이 닫혀 [폴더 열기]를 따로 누를 수 없으니
+        # 받는 동안 넣을 폴더도 같이 열어 둔다.
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl(ONLINE_KEYS_DOWNLOAD_URL))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+    elif clicked is console_btn:
         QDesktopServices.openUrl(QUrl(KAKAO_CONSOLE_URL))
     elif clicked is file_btn:
         try:
@@ -120,7 +153,6 @@ def show_online_keys_notice(parent=None, allow_suppress: bool = True) -> None:
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
     elif clicked is folder_btn:
-        folder = os.path.dirname(keys_file_path())
         try:
             os.makedirs(folder, exist_ok=True)
         except OSError:

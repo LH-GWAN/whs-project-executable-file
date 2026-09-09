@@ -26,6 +26,14 @@ MAP_SERVER_PREFERRED_PORTS = (48213, 48214, 48215)
 # 들어간다. 저장소가 공개돼 있어서 키가 커밋되면 누구나 이 앱의 한도를 소진시킬 수 있다.
 KEYS_FILENAME = "online_keys.json"
 
+# 팀 공용 키 파일을 받을 곳. 배경지도(core/basemap.py의 BASEMAP_DOWNLOAD_URL)와 같은
+# 방식으로 외부 공유 링크에 올려두고, 안내 창의 [키 파일 내려받기] 버튼이 연다.
+# 링크를 아는 사람만 받을 수 있고 저장소에는 키가 남지 않는다. 파일을 옮기면 여기만 바꾼다.
+# 비워 두면 안내 창에서 내려받기 버튼과 문구가 빠지고 직접 발급 절차만 남는다.
+ONLINE_KEYS_DOWNLOAD_URL = (
+    "https://drive.google.com/file/d/1OnogXYR8ZCImaeHLQbt_R13Au-nhXr1f/view?usp=sharing"
+)
+
 _CONFIG_FILENAME = "settings.json"
 
 # 설정과 키는 화면을 그릴 때마다(재생 중 초당 수십 번) 조회되므로 메모리에 들고 있는다.

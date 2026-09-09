@@ -40,8 +40,17 @@
 
 ### 넣는 방법
 
-프로그램 안내 창의 [키 파일 만들기]를 누르면 빈 틀이 생기고 편집기로 열린다. 직접 만들
-때는 `online_keys.example.json`을 이 폴더에 `online_keys.json`으로 복사하고 값을 채운다.
+**팀원이라면 발급받을 필요 없다.** 안내 창의 [키 파일 내려받기]를 누르면 팀 공용
+`online_keys.json`을 받는 링크(구글 드라이브)와 넣을 폴더가 같이 열린다. 받은 파일을 그
+폴더에 넣고 프로그램을 다시 켜면 된다. 현재 배포 위치:
+
+    https://drive.google.com/file/d/1OnogXYR8ZCImaeHLQbt_R13Au-nhXr1f/view?usp=sharing
+
+파일을 옮기면 `core/appconfig.py`의 `ONLINE_KEYS_DOWNLOAD_URL`만 바꾸면 된다(배경지도의
+`BASEMAP_DOWNLOAD_URL`과 같은 방식). 뷰어 권한이면 충분하다.
+
+직접 발급받은 키를 넣을 때는 안내 창의 [키 파일 만들기]로 빈 틀을 만들어 채우거나,
+`online_keys.example.json`을 이 폴더에 `online_keys.json`으로 복사하고 값을 채운다.
 
 ```json
 {
@@ -67,9 +76,11 @@ GPSTracer.exe --diagnose
 
 ### 팀에 나눠줄 때
 
-배경지도와 같다 — 키 파일은 git이 아니라 USB/드라이브로 옮겨 `assets/`에 넣는다. exe로
+배경지도와 같다 — 키 파일은 git이 아니라 위 드라이브 링크로 받아 `assets/`에 넣는다. exe로
 배포할 때는 빌드하는 PC에만 있으면 되고, 받는 쪽은 exe 안에 든 키를 그대로 쓴다.
-같은 앱의 키를 여러 PC가 써도 되지만 한도는 앱 단위로 합산된다.
+같은 앱의 키를 여러 PC가 써도 되지만 한도는 앱 단위로 합산된다. 키를 소스나 저장소에
+적어 올리지 말 것(인코딩해도 누구나 푼다). 유출됐으면 카카오 디벨로퍼스에서 재발급하고
+드라이브의 파일을 바꾼다.
 
 ### 안 될 때
 
