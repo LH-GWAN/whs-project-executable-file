@@ -49,6 +49,7 @@ def make_settings_button(menu: QMenu, parent=None) -> QToolButton:
     button.setPopupMode(QToolButton.InstantPopup)
     button.setToolButtonStyle(Qt.ToolButtonTextOnly)
     button.setMenu(menu)
+    button.setCursor(Qt.PointingHandCursor)
     button.setToolTip("지도 사용 방식, 온라인 지도 키, 오프라인 지도 파일 안내")
     return button
 
@@ -62,7 +63,7 @@ def _vertical_separator() -> QFrame:
 
 
 class _HashLabel(QLabel):
-    """해시는 앞 16자만 보이고, 마우스를 올리면 전체가 풀로 뜨며, 클릭하면 복사된다."""
+    """해시는 앞 16자만 보이고, 클릭하면 전체 값이 바로 뜬다(마우스를 올려도 뜨고, 클릭 시 복사도 된다)."""
 
     def __init__(self, parent=None):
         super().__init__("", parent)
@@ -73,12 +74,13 @@ class _HashLabel(QLabel):
     def set_hash(self, sha256: str) -> None:
         self._full = sha256 or ""
         self.setText(f"{self._full[:16]}…" if len(self._full) > 16 else (self._full or "-"))
-        self.setToolTip(f"SHA-256 전체\n{self._full}\n\n클릭하면 복사됩니다" if self._full else "")
+        self.setToolTip(f"SHA-256\n{self._full}" if self._full else "")
 
     def mousePressEvent(self, event):  # noqa: N802
         if self._full:
             QGuiApplication.clipboard().setText(self._full)
-            QToolTip.showText(event.globalPosition().toPoint(), "복사됨: " + self._full, self)
+            QToolTip.showText(event.globalPosition().toPoint(),
+                              f"SHA-256\n{self._full}\n(클립보드에 복사됨)", self)
         super().mousePressEvent(event)
 
 
@@ -112,9 +114,6 @@ class AnalysisView(QWidget):
         header_layout.addWidget(self._case_label)
         header_layout.addWidget(report_btn)
         header_layout.addWidget(home_btn)
-        self._settings_slot = QHBoxLayout()
-        self._settings_slot.setContentsMargins(0, 0, 0, 0)
-        header_layout.addLayout(self._settings_slot)
 
         # 파일 정보 줄: 항목마다 일정한 간격과 구분선을 두고, 이름표는 흐리게, 값은 진하게.
         self._file_badge = QLabel("-")
@@ -191,10 +190,6 @@ class AnalysisView(QWidget):
             self._location_tab.load(result.extraction.points, result.flagged_segments)
 
         self._on_tab_changed(self._tabs.currentIndex())
-
-    def set_settings_menu(self, menu: QMenu) -> None:
-        button = make_settings_button(menu, self)
-        self._settings_slot.addWidget(button)
 
     def release_media(self) -> None:
         """보고 있던 사건이 삭제될 때 영상 파일 잠금을 푼다."""

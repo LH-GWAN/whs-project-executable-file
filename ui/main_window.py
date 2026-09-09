@@ -70,8 +70,8 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._analysis_view)
         self.setCentralWidget(self._stack)
 
-        # 메뉴바는 눈에 안 띄어 찾기 어렵다는 피드백으로, 각 화면 우측 상단의 '⚙ 설정' 버튼에
-        # 같은 메뉴를 단다. 메뉴바는 만들지 않는다.
+        # 메뉴바는 눈에 안 띄어 찾기 어렵다는 피드백으로, 홈 화면 우측 상단의 '⚙ 설정' 버튼에
+        # 메뉴를 단다. 메뉴바는 만들지 않는다.
         settings_menu = QMenu("설정", self)
         self._settings_menu = settings_menu
         map_mode_action = QAction("지도 사용 방식…", self)
@@ -87,8 +87,9 @@ class MainWindow(QMainWindow):
         reset_action = QAction("지도 설정 초기화 (처음 실행처럼 다시 묻기)", self)
         reset_action.triggered.connect(self._on_reset_map_settings)
         settings_menu.addAction(reset_action)
+        # 메뉴 항목 위에서도 손가락 커서가 보이게 (기본은 화살표라 눌리는지 알기 어렵다)
+        settings_menu.setCursor(Qt.PointingHandCursor)
         self._home.set_settings_menu(settings_menu)
-        self._analysis_view.set_settings_menu(settings_menu)
 
         self._worker: Optional[AnalysisWorker] = None
         self._progress: Optional[QProgressDialog] = None
