@@ -66,6 +66,38 @@ QFrame[role="upload-box"] {
     font-family: Menlo, Consolas, "Courier New", monospace;
 }
 
+/* 해시 전체 값 팝업 */
+#HashPopup {
+    background-color: #ffffff;
+    border: 1px solid #999999;
+    border-radius: 3px;
+}
+
+/* 메뉴: 전역 QWidget 배경색 때문에 기본 하이라이트가 사라져서 직접 그린다.
+   마우스를 올린 항목은 웹사이트처럼 파란 배경·흰 글씨. */
+QMenu {
+    background-color: #ffffff;
+    border: 1px solid #cccccc;
+    padding: 4px 0;
+}
+QMenu::item {
+    padding: 7px 28px 7px 16px;
+    background-color: transparent;
+    color: #111111;
+}
+QMenu::item:selected {
+    background-color: #1c7ed6;
+    color: #ffffff;
+}
+QMenu::item:disabled {
+    color: #999999;
+}
+QMenu::separator {
+    height: 1px;
+    background-color: #e0e0e0;
+    margin: 4px 8px;
+}
+
 /* 설정 메뉴 버튼(화면 우측 상단). 메뉴바 대신 눈에 띄는 자리에 둔다. */
 QToolButton[role="settings"] {
     border: 1px solid #cccccc;

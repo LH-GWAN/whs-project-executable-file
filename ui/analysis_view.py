@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, Signal
+from typing import Optional
+
+from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
@@ -12,7 +14,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTabWidget,
     QToolButton,
-    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -62,25 +63,56 @@ def _vertical_separator() -> QFrame:
     return line
 
 
+class _HashPopup(QFrame):
+    """해시 전체 값을 보여주는 작은 상자. 바깥을 클릭하면 닫힌다(웹의 팝오버처럼)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setObjectName("HashPopup")
+        self._label = QLabel("", self)
+        self._label.setProperty("role", "hash")
+        self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._note = QLabel("클립보드에 복사됨 · 바깥을 클릭하면 닫힙니다", self)
+        self._note.setProperty("role", "info-key")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(4)
+        layout.addWidget(QLabel("SHA-256", self))
+        layout.addWidget(self._label)
+        layout.addWidget(self._note)
+
+    def show_for(self, anchor: QWidget, text: str) -> None:
+        self._label.setText(text)
+        self.adjustSize()
+        self.move(anchor.mapToGlobal(anchor.rect().bottomLeft()) + QPoint(0, 4))
+        self.show()
+
+    @property
+    def text(self) -> str:
+        return self._label.text()
+
+
 class _HashLabel(QLabel):
-    """해시는 앞 16자만 보이고, 클릭하면 전체 값이 바로 뜬다(마우스를 올려도 뜨고, 클릭 시 복사도 된다)."""
+    """해시는 앞 16자만 보이고, 마우스를 올려도 아무것도 뜨지 않는다. 클릭하면 전체 값이
+    작은 상자로 뜨고(바깥 클릭으로 닫힘) 클립보드에도 복사된다."""
 
     def __init__(self, parent=None):
         super().__init__("", parent)
         self._full = ""
+        self._popup: Optional[_HashPopup] = None
         self.setProperty("role", "hash")
         self.setCursor(Qt.PointingHandCursor)
 
     def set_hash(self, sha256: str) -> None:
         self._full = sha256 or ""
         self.setText(f"{self._full[:16]}…" if len(self._full) > 16 else (self._full or "-"))
-        self.setToolTip(f"SHA-256\n{self._full}" if self._full else "")
 
     def mousePressEvent(self, event):  # noqa: N802
         if self._full:
             QGuiApplication.clipboard().setText(self._full)
-            QToolTip.showText(event.globalPosition().toPoint(),
-                              f"SHA-256\n{self._full}\n(클립보드에 복사됨)", self)
+            if self._popup is None:
+                self._popup = _HashPopup(self.window())
+            self._popup.show_for(self, self._full)
         super().mousePressEvent(event)
 
 
