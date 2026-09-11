@@ -39,6 +39,8 @@
   .trk-start { background: #1a9e5c; }
   .trk-end { background: #111111; }
   .trk-pos { width: 18px; height: 18px; border-width: 3px; background: #1c7ed6; }
+  /* 리포트용 캡처 중에는 조작 요소를 숨긴다(범례는 남긴다) */
+  body.capture #followBtn, body.capture #status { display: none !important; }
 </style>
 </head>
 <body>
@@ -265,6 +267,14 @@ function renderTrack(payload) {
     endOverlay.setPosition(latLng(fixes[fixes.length - 1]));
     endOverlay.setMap(map);
     fitToTrack(payload);
+    // 리포트 기준 지도: 화면을 맞춘 직후 타일까지 다 그려지면 Python이 캡처한다.
+    window.__trackDrawn = (window.__trackDrawn || 0) + 1;
+    window.__trackIdle = false;
+    const idleListener = function () {
+      window.__trackIdle = true;
+      kakao.maps.event.removeListener(map, "tilesloaded", idleListener);
+    };
+    kakao.maps.event.addListener(map, "tilesloaded", idleListener);
 
     const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
     setStatus(`좌표 ${fixes.length}개` + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : ""));
@@ -334,9 +344,12 @@ document.getElementById("followBtn").addEventListener("click", function () {
 
 boot();
 
+function setCaptureMode(on) { document.body.classList.toggle("capture", !!on); }
+
 window.renderTrack = renderTrack;
 window.setPlaybackTime = setPlaybackTime;
 window.setFollow = setFollow;
+window.setCaptureMode = setCaptureMode;
 </script>
 </body>
 </html>

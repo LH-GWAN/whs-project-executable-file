@@ -241,8 +241,8 @@ class AnalysisView(QWidget):
     def capture_visuals(self) -> tuple:
         """리포트에 넣을 그래프/지도 이미지. 못 만들면 None을 돌려준다(리포트는 계속 나간다).
 
-        지도는 탭을 열어야 로드되는 지연 로딩이라, 사용자가 Location 탭을 한 번도
-        안 열었으면 그 지도는 비어 있다. Tracker 탭 지도로 대신 잡는다.
+        지도는 분석 직후 전체 경로에 맞춰 찍어 둔 기준 그림(baseline)을 쓴다. 기준 그림이
+        아직 없으면(지도 탭을 한 번도 안 열었거나 타일이 늦게 온 경우) 현재 화면을 잡는다.
         """
         chart = None
         try:
@@ -250,7 +250,16 @@ class AnalysisView(QWidget):
         except Exception:
             chart = None
 
+        # 분석 직후 전체 경로에 맞춰진 기준 지도를 우선 쓴다. 사용자가 확대·축소한 현재
+        # 화면은 기준 그림이 없을 때만 대신 쓴다.
         map_png = None
+        for tab in (self._tracker_tab, self._location_tab):
+            try:
+                map_png = tab.map_view().baseline_png()
+            except Exception:
+                map_png = None
+            if map_png:
+                return chart, map_png
         for tab in (self._location_tab, self._tracker_tab):
             try:
                 map_png = tab.grab_map_png()

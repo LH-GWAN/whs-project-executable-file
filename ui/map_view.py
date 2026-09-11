@@ -13,6 +13,8 @@ from ui.map_server import ONLINE_PAGE, MapServer
 
 _ONLINE_POLL_MS = 700
 _ONLINE_POLL_LIMIT_MS = 40000
+_BASELINE_POLL_MS = 500
+_BASELINE_IDLE_WAIT_LIMIT_MS = 8000   # 타일이 이만큼 안 와도 일단 찍는다
 
 
 class MapView(QWidget):
@@ -46,6 +48,16 @@ class MapView(QWidget):
         self._online_poll.setInterval(_ONLINE_POLL_MS)
         self._online_poll.timeout.connect(self._poll_online_state)
         self._online_poll_elapsed = 0
+
+        # 리포트용 기준 지도. 궤적을 그리고 화면을 맞춘 직후의 모습을 한 번 찍어 둔다.
+        # 사용자가 이후 확대·축소해도 리포트에는 이 그림이 들어간다(검토 의견: 축소된
+        # 상태로 리포트를 만들면 경로가 점 하나로 나왔다).
+        self._baseline_png: Optional[bytes] = None
+        self._baseline_track_id = 0
+        self._baseline_poll = QTimer(self)
+        self._baseline_poll.setInterval(_BASELINE_POLL_MS)
+        self._baseline_poll.timeout.connect(self._poll_baseline)
+        self._baseline_waited_ms = 0
 
     def ensure_loaded(self) -> None:
         if not self._load_started:
@@ -137,6 +149,44 @@ class MapView(QWidget):
         self._last_track_js = f"renderTrack({json.dumps(payload, ensure_ascii=False)});"
         self._last_time_js = None
         self._run_js(self._last_track_js)
+        self._baseline_png = None
+        self._baseline_track_id += 1
+        self._baseline_waited_ms = 0
+        self._baseline_poll.start()
+
+    def baseline_png(self) -> Optional[bytes]:
+        """분석 직후(전체 경로가 화면에 맞춰진 상태)의 지도 그림. 아직 못 찍었으면 None."""
+        return self._baseline_png
+
+    def _poll_baseline(self) -> None:
+        if self._baseline_png is not None:
+            self._baseline_poll.stop()
+            return
+        if not self._loaded or not self._view.isVisible():
+            return  # 탭이 보일 때까지 기다린다(안 보이는 웹뷰는 빈 그림이 찍힌다)
+        self._baseline_waited_ms += _BASELINE_POLL_MS
+        self._view.page().runJavaScript(
+            "(window.__mapReady && window.__trackDrawn) ? (window.__trackIdle ? 'idle' : 'wait') : 'no'",
+            0, self._on_baseline_state)
+
+    def _on_baseline_state(self, state) -> None:
+        if self._baseline_png is not None or not self._baseline_poll.isActive():
+            return
+        if state == "idle" or (state == "wait" and self._baseline_waited_ms >= _BASELINE_IDLE_WAIT_LIMIT_MS):
+            self._baseline_poll.stop()
+            track_id = self._baseline_track_id
+            self._view.page().runJavaScript("setCaptureMode(true);")
+            QTimer.singleShot(250, lambda: self._capture_baseline(track_id))
+
+    def _capture_baseline(self, track_id: int) -> None:
+        try:
+            if track_id == self._baseline_track_id and self._loaded and self._view.isVisible():
+                self._baseline_png = self.grab_png()
+        finally:
+            if self._loaded:
+                self._view.page().runJavaScript("setCaptureMode(false);")
+        if self._baseline_png is None and track_id == self._baseline_track_id:
+            self._baseline_poll.start()  # 못 찍었으면 다시 기다린다
 
     def grab_png(self) -> Optional[bytes]:
         """현재 지도 화면을 PNG로 캡처한다. 리포트에 넣기 위한 것.

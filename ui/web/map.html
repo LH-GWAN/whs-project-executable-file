@@ -32,6 +32,9 @@
   }
   #followBtn.on { background: #1c7ed6; border-color: #1c7ed6; color: #fff; }
   #legend i { width: 16px; height: 0; border-top-width: 3px; border-top-style: solid; }
+  /* 리포트용 캡처 중에는 조작 요소를 숨긴다(범례는 남긴다) */
+  body.capture #followBtn, body.capture #status, body.capture .maplibregl-ctrl-top-left,
+  body.capture .maplibregl-ctrl-bottom-left { display: none !important; }
 </style>
 </head>
 <body>
@@ -215,6 +218,10 @@ function renderTrack(payload) {
     } else {
       map.fitBounds([[minX, minY], [maxX, maxY]], { padding: 48, duration: 0, maxZoom: 17 });
     }
+    // 리포트 기준 지도: 화면을 맞춘 직후 타일까지 다 그려지면 Python이 캡처한다.
+    window.__trackDrawn = (window.__trackDrawn || 0) + 1;
+    window.__trackIdle = false;
+    map.once("idle", function () { window.__trackIdle = true; });
 
     const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
     setStatus(`좌표 ${fixes.length}개` + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : "")
@@ -363,9 +370,12 @@ function boot() {
 
 boot();
 
+function setCaptureMode(on) { document.body.classList.toggle("capture", !!on); }
+
 window.renderTrack = renderTrack;
 window.setPlaybackTime = setPlaybackTime;
 window.setFollow = setFollow;
+window.setCaptureMode = setCaptureMode;
 </script>
 </body>
 </html>

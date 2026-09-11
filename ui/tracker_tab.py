@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -47,6 +47,11 @@ class TrackerTab(QWidget):
         self._player.positionChanged.connect(self._on_position_changed)
         self._player.durationChanged.connect(self._on_duration_changed)
         self._player.playbackStateChanged.connect(self._on_state_changed)
+        self._player.mediaStatusChanged.connect(self._on_media_status)
+        # 영상을 올린 직후 검은 화면 대신 첫 장면이 보이게, 로드되면 잠깐 재생했다가
+        # 바로 멈춰 0초로 되돌린다(재생기는 한 번 재생을 시작해야 프레임을 그린다).
+        self._prime_pending = False
+        self._priming = False
 
         controls = QHBoxLayout()
         controls.addWidget(self._play_btn)
@@ -98,7 +103,26 @@ class TrackerTab(QWidget):
         return self._map
 
     def load_video(self, path: str) -> None:
+        self._prime_pending = True
         self._player.setSource(QUrl.fromLocalFile(path))
+
+    def _on_media_status(self, status) -> None:
+        if not self._prime_pending:
+            return
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            self._prime_pending = False
+            self._priming = True
+            self._player.play()
+            QTimer.singleShot(150, self._finish_prime)
+
+    def _finish_prime(self) -> None:
+        if not self._priming:
+            return
+        self._player.pause()
+        self._player.setPosition(0)
+        self._priming = False
+        self._play_btn.setText("▶")
+        self._update_info(0.0)
 
     def load_track(self, points: List[TrackPoint],
                     segments: Optional[List[FlaggedSegment]] = None) -> None:
@@ -165,6 +189,8 @@ class TrackerTab(QWidget):
             self._player.play()
 
     def _on_state_changed(self, state) -> None:
+        if self._priming:
+            return  # 첫 장면을 띄우려는 내부 재생은 버튼에 반영하지 않는다
         self._play_btn.setText("⏸" if state == QMediaPlayer.PlayingState else "▶")
 
     def _on_slider_moved(self, position: int) -> None:
@@ -190,6 +216,8 @@ class TrackerTab(QWidget):
         self._map.ensure_loaded()
 
     def stop(self) -> None:
+        self._prime_pending = False
+        self._priming = False
         self._player.stop()
 
     def release_media(self) -> None:
