@@ -37,6 +37,7 @@ class CaseInfoDialog(QDialog):
         self.setMinimumWidth(360)
 
         self._case_number = QLineEdit()
+        self._case_number.textChanged.connect(lambda _t: self._case_number.setStyleSheet(""))
         self._tracker_cb = QCheckBox("Tracker")
         self._speed_cb = QCheckBox("Speed")
         self._location_cb = QCheckBox("Location")
@@ -73,13 +74,19 @@ class CaseInfoDialog(QDialog):
 
         form.addRow("Examiner", self._examiner)
         form.addRow("memo", self._memo)
-        form.addRow("급가속 임계값", self._threshold)
+        form.addRow("급가·감속 임계값", self._threshold)
         form.addRow("", self._slack_cb)
 
         start_btn = QPushButton("Start")
         start_btn.setProperty("role", "primary")
+        # Enter를 치면 Start가 눌리게 한다. 기본 버튼을 안 정하면 Qt가 먼저 만든 버튼
+        # (여기선 Cancel)을 autoDefault로 골라, 사건번호만 치고 Enter를 누르면 취소됐다.
+        start_btn.setDefault(True)
+        start_btn.setAutoDefault(True)
         start_btn.clicked.connect(self._on_start)
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setAutoDefault(False)
+        cancel_btn.setDefault(False)
         cancel_btn.clicked.connect(self.reject)
 
         btn_row = QHBoxLayout()

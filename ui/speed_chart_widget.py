@@ -13,7 +13,8 @@ from engine.engine_adapter import TrackPoint
 _BG = QColor("#0d1117")
 _LINE = QColor("#3ddc97")
 _DOT = QColor("#2f8f6c")
-_BAND = QColor(255, 60, 60, 90)
+_BAND = QColor(255, 60, 60, 90)          # 급가속
+_BAND_DECEL = QColor(255, 150, 30, 95)   # 급감속
 _AXIS = QColor("#9aa4ad")
 # 눈금선. 처음엔 알파 22로 그렸더니 검토에서 "선이 안 나온다"는 말이 나왔다 - 검은 배경 위에
 # 9% 흰색은 화면에서도 리포트 이미지에서도 사실상 보이지 않는다.
@@ -162,8 +163,8 @@ class SpeedChartWidget(QWidget):
             t += minor_step
 
         painter.setPen(Qt.NoPen)
-        painter.setBrush(_BAND)
         for seg in self._segments:
+            painter.setBrush(_BAND_DECEL if getattr(seg, "is_decel", False) else _BAND)
             x0 = x_for_index(seg.start_index)
             x1 = x_for_index(seg.end_index)
             painter.drawRect(QRectF(x0, plot.top(), max(2.0, x1 - x0), plot.height()))

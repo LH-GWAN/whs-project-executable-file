@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import List, Optional
 
 from PySide6.QtCore import QBuffer, QIODevice, QTimer, QUrl, Signal
@@ -15,6 +16,50 @@ _ONLINE_POLL_MS = 700
 _ONLINE_POLL_LIMIT_MS = 40000
 _BASELINE_POLL_MS = 500
 _BASELINE_IDLE_WAIT_LIMIT_MS = 8000   # 타일이 이만큼 안 와도 일단 찍는다
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """진북 기준 방위각(0~360, 시계 방향)."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    x = math.sin(dl) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def compute_headings(points: List[TrackPoint]) -> List[Optional[float]]:
+    """지점별 진행 방향(도). 지도 위치 마커를 화살표로 그리기 위한 값.
+
+    GPS가 준 진행각(track_deg)이 있고 움직이는 중이면 그것을, 없으면 다음(없으면 이전)
+    좌표와의 방위각을 쓴다. 정지 중(같은 좌표 반복)에는 마지막 방향을 유지한다.
+    """
+    n = len(points)
+    fixes = [i for i, p in enumerate(points) if p.has_fix]
+    out: List[Optional[float]] = [None] * n
+    last: Optional[float] = None
+    for k, i in enumerate(fixes):
+        p = points[i]
+        h: Optional[float] = None
+        if p.track_deg is not None and (p.speed_kmh or 0.0) >= 3.0:
+            h = float(p.track_deg) % 360.0
+        else:
+            # 다음(또는 이전) 다른 좌표까지의 방위각
+            for j in fixes[k + 1:k + 30]:
+                q = points[j]
+                if abs(q.latitude - p.latitude) > 1e-7 or abs(q.longitude - p.longitude) > 1e-7:
+                    h = _bearing_deg(p.latitude, p.longitude, q.latitude, q.longitude)
+                    break
+            if h is None and last is None:
+                for j in reversed(fixes[max(0, k - 30):k]):
+                    q = points[j]
+                    if abs(q.latitude - p.latitude) > 1e-7 or abs(q.longitude - p.longitude) > 1e-7:
+                        h = _bearing_deg(q.latitude, q.longitude, p.latitude, p.longitude)
+                        break
+        if h is None:
+            h = last
+        out[i] = h
+        last = h
+    return out
 
 
 class MapView(QWidget):
@@ -133,18 +178,23 @@ class MapView(QWidget):
 
     def set_track(self, points: List[TrackPoint],
                    segments: Optional[List[FlaggedSegment]] = None) -> None:
+        headings = compute_headings(points)
         payload = {
             "points": [
                 {
                     "t": p.start_time_sec,
-                    "lat": p.latitude,
-                    "lon": p.longitude,
+                    # 이상치는 좌표를 지도에 주지 않는다(궤적이 튀는 원인). 끊김과는 구분해 o=1.
+                    "lat": p.latitude if p.has_fix else None,
+                    "lon": p.longitude if p.has_fix else None,
                     "v": p.speed_kmh,
                     "d": 1 if p.is_dropout else 0,
+                    "o": 1 if p.is_outlier else 0,
+                    "h": headings[i],
                 }
-                for p in points
+                for i, p in enumerate(points)
             ],
-            "flagged": [[s.start_index, s.end_index] for s in (segments or [])],
+            "flagged": [[s.start_index, s.end_index, getattr(s, "kind", "accel")]
+                        for s in (segments or [])],
         }
         self._last_track_js = f"renderTrack({json.dumps(payload, ensure_ascii=False)});"
         self._last_time_js = None

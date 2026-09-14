@@ -59,9 +59,18 @@ class TrackPoint:
 
     source_file: str = ""
 
+    # 앱 판정(core/outliers.py). 좌표는 남아 있지만 화면·지도·그래프·급가감속 계산에서 뺀다.
+    is_outlier: bool = False
+    outlier_reason: str = ""
+
+    @property
+    def has_coords(self) -> bool:
+        """엔진이 좌표를 뽑았는가(이상치 판정과 무관)."""
+        return self.latitude is not None and self.longitude is not None
+
     @property
     def has_fix(self) -> bool:
-        return self.latitude is not None and self.longitude is not None
+        return self.has_coords and not self.is_outlier
 
     @property
     def has_gps_record(self) -> bool:
@@ -69,7 +78,8 @@ class TrackPoint:
 
     @property
     def is_dropout(self) -> bool:
-        return self.has_gps_record and not self.has_fix
+        # 좌표 자체가 없을 때만 끊김이다. 이상치는 좌표가 있지만 쓰지 않는 것이라 따로 센다.
+        return self.has_gps_record and not self.has_coords
 
     @property
     def g_magnitude(self) -> Optional[float]:
@@ -118,6 +128,10 @@ class ExtractionResult:
     @property
     def dropout_count(self) -> int:
         return sum(1 for p in self.points if p.is_dropout)
+
+    @property
+    def outlier_count(self) -> int:
+        return sum(1 for p in self.points if p.is_outlier)
 
     @property
     def succeeded(self) -> bool:

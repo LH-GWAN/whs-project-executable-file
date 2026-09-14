@@ -154,6 +154,13 @@ class AnalysisView(QWidget):
         self._file_size_label = QLabel("")
         self._duration_label = QLabel("")
         self._hash_label = _HashLabel()
+        # 원본과 사본의 해시가 같은지 알려주는 작은 불. 사본을 다시 읽어 비교하므로 잠깐
+        # 회색이었다가 초록(일치)/빨강(불일치)이 된다. 사본이 없으면 회색으로 남는다.
+        self._integrity_dot = QLabel("●")
+        self._integrity_dot.setProperty("role", "integrity")
+        self._integrity_dot.setToolTip("원본과 사본 해시 비교 대기 중")
+        self._integrity_worker = None
+        self._set_integrity("pending", "")
 
         file_info = QWidget()
         file_info.setObjectName("FileInfoBar")
@@ -175,6 +182,7 @@ class AnalysisView(QWidget):
         add_item("크기", self._file_size_label)
         add_item("길이", self._duration_label)
         add_item("해시", self._hash_label)
+        file_info_layout.addWidget(self._integrity_dot)
         file_info_layout.addStretch(1)
 
         self._tabs = QTabWidget()
@@ -207,13 +215,19 @@ class AnalysisView(QWidget):
         self._duration_label.setText(_format_duration(result.duration_sec))
         self._hash_label.set_hash(result.sha256)
 
+        self._start_integrity_check(result)
+
         self._tabs.clear()
         if settings.get("tracker", True):
             self._tabs.addTab(self._tracker_tab, "Tracker")
             self._tracker_tab.stop()
+            self._tracker_tab.set_duration_hint(result.duration_sec)
             if video_path and os.path.isfile(video_path):
-                self._tracker_tab.load_video(video_path)
+                rear = result.rear_copy_path if result.rear_copy_path and os.path.isfile(result.rear_copy_path) else ""
+                self._tracker_tab.load_video(video_path, rear)
             self._tracker_tab.load_track(result.extraction.points, result.flagged_segments)
+        else:
+            self._tracker_tab.stop()
         if settings.get("speed", True):
             self._tabs.addTab(self._speed_tab, "Speed Analysis")
             self._speed_tab.load(result.extraction.points, result.flagged_segments)
@@ -231,6 +245,62 @@ class AnalysisView(QWidget):
         """지도 사용 방식(오프라인/온라인)이 바뀐 뒤 이미 떠 있는 지도를 새 방식으로 다시 띄운다."""
         for tab in (self._tracker_tab, self._location_tab):
             tab.map_view().reload()
+
+    def set_case_number(self, case_number: str) -> None:
+        self._case_label.setText(f"Case Number : {case_number}")
+
+    # ---------- 무결성 표시등 ----------
+    def _set_integrity(self, state: str, detail: str) -> None:
+        colors = {"pending": "#b0b0b0", "ok": "#2fb344", "bad": "#e03131", "none": "#b0b0b0"}
+        self._integrity_dot.setStyleSheet(f"color: {colors.get(state, '#b0b0b0')}; font-size: 14px;")
+        tips = {
+            "pending": "원본과 사본 해시 비교 중…",
+            "ok": "원본 해시와 사건 폴더 사본의 해시가 같습니다 (무결성 확인)",
+            "bad": "원본 해시와 사본 해시가 다릅니다! 사본이 변조·손상됐을 수 있습니다",
+            "none": "사본 파일이 없어 비교하지 못했습니다",
+        }
+        self._integrity_dot.setToolTip(tips.get(state, "") + (f"\n{detail}" if detail else ""))
+        self._integrity_state = state
+
+    def integrity_state(self) -> str:
+        return getattr(self, "_integrity_state", "pending")
+
+    def _start_integrity_check(self, result: PipelineResult) -> None:
+        from ui.workers import HashWorker  # 순환 import 회피
+
+        if self._integrity_worker is not None:
+            self._integrity_worker.cancel()
+            self._integrity_worker = None
+        copy_path = result.source_copy_path
+        if not result.sha256 or not copy_path or not os.path.isfile(copy_path):
+            self._set_integrity("none", copy_path or "")
+            return
+        self._set_integrity("pending", "")
+        expected = result.sha256
+        worker = HashWorker(copy_path, self)
+
+        def on_done(sha: str, w=worker) -> None:
+            if w is not self._integrity_worker:
+                return  # 새 사건이 열려 이미 다른 검사가 시작됨
+            self._integrity_worker = None
+            w.deleteLater()
+            if not sha:
+                self._set_integrity("none", "해시 계산이 취소됨")
+            elif sha == expected:
+                self._set_integrity("ok", f"SHA-256 {sha[:16]}…")
+            else:
+                self._set_integrity("bad", f"원본 {expected[:16]}… / 사본 {sha[:16]}…")
+
+        def on_failed(message: str, w=worker) -> None:
+            if w is self._integrity_worker:
+                self._integrity_worker = None
+                w.deleteLater()
+                self._set_integrity("none", message)
+
+        worker.finished_hash.connect(on_done)
+        worker.failed.connect(on_failed)
+        self._integrity_worker = worker
+        worker.start()
 
     def _on_tab_changed(self, _index: int) -> None:
         widget = self._tabs.currentWidget()

@@ -65,6 +65,9 @@ QFrame[role="upload-box"] {
 #FileInfoBar QLabel[role="hash"] {
     font-family: Menlo, Consolas, "Courier New", monospace;
 }
+#FileInfoBar QLabel[role="integrity"] {
+    padding-left: 2px;
+}
 
 /* 해시 전체 값 팝업 */
 #HashPopup {

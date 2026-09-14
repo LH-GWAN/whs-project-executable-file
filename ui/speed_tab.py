@@ -4,7 +4,7 @@ from typing import List
 
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from core.acceleration import FlaggedSegment
+from core.acceleration import FlaggedSegment, count_by_kind
 from engine.engine_adapter import TrackPoint
 from ui.speed_chart_widget import SpeedChartWidget
 
@@ -16,9 +16,11 @@ class SpeedTab(QWidget):
 
         self._avg_label = QLabel("평균 속도: -")
         self._max_label = QLabel("최고 속도: -")
-        self._flag_label = QLabel("급가속 의심 구간: 0개")
+        self._flag_label = QLabel("급가·감속 의심 구간: 0개")
         legend = QLabel("■ 급가속 의심 구간")
         legend.setStyleSheet("color: #cc3333;")
+        legend_decel = QLabel("■ 급감속 의심 구간")
+        legend_decel.setStyleSheet("color: #e08a00;")
 
         stats_row = QHBoxLayout()
         stats_row.addWidget(self._avg_label)
@@ -26,6 +28,8 @@ class SpeedTab(QWidget):
         stats_row.addWidget(self._flag_label)
         stats_row.addStretch(1)
         stats_row.addWidget(legend)
+        stats_row.addSpacing(10)
+        stats_row.addWidget(legend_decel)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._chart, 1)
@@ -40,7 +44,8 @@ class SpeedTab(QWidget):
         else:
             self._avg_label.setText("평균 속도: -")
             self._max_label.setText("최고 속도: -")
-        self._flag_label.setText(f"급가속 의심 구간: {len(segments)}개")
+        accel_n, decel_n = count_by_kind(segments)
+        self._flag_label.setText(f"급가·감속 의심 구간: {len(segments)}개 (급가속 {accel_n} · 급감속 {decel_n})")
 
     def grab_chart_png(self):
         return self._chart.grab_png()

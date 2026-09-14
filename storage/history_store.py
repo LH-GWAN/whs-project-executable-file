@@ -66,6 +66,7 @@ class CaseRecord:
     created_at: str = ""
     last_opened_at: Optional[str] = None
     report_pdf_path: Optional[str] = None
+    rear_video_filename: str = ""   # 후방 영상 사본 이름(source/ 안). 없으면 빈 문자열
 
 
 class HistoryStore:
@@ -76,7 +77,14 @@ class HistoryStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """예전 DB에 없는 컬럼을 보탠다. CREATE TABLE IF NOT EXISTS 는 기존 표를 안 바꾼다."""
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(cases)")}
+        if "rear_video_filename" not in existing:
+            self._conn.execute("ALTER TABLE cases ADD COLUMN rear_video_filename TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -166,6 +174,18 @@ class HistoryStore:
         self._conn.execute("DELETE FROM cases WHERE id = ?", (case_id,))
         self._conn.commit()
 
+    def update_case_info(self, case_id: int, case_number: str, examiner: str, memo: str) -> None:
+        """사건번호·담당자·메모 수정. 폴더 이름과 분석 결과는 그대로 둔다."""
+        self._conn.execute(
+            "UPDATE cases SET case_number = ?, examiner = ?, memo = ? WHERE id = ?",
+            (case_number, examiner, memo, case_id),
+        )
+        self._conn.commit()
+
+    def set_rear_video(self, case_id: int, filename: str) -> None:
+        self._conn.execute("UPDATE cases SET rear_video_filename = ? WHERE id = ?", (filename, case_id))
+        self._conn.commit()
+
     def set_report_path(self, case_id: int, report_pdf_path: str) -> None:
         self._conn.execute(
             "UPDATE cases SET report_pdf_path = ? WHERE id = ?", (report_pdf_path, case_id),
@@ -191,4 +211,5 @@ def _row_to_case(row: sqlite3.Row) -> CaseRecord:
         created_at=row["created_at"] or "",
         last_opened_at=row["last_opened_at"],
         report_pdf_path=row["report_pdf_path"],
+        rear_video_filename=(row["rear_video_filename"] or "") if "rear_video_filename" in row.keys() else "",
     )

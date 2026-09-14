@@ -24,12 +24,13 @@ from core.appconfig import (
     reset_map_mode,
     set_map_mode,
 )
-from core.pipeline import PipelineResult, reopen_case
+from core.pipeline import PipelineResult, reopen_case, update_case_json
 from report.report_builder import ReportExporter, render_report_html
 from storage.history_store import HistoryStore, default_app_data_dir
 from ui.address_resolver import AddressResolver
 from ui.analysis_view import AnalysisView
 from ui.basemap_notice import should_show_notice, show_basemap_notice
+from ui.case_edit_dialog import CaseEditDialog
 from ui.case_info_dialog import CaseInfoDialog
 from ui.home_view import HomeView
 from ui.map_mode_dialog import ask_map_mode
@@ -57,6 +58,7 @@ class MainWindow(QMainWindow):
         self._home.history_item_opened.connect(self._on_history_item_opened)
         self._home.history_delete_requested.connect(self._on_history_delete_requested)
         self._home.history_clear_requested.connect(self._on_history_clear_requested)
+        self._home.history_edit_requested.connect(self._on_history_edit_requested)
 
         self._analysis_view = AnalysisView()
         self._analysis_view.home_requested.connect(self._show_home)
@@ -316,7 +318,7 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is yes_btn
 
-    def _on_video_selected(self, video_path: str) -> None:
+    def _on_video_selected(self, video_path: str, rear_path: str = "") -> None:
         sha256, error = self._compute_hash_with_progress(video_path)
         if error:
             QMessageBox.critical(
@@ -360,6 +362,7 @@ class MainWindow(QMainWindow):
             accel_threshold_mps2=info.accel_threshold_mps2,
             carve_slack=info.carve_slack,
             sha256=sha256,
+            rear_video_path=rear_path or "",
         )
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_ok.connect(self._on_worker_finished)
@@ -404,6 +407,26 @@ class MainWindow(QMainWindow):
             self._progress.close()
             self._progress = None
         QMessageBox.critical(self, "분석 실패", f"분석 중 오류가 발생했습니다:\n{message}")
+
+    def _on_history_edit_requested(self, case_id: int) -> None:
+        with HistoryStore(self._history_db_path) as store:
+            case = store.get_case(case_id)
+        if case is None:
+            return
+        dialog = CaseEditDialog(case.case_number, case.examiner, case.memo, self)
+        if dialog.exec() != CaseEditDialog.Accepted or dialog.result_values is None:
+            return
+        number, examiner, memo = dialog.result_values
+        with HistoryStore(self._history_db_path) as store:
+            store.update_case_info(case_id, number, examiner, memo)
+        case_folder = os.path.dirname(case.output_folder) if case.output_folder else ""
+        update_case_json(case_folder, number, examiner, memo)
+        self._refresh_history()
+        if self._current_case_id == case_id:
+            self._current_case_number = number
+            self._current_examiner = examiner
+            self._current_memo = memo
+            self._analysis_view.set_case_number(number)
 
     def _on_history_item_opened(self, case_id: int) -> None:
         with HistoryStore(self._history_db_path) as store:

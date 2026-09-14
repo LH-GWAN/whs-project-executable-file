@@ -39,6 +39,11 @@
   .trk-start { background: #1a9e5c; }
   .trk-end { background: #111111; }
   .trk-pos { width: 18px; height: 18px; border-width: 3px; background: #1c7ed6; }
+  /* 진행 방향 화살표: 위(북)를 향하는 삼각형을 transform: rotate 로 돌린다 */
+  .trk-arrow { width: 26px; height: 26px; transform-origin: 50% 50%; }
+  .trk-arrow svg { display: block; width: 26px; height: 26px; }
+  #legend .lg-arrow { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent;
+    border-bottom: 12px solid #1c7ed6; display: inline-block; margin: 0 2px; }
   /* 리포트용 캡처 중에는 조작 요소를 숨긴다(범례는 남긴다) */
   body.capture #followBtn, body.capture #status { display: none !important; }
 </style>
@@ -48,7 +53,9 @@
 <div id="legend">
   <div><i style="border-color:#1a9e5c"></i> 주행 경로</div>
   <div><i style="border-color:#e03131"></i> 급가속 의심 구간</div>
+  <div><i style="border-color:#f08c00"></i> 급감속 의심 구간</div>
   <div><i style="border-color:#9aa4ad; border-top-style:dashed"></i> GPS 끊김 구간</div>
+  <div><span class="lg-arrow"></span> 현재 위치 (진행 방향)</div>
 </div>
 <button id="followBtn" class="on" title="영상 재생에 맞춰 지도를 따라 움직입니다">따라가기 켜짐</button>
 <div id="status">온라인 지도 준비 중…</div>
@@ -156,6 +163,33 @@ function makeDot(cls) {
   });
 }
 
+// 현재 위치: 진행 방향을 알면 화살표(회전), 모르면 원.
+let posArrowEl = null, posDotEl = null, posWrapEl = null;
+function makePosOverlay() {
+  posWrapEl = document.createElement("div");
+  posArrowEl = document.createElement("div");
+  posArrowEl.className = "trk-arrow";
+  posArrowEl.innerHTML = '<svg viewBox="0 0 64 64"><path d="M32 4 L58 58 L32 45 L6 58 Z" fill="#1c7ed6" stroke="#ffffff" stroke-width="5" stroke-linejoin="round"/></svg>';
+  posDotEl = document.createElement("div");
+  posDotEl.className = "trk-dot trk-pos";
+  posDotEl.style.display = "none";
+  posWrapEl.appendChild(posArrowEl);
+  posWrapEl.appendChild(posDotEl);
+  return new kakao.maps.CustomOverlay({
+    position: new kakao.maps.LatLng(37.5, 127.0),
+    content: posWrapEl, xAnchor: 0.5, yAnchor: 0.5, zIndex: 20,
+  });
+}
+function setPosHeading(h) {
+  if (!posArrowEl) return;
+  if (h === null || h === undefined) {
+    posArrowEl.style.display = "none"; posDotEl.style.display = "block";
+  } else {
+    posDotEl.style.display = "none"; posArrowEl.style.display = "block";
+    posArrowEl.style.transform = "rotate(" + h + "deg)";
+  }
+}
+
 function initMap() {
   try {
     map = new kakao.maps.Map(document.getElementById("map"), {
@@ -168,7 +202,7 @@ function initMap() {
 
     startOverlay = makeDot("trk-start");
     endOverlay = makeDot("trk-end");
-    posOverlay = makeDot("trk-pos");
+    posOverlay = makePosOverlay();
 
     // 컨테이너 크기가 바뀌면(탭 분할선 이동, 창 크기 변경) 카카오 지도는 내부 뷰포트를
     // 다시 잡아야 한다. 초기화 당시 작았던 화면 기준으로 맞춘 범위도 다시 맞춘다 -
@@ -205,22 +239,25 @@ function latLng(p) {
 // 연속된 같은 종류의 구간을 하나의 선으로 묶는다. 지점이 수천 개라 구간마다 객체를
 // 만들면 무겁다. 종류가 바뀌는 지점은 양쪽 선이 공유해 끊김이 없게 한다.
 function buildRuns(points, flagged) {
-  const flaggedSet = new Set();
-  (flagged || []).forEach(([s, e]) => { for (let i = s; i <= e; i++) flaggedSet.add(i); });
+  const flaggedKind = new Map();
+  (flagged || []).forEach(([s, e, kind]) => { for (let i = s; i <= e; i++) flaggedKind.set(i, kind || "accel"); });
 
-  const runs = { solid: [], dashed: [], flagged: [] };
+  const runs = { solid: [], dashed: [], flagged: [], decel: [] };
   let current = null, currentKind = null;
   let prev = null;
   let sawDropout = false;
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
     if (p.lat === null || p.lon === null) {
+      // 이상치(o)는 좌표를 쓰지 않되 끊김으로도 치지 않는다.
       if (p.d) sawDropout = true;
       continue;
     }
     if (prev !== null) {
       let kind;
-      if (flaggedSet.has(i) && flaggedSet.has(prev)) kind = "flagged";
+      // 두 끝점이 같은 종류의 구간에 있을 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
+      const k1 = flaggedKind.get(i), k0 = flaggedKind.get(prev);
+      if (k1 && k0 && k1 === k0) kind = (k1 === "decel" ? "decel" : "flagged");
       else if (sawDropout) kind = "dashed";
       else kind = "solid";
       if (current === null || kind !== currentKind) {
@@ -241,6 +278,7 @@ const LINE_STYLES = {
   dashed: { strokeWeight: 3, strokeColor: "#9aa4ad", strokeOpacity: 0.9, strokeStyle: "dashed", zIndex: 1 },
   solid: { strokeWeight: 5, strokeColor: "#1a9e5c", strokeOpacity: 0.9, strokeStyle: "solid", zIndex: 2 },
   flagged: { strokeWeight: 7, strokeColor: "#e03131", strokeOpacity: 0.95, strokeStyle: "solid", zIndex: 3 },
+  decel: { strokeWeight: 7, strokeColor: "#f08c00", strokeOpacity: 0.95, strokeStyle: "solid", zIndex: 3 },
 };
 
 function renderTrack(payload) {
@@ -252,7 +290,7 @@ function renderTrack(payload) {
   polylines.forEach((l) => l.setMap(null));
   polylines = [];
   const runs = buildRuns(pts, payload.flagged);
-  for (const kind of ["dashed", "solid", "flagged"]) {
+  for (const kind of ["dashed", "solid", "flagged", "decel"]) {
     for (const path of runs[kind]) {
       const line = new kakao.maps.Polyline(Object.assign({ path: path }, LINE_STYLES[kind]));
       line.setMap(map);
@@ -277,7 +315,9 @@ function renderTrack(payload) {
     kakao.maps.event.addListener(map, "tilesloaded", idleListener);
 
     const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
-    setStatus(`좌표 ${fixes.length}개` + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : ""));
+    const outliers = pts.reduce((n, p) => n + (p.o ? 1 : 0), 0);
+    setStatus(`좌표 ${fixes.length}개` + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : "")
+      + (outliers ? ` · 이상치 ${outliers}개 제외` : ""));
   } else {
     startOverlay.setMap(null);
     endOverlay.setMap(null);
@@ -310,6 +350,7 @@ function setPlaybackTime(sec) {
   }
   if (!best) { posOverlay.setMap(null); return; }
   const pos = latLng(best);
+  setPosHeading(best.h);
   posOverlay.setPosition(pos);
   posOverlay.setMap(map);
 

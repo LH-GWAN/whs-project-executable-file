@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from typing import List
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -17,14 +19,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.video_pairs import find_rear_sibling
 from storage.history_store import CaseRecord
 
 VIDEO_FILTER = "블랙박스 영상 (*.mp4 *.avi);;모든 파일 (*)"
 
 
 class HomeView(QWidget):
-    video_selected = Signal(str)
+    video_selected = Signal(str, str)   # (전방 영상, 후방 영상 또는 "")
     history_item_opened = Signal(int)
+    history_edit_requested = Signal(int)
     # 삭제는 확인 창과 실제 삭제를 MainWindow가 맡는다(사건 폴더·DB 경로를 아는 곳).
     history_delete_requested = Signal(list)   # 선택한 사건 id 목록
     history_clear_requested = Signal()        # 전체
@@ -44,7 +48,16 @@ class HomeView(QWidget):
         upload_layout = QVBoxLayout(self._upload_box)
         upload_btn = QPushButton("Upload")
         upload_btn.clicked.connect(self._on_upload_clicked)
+        # 전방/후방 같이 보기: 켜 두면 전방 파일을 고른 뒤 후방 파일을 하나 더 고른다.
+        # 같은 폴더에 _F/_R 짝이 있으면 그 파일을 기본값으로 띄운다.
+        self._dual_cb = QCheckBox("전방/후방 영상 같이 보기 (후방 영상 파일을 하나 더 고릅니다)")
+        self._dual_cb.setToolTip(
+            "전방 영상을 고른 뒤 후방 영상을 고르는 창이 한 번 더 뜹니다. 같은 폴더에\n"
+            "…_F / …_R 처럼 짝이 되는 파일이 있으면 자동으로 골라 둡니다.\n"
+            "GPS 분석은 전방 영상으로 하고, 후방은 Tracker에서 나란히 재생만 합니다.\n"
+            "파일 하나에 전방·후방 트랙이 같이 든 영상은 이 옵션과 무관하게 둘 다 보입니다.")
         upload_layout.addStretch(1)
+        upload_layout.addWidget(self._dual_cb, 0, Qt.AlignHCenter)
         upload_layout.addWidget(upload_btn)
         upload_layout.addStretch(1)
 
@@ -54,7 +67,7 @@ class HomeView(QWidget):
         left.addStretch(1)
 
         history_heading = QLabel("History")
-        hint = QLabel("더블클릭: 열기 · Delete 키/우클릭: 삭제 · Ctrl/Shift 클릭: 여러 개 선택")
+        hint = QLabel("더블클릭: 열기 · 우클릭: 사건 정보 수정/삭제 · Delete 키: 삭제 · Ctrl/Shift 클릭: 여러 개 선택")
         hint.setStyleSheet("color: #777; font-size: 11px;")
 
         self._history_list = QListWidget()
@@ -105,9 +118,21 @@ class HomeView(QWidget):
         self._settings_slot.addWidget(make_settings_button(menu, self))
 
     def _on_upload_clicked(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "블랙박스 영상 선택", "", VIDEO_FILTER)
-        if path:
-            self.video_selected.emit(path)
+        path, _ = QFileDialog.getOpenFileName(self, "블랙박스 영상 선택 (전방)", "", VIDEO_FILTER)
+        if not path:
+            return
+        rear = ""
+        if self._dual_cb.isChecked():
+            suggested = find_rear_sibling(path) or ""
+            rear, _ = QFileDialog.getOpenFileName(
+                self, "후방 영상 선택 (취소하면 전방만 분석)",
+                suggested or os.path.dirname(path), VIDEO_FILTER)
+            if rear and os.path.abspath(rear) == os.path.abspath(path):
+                rear = ""  # 같은 파일을 두 번 고른 경우
+        self.video_selected.emit(path, rear)
+
+    def dual_view_enabled(self) -> bool:
+        return self._dual_cb.isChecked()
 
     def _on_history_double_clicked(self, item: QListWidgetItem) -> None:
         case_id = item.data(Qt.UserRole)
@@ -131,10 +156,17 @@ class HomeView(QWidget):
         item = self._history_list.itemAt(pos)
         if item is not None and not item.isSelected():
             self._history_list.setCurrentItem(item)
+        menu = self.build_context_menu(item)
+        menu.exec(self._history_list.mapToGlobal(pos))
+
+    def build_context_menu(self, item) -> QMenu:
         menu = QMenu(self)
         open_action = QAction("열기", menu)
         open_action.setEnabled(item is not None)
         open_action.triggered.connect(lambda: self._on_history_double_clicked(item))
+        edit_action = QAction("사건 정보 수정… (사건번호·담당자·메모)", menu)
+        edit_action.setEnabled(item is not None)
+        edit_action.triggered.connect(lambda: self._request_edit(item))
         delete_action = QAction("선택 삭제", menu)
         delete_action.setEnabled(bool(self.selected_case_ids()))
         delete_action.triggered.connect(self._request_delete_selected)
@@ -142,10 +174,18 @@ class HomeView(QWidget):
         clear_action.setEnabled(self._history_list.count() > 0)
         clear_action.triggered.connect(self.history_clear_requested.emit)
         menu.addAction(open_action)
+        menu.addAction(edit_action)
         menu.addSeparator()
         menu.addAction(delete_action)
         menu.addAction(clear_action)
-        menu.exec(self._history_list.mapToGlobal(pos))
+        return menu
+
+    def _request_edit(self, item: QListWidgetItem) -> None:
+        if item is None:
+            return
+        case_id = item.data(Qt.UserRole)
+        if case_id is not None:
+            self.history_edit_requested.emit(int(case_id))
 
     def _update_buttons(self) -> None:
         self._delete_btn.setEnabled(bool(self._history_list.selectedItems()))

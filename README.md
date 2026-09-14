@@ -64,7 +64,9 @@ core/                     플랫폼/UI 무관 핵심 로직
 ├── paths.py              개발 실행 vs 패키징 실행 경로 차이 흡수
 ├── format_sniffer.py     업로드 파일이 처리 가능한지 사전 확인
 ├── duration.py           영상 재생시간 계산
-├── acceleration.py       급가속 의심 구간 판정
+├── acceleration.py       급가·감속 의심 구간 판정 (부호 유지, 종류 구분)
+├── outliers.py           GPS 이상치 판정 (좌표 급변·비정상 속도·범위 밖)
+├── video_pairs.py        전방 영상에서 후방 짝 파일(_F↔_R 등) 찾기
 ├── hashing.py            SHA-256 무결성 해시
 ├── pipeline.py           전체 분석 파이프라인 (위 모듈들을 순서대로 엮음)
 ├── appconfig.py          지도 사용 방식(오프라인/온라인) 설정 + 온라인 API 키 로딩
@@ -84,9 +86,10 @@ report/report_builder.py  Extraction Report PDF 생성
 ui/                       PySide6 화면
 ├── main_window.py        Home ↔ 분석화면 전환, 워커/리포트 연결
 ├── home_view.py          업로드 + 사건 이력 목록
-├── case_info_dialog.py   사건 정보 입력 모달
+├── case_info_dialog.py   사건 정보 입력 모달 (Enter = Start)
+├── case_edit_dialog.py   사건번호·담당자·메모 수정 (History 우클릭)
 ├── analysis_view.py      공통 헤더 + 3개 탭 구성
-├── tracker_tab.py        영상 재생 + 지도 (재생 위치 동기화)
+├── tracker_tab.py        영상 재생(배속·5초 건너뜀·전후방 나란히) + 지도 (재생 위치 동기화)
 ├── speed_tab.py          속도 그래프 + 통계
 ├── speed_chart_widget.py 속도 그래프 렌더링 (QPainter)
 ├── location_tab.py       지도 + 좌표 테이블
@@ -147,10 +150,26 @@ fragmented/sampletable/udta-mamt)는 엔진이 알아서 고르므로 앱은 관
 | `is_dropout` | GPS 시각은 있는데 좌표 없음 | **수신 끊김** (NMEA status=V) |
 | (둘 다 아님) | GPS 정보 자체가 없음 | 이 시점엔 GPS 미기록 (G센서 전용 행) |
 
-### `core/acceleration.py` — 급가속 판정
+### `core/acceleration.py` — 급가·감속 판정
 
-이 결과 하나를 속도 그래프의 강조 구간과 좌표 테이블의 빨간 행이 함께 사용한다
-(두 화면이 어긋나지 않도록 단일 소스).
+이 결과 하나를 속도 그래프의 강조 구간, 좌표 테이블의 색 행, 지도의 색 구간, 리포트가
+함께 사용한다(두 화면이 어긋나지 않도록 단일 소스). `FlaggedSegment.max_acceleration_mps2`는
+**부호를 유지**하고 `kind`가 `accel`/`decel`이다 — 예전엔 `abs()`로 저장해 감속도 전부
+"급가속"으로 표시됐다(제보: `REC_20240312_082217_F.mp4` 임계값 2.0에서 -2.418/-2.212/
+-2.109 m/s² 감속 3건이 급가속으로 나옴. 실샘플로 재현·수정 확인). 급가속 직후 급제동처럼
+부호가 바뀌면 구간을 나눈다. 색은 급가속 빨강, 급감속 주황.
+
+### `core/outliers.py` — GPS 이상치
+
+터널 출구·고층 건물 사이에서 좌표가 수 km 튀거나 속도가 말이 안 되는 값으로 찍히는 행을
+`TrackPoint.is_outlier`로 표시한다. 판정: 좌표 범위 밖/(0,0), 속도 300 km/h 초과·음수,
+직전 정상 측정에서 360 km/h 넘는 속도로 150 m 이상 멀어졌다가 다음 측정이 원래 자리 근처로
+돌아오는 "튄 점"(마지막 점은 돌아올 점이 없어 튄 것으로 봄). 다음 측정도 튄 자리 근처면
+실제 이동(긴 끊김 뒤 재수신)으로 보고 건드리지 않는다. 같은 측정값을 반복 기록한 행은
+함께 표시한다. 이상치는 `has_fix`가 False가 되어 지도·그래프·급가감속 판정·주소 조회에서
+빠지고, 좌표 표·리포트에는 "(이상치)"로 남으며 원본 값과 사유는 툴팁·CSV에 그대로 있다.
+끊김(`is_dropout`)과는 구분한다(좌표가 있으니 끊김이 아니다). 판정은 파이프라인과 재열기
+양쪽에서 매번 다시 한다.
 
 ### `core/pipeline.py` — 분석 파이프라인
 
@@ -162,6 +181,12 @@ fragmented/sampletable/udta-mamt)는 엔진이 알아서 고르므로 앱은 관
 
 SQLite는 **검색/색인용**이고, 실제 증거(원본 사본·엔진 출력·리포트)는 폴더에 파일로 둔다.
 DB가 손상돼도 증거는 살아남고, 다른 포렌식 도구가 이 앱 없이 폴더만으로 접근할 수 있다.
+
+사건번호·담당자·메모는 History 우클릭 > **사건 정보 수정**으로 나중에 고칠 수 있다
+(`ui/case_edit_dialog.py`). DB와 `case.json`에 반영되고(`pipeline.update_case_json`,
+`info_updated_at` 기록), 사건 폴더 이름과 분석 결과는 그대로 둔다. 예전 DB에 없는 컬럼
+(`rear_video_filename`)은 `HistoryStore._migrate()`가 `ALTER TABLE`로 보탠다 — `CREATE TABLE
+IF NOT EXISTS`는 기존 표를 바꾸지 않는다.
 
 삭제는 Home의 [선택 삭제]/[전체 삭제](Delete 키, 우클릭 메뉴)로 하며 `core/case_deletion.py`가
 맡는다. 확인 창에서 "사건 폴더도 함께 삭제"(기본 켜짐)를 끄면 목록에서만 지운다. 안전장치:
@@ -211,6 +236,33 @@ Range(206) 의미론이 필요하다. Qt 커스텀 URL 스킴으로는 206을 �
 전체가 보이게 축소한 채 리포트를 만들자 경로가 점 하나로 나왔다. 탭이 안 보이면(숨은 웹뷰는
 빈 그림이 찍힌다) 보일 때까지 기다리고, 타일이 8초 안에 안 와도 일단 찍는다. 기준 그림이 아직
 없으면 현재 화면을 대신 쓴다.
+
+### Tracker 재생 조작·전후방·정보 줄
+
+- **배속**(0.5×~2×)과 **±5초** 버튼. 지도 마커는 재생기의 `positionChanged`를 따라가므로
+  느리게 틀면 같이 느려진다(별도 처리 없음).
+- **전방/후방 같이 보기**: Home의 체크박스를 켜면 전방 파일을 고른 뒤 후방 파일을 하나 더
+  고른다(`core/video_pairs.py`가 `_F↔_R`, `_N↔_R` 짝을 기본값으로 띄움). 후방은 분석하지 않고
+  사건 폴더 `source/`에 사본만 두며(DB `rear_video_filename`, case.json), Tracker에서 영상
+  칸을 반으로 나눠 왼쪽 전방·오른쪽 후방으로 재생한다. 후방 재생기는 전방의 재생/정지/위치/
+  배속을 따라가고 0.4초 이상 어긋나면 맞춘다. **파일 하나에 비디오 트랙이 둘인 영상**은
+  옵션과 무관하게 두 번째 트랙(`setActiveVideoTrack(1)`)을 후방으로 띄운다. 헤드리스에서는
+  디코딩을 확인할 수 없어 실제 화면에서 봐야 한다.
+- **정보 줄**: GPS가 없는 순간(미기록·끊김·이상치)에는 속도·좌표를 지우지 않고 마지막 정상값을
+  그대로 두며, 오른쪽에 `(GPS 미기록)`/`(GPS 끊김)`/`(이상치)`만 표시한다 — 1초마다 "미기록"
+  으로 바뀌면 읽을 수 없다는 검토 의견.
+- **영상 길이**: 재생기가 길이를 0으로 주는 경우(가끔 AVI 첫 로드)에 대비해 파이프라인이
+  계산한 길이를 슬라이더·시간 표시의 대비값으로 쓴다(`set_duration_hint`).
+- **무결성 표시등**: 파일 정보 줄의 해시 옆 작은 점. 사건을 열 때마다 사본을 다시 읽어
+  원본 해시와 비교해 초록(일치)/빨강(불일치)/회색(사본 없음)으로 켜진다(HashWorker).
+
+### 지도 현재 위치 화살표
+
+현재 위치는 진행 방향으로 돌린 화살표다. 방향은 GPS 진행각(`track_deg`, 3 km/h 이상 이동
+중일 때)을 우선하고, 없으면 다음(없으면 이전) 좌표와의 방위각을 쓰며 정지 중에는 마지막
+방향을 유지한다(`ui/map_view.compute_headings`). 방향을 모르면 원으로 그린다. MapLibre는
+캔버스로 만든 화살표 이미지 + `icon-rotate`, 카카오는 CustomOverlay 안의 SVG를 CSS
+`rotate`로 돌린다.
 
 ### Tracker 영상 첫 장면
 
@@ -487,6 +539,12 @@ PC의 `assets/`에 있을 때만 `gpstracer.spec`이 번들에 넣는다. 배포
 `geocode.describe_location()`은 네트워크를 탄다. 화면은 `geocode.cached_address()`로
 즉시 확인하고, 없으면 `AddressResolver.request()`에 맡긴 뒤 `resolved` 시그널로 받는다.
 재생 중 초당 수십 번 불리는 `_update_info()`에서 동기 호출하면 창이 멈춘다.
+
+### 20. 사건 정보 창에서 Enter는 Start다
+
+QDialog에 기본 버튼을 정하지 않으면 Qt가 먼저 만든 버튼(Cancel)을 autoDefault로 골라,
+사건번호만 치고 Enter를 누르면 **취소**됐다(검토 제보). `start_btn.setDefault(True)` +
+`cancel_btn.setAutoDefault(False)`로 고정했다. 버튼 순서를 바꿔도 이 설정은 유지할 것.
 
 ### 19. 온라인 페이지는 외부 스크립트를 받는다
 

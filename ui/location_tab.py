@@ -21,7 +21,9 @@ from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
 from ui.map_view import MapView
 
-_FLAG_COLOR = QColor(255, 200, 200)
+_FLAG_COLOR = QColor(255, 200, 200)        # 급가속
+_FLAG_DECEL_COLOR = QColor(255, 226, 190)  # 급감속
+_OUTLIER_COLOR = QColor(200, 110, 0)
 _LINK_COLOR = QColor(30, 100, 200)
 _MAP_LINK_COLUMN = 5
 _DROPOUT_COLOR = QColor(190, 110, 40)
@@ -127,14 +129,28 @@ class LocationTab(QWidget):
         self._selected_key = None
 
         flagged_indices = set()
+        decel_indices = set()
         for seg in segments:
-            flagged_indices.update(range(seg.start_index, seg.end_index + 1))
+            rng = range(seg.start_index, seg.end_index + 1)
+            flagged_indices.update(rng)
+            if getattr(seg, "is_decel", False):
+                decel_indices.update(rng)
 
         self._table.setRowCount(len(records))
         for row, rec in enumerate(records):
             time_item = QTableWidgetItem(
                 f"{rec.start_time_sec:.2f}" if rec.start_time_sec is not None else "-")
-            if rec.has_fix:
+            if rec.is_outlier:
+                # 값은 지우지 않는다 - 툴팁에 원본과 판정 사유를 남긴다.
+                lat_item = QTableWidgetItem("(이상치)")
+                lon_item = QTableWidgetItem("(이상치)")
+                tip = (f"원본 값: {rec.latitude:.6f}, {rec.longitude:.6f}"
+                       + (f"\n속도 {rec.speed_kmh:.1f} km/h" if rec.speed_kmh is not None else "")
+                       + f"\n판정: {rec.outlier_reason}")
+                for it in (lat_item, lon_item):
+                    it.setForeground(_OUTLIER_COLOR)
+                    it.setToolTip(tip)
+            elif rec.has_fix:
                 lat_item = QTableWidgetItem(f"{rec.latitude:.6f}")
                 lon_item = QTableWidgetItem(f"{rec.longitude:.6f}")
             elif rec.is_dropout:
@@ -148,7 +164,9 @@ class LocationTab(QWidget):
                 lat_item.setForeground(_NOGPS_COLOR)
                 lon_item.setForeground(_NOGPS_COLOR)
             speed_item = QTableWidgetItem(
-                f"{rec.speed_kmh:.1f}" if rec.speed_kmh is not None else "-")
+                "(이상치)" if rec.is_outlier else (f"{rec.speed_kmh:.1f}" if rec.speed_kmh is not None else "-"))
+            if rec.is_outlier:
+                speed_item.setForeground(_OUTLIER_COLOR)
             g = rec.g_magnitude
             g_item = QTableWidgetItem(f"{g:.2f}" if g is not None else "-")
             if g is not None and g >= _IMPACT_G:
@@ -163,7 +181,8 @@ class LocationTab(QWidget):
                 link_item = QTableWidgetItem("-")
             items = (time_item, lat_item, lon_item, speed_item, g_item, link_item)
             if row in flagged_indices:
+                color = _FLAG_DECEL_COLOR if row in decel_indices else _FLAG_COLOR
                 for item in items:
-                    item.setBackground(_FLAG_COLOR)
+                    item.setBackground(color)
             for col, item in enumerate(items):
                 self._table.setItem(row, col, item)

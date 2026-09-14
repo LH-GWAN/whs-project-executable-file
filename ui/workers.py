@@ -46,10 +46,11 @@ class AnalysisWorker(QThread):
     def __init__(self, video_path: str, case_number: str, examiner: str, memo: str,
                  settings: Dict, cases_root_dir: str, history_db_path: Optional[str],
                  accel_threshold_mps2: float, carve_slack: bool = False,
-                 sha256: str = "", parent=None):
+                 sha256: str = "", rear_video_path: str = "", parent=None):
         super().__init__(parent)
         self._video_path = video_path
         self._sha256 = sha256
+        self._rear_video_path = rear_video_path
         self._case_number = case_number
         self._examiner = examiner
         self._memo = memo
@@ -76,6 +77,7 @@ class AnalysisWorker(QThread):
                     cancel_event=self._cancel_event,
                     progress_cb=self.progress.emit,
                     precomputed_sha256=self._sha256,
+                    rear_video_path=self._rear_video_path,
                 )
             self.finished_ok.emit(result)
         except CancelledError:

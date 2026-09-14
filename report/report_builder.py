@@ -9,7 +9,7 @@ from PySide6.QtCore import QMarginsF, QObject, QUrl
 from PySide6.QtGui import QPageLayout, QPageSize
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-from core.acceleration import FlaggedSegment
+from core.acceleration import KIND_DECEL, FlaggedSegment, count_by_kind
 from core.pipeline import PipelineResult
 from engine.engine_adapter import TrackPoint
 
@@ -75,8 +75,12 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     row_indices = _select_row_indices(records, segments)
 
     flagged_indices = set()
+    row_kind = {}
     for seg in segments:
-        flagged_indices.update(range(seg.start_index, seg.end_index + 1))
+        for i in range(seg.start_index, seg.end_index + 1):
+            flagged_indices.add(i)
+            row_kind[i] = seg.kind
+    accel_count, decel_count = count_by_kind(segments)
 
     rows_html = []
     prev_index: Optional[int] = None
@@ -84,12 +88,19 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
         if prev_index is not None and idx != prev_index + 1:
             rows_html.append('<tr class="gap"><td colspan="6">...</td></tr>')
         rec = records[idx]
-        row_class = "flagged" if idx in flagged_indices else ""
+        row_class = ""
+        if idx in flagged_indices:
+            row_class = "flagged-decel" if row_kind.get(idx) == KIND_DECEL else "flagged"
+        if rec.is_outlier:
+            row_class = (row_class + " outlier").strip()
         time_text = f"{rec.start_time_sec:.2f}" if rec.start_time_sec is not None else "-"
         speed_text = f"{rec.speed_kmh:.1f}" if rec.speed_kmh is not None else "-"
         g_value = rec.g_magnitude
         g_text = f"{g_value:.2f}" if g_value is not None else "-"
-        if rec.has_fix:
+        if rec.is_outlier:
+            lat_text = lon_text = "(이상치)"
+            speed_text = "(이상치)"
+        elif rec.has_fix:
             lat_text, lon_text = f"{rec.latitude:.6f}", f"{rec.longitude:.6f}"
         elif rec.is_dropout:
             lat_text = lon_text = "(GPS 끊김)"
@@ -118,11 +129,13 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     # 살려 그리면 타일 로딩 타이밍에 따라 결과가 달라져, 증거 문서로 쓰기 어렵다.
     visuals_html = (
         _image_section("속도 분석", chart_png,
-                        "급가속 의심 구간은 붉게 표시됩니다. 점은 실제 GPS 측정 지점입니다.")
+                        "붉은 구간은 급가속, 주황 구간은 급감속 의심 구간입니다. "
+                        "점은 실제 GPS 측정값이고 선은 점을 지나는 보간선입니다.")
         + _image_section("이동 경로", map_png,
-                          "초록 실선은 주행 경로, 붉은 구간은 급가속 의심 구간, "
-                          "회색 점선은 GPS 수신이 끊긴 구간입니다.")
+                          "초록 실선은 주행 경로, 붉은 구간은 급가속, 주황 구간은 급감속 의심 구간, "
+                          "회색 점선은 GPS 수신이 끊긴 구간입니다. 분석 완료 시점의 전체 경로입니다.")
     )
+    outlier_count = extraction.outlier_count
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -142,6 +155,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   th, td {{ border: 1px solid #ccc; padding: 4px 6px; text-align: left; }}
   th {{ background: #f2f2f2; }}
   tr.flagged {{ background: #ffd9d9; }}
+  tr.flagged-decel {{ background: #ffe8cc; }}
+  tr.outlier td {{ color: #b36b00; }}
   tr.gap td {{ text-align: center; color: #999; border: none; }}
   .kv {{ font-size: 12px; margin: 2px 0; }}
   .kv b {{ display: inline-block; width: 120px; }}
@@ -158,8 +173,9 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>시간축 근거</b>{_esc(extraction.time_source or "-")}</div>
   <div class="kv"><b>추출 지점</b>{_esc(len(records))}개 (GPS 수신 {_esc(fix_count)}개 /
       수신 끊김 {_esc(dropout_count)}개 / GPS 미기록 {_esc(len(records) - fix_count - dropout_count)}개)</div>
-  <div class="kv"><b>급가속 임계값</b>{_esc(pipeline_result.accel_threshold_mps2)} m/s&sup2;</div>
-  <div class="kv"><b>급가속 의심 구간</b>{_esc(len(segments))}개</div>
+  <div class="kv"><b>급가·감속 임계값</b>{_esc(pipeline_result.accel_threshold_mps2)} m/s&sup2;</div>
+  <div class="kv"><b>급가·감속 의심 구간</b>{_esc(len(segments))}개 (급가속 {accel_count} · 급감속 {decel_count})</div>
+  <div class="kv"><b>이상치 제외</b>{_esc(outlier_count)}개 지점 (좌표 급변·비정상 속도, 원본 CSV에는 보존)</div>
 
   {visuals_html}
   <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 급가속 구간 우선)</h2>

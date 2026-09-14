@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from engine.engine_adapter import TrackPoint
 
@@ -10,13 +10,35 @@ DEFAULT_THRESHOLD_MPS2 = 3.0
 MAX_GAP_SEC = 5.0
 
 
+KIND_ACCEL = "accel"
+KIND_DECEL = "decel"
+
+
 @dataclass
 class FlaggedSegment:
     start_index: int
     end_index: int
     start_time_sec: Optional[float]
     end_time_sec: Optional[float]
+    # 구간에서 크기가 가장 큰 가속도. **부호를 유지한다** - 음수면 급감속이다.
+    # 예전엔 abs()로 저장해 감속도 전부 "급가속"으로 표시됐다(검토 제보: REC_20240312 샘플
+    # 임계값 2.0에서 -2.418/-2.212/-2.109 m/s² 감속이 급가속으로 나옴).
     max_acceleration_mps2: float
+    kind: str = KIND_ACCEL
+
+    @property
+    def is_decel(self) -> bool:
+        return self.kind == KIND_DECEL
+
+    @property
+    def label(self) -> str:
+        return "급감속" if self.is_decel else "급가속"
+
+
+def count_by_kind(segments: List["FlaggedSegment"]) -> Tuple[int, int]:
+    """(급가속 개수, 급감속 개수)"""
+    decel = sum(1 for s in segments if s.is_decel)
+    return len(segments) - decel, decel
 
 
 def _time_of(point: TrackPoint) -> Optional[float]:
@@ -34,7 +56,7 @@ def _distinct_fix_indices(points: List[TrackPoint]) -> List[int]:
     out: List[int] = []
     prev_key = None
     for i, p in enumerate(points):
-        if p.speed_kmh is None or _time_of(p) is None:
+        if p.speed_kmh is None or _time_of(p) is None or p.is_outlier:
             continue
         key = _fix_key(p)
         if prev_key is None or key != prev_key:
@@ -67,6 +89,14 @@ def compute_flagged_segments(points: List[TrackPoint],
             if accel_at[i] is None or abs(accel) > abs(accel_at[i]):
                 accel_at[i] = accel
 
+    # 연속된 표시 행을 한 구간으로 묶되, 가속과 감속이 맞붙어 있으면(급가속 직후 급제동)
+    # 부호가 바뀌는 곳에서 구간을 나눠 각각 이름을 붙인다.
+    def sign_of(i: int) -> int:
+        a = accel_at[i]
+        if a is None:
+            return 0
+        return -1 if a < 0 else 1
+
     segments: List[FlaggedSegment] = []
     i = 0
     while i < n:
@@ -74,17 +104,25 @@ def compute_flagged_segments(points: List[TrackPoint],
             i += 1
             continue
         start = i
+        seg_sign = sign_of(i)
         while i < n and flags[i]:
+            s_i = sign_of(i)
+            if seg_sign == 0:
+                seg_sign = s_i
+            elif s_i != 0 and s_i != seg_sign:
+                break
             i += 1
         end = i - 1
-        seg_accels = [abs(a) for a in accel_at[start:end + 1] if a is not None]
-        if not seg_accels:
+        signed = [a for a in accel_at[start:end + 1] if a is not None]
+        if not signed:
             continue
+        peak = max(signed, key=abs)
         segments.append(FlaggedSegment(
             start_index=start,
             end_index=end,
             start_time_sec=_time_of(points[start]),
             end_time_sec=points[end].end_time_sec or _time_of(points[end]),
-            max_acceleration_mps2=max(seg_accels),
+            max_acceleration_mps2=peak,
+            kind=KIND_DECEL if peak < 0 else KIND_ACCEL,
         ))
     return segments

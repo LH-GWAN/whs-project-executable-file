@@ -32,6 +32,8 @@
   }
   #followBtn.on { background: #1c7ed6; border-color: #1c7ed6; color: #fff; }
   #legend i { width: 16px; height: 0; border-top-width: 3px; border-top-style: solid; }
+  #legend .lg-arrow { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent;
+    border-bottom: 12px solid #1c7ed6; display: inline-block; margin: 0 2px; }
   /* 리포트용 캡처 중에는 조작 요소를 숨긴다(범례는 남긴다) */
   body.capture #followBtn, body.capture #status, body.capture .maplibregl-ctrl-top-left,
   body.capture .maplibregl-ctrl-bottom-left { display: none !important; }
@@ -42,7 +44,9 @@
 <div id="legend">
   <div><i style="border-color:#1a9e5c"></i> 주행 경로</div>
   <div><i style="border-color:#e03131"></i> 급가속 의심 구간</div>
+  <div><i style="border-color:#f08c00"></i> 급감속 의심 구간</div>
   <div><i style="border-color:#9aa4ad; border-top-style:dashed"></i> GPS 끊김 구간</div>
+  <div><span class="lg-arrow"></span> 현재 위치 (진행 방향)</div>
 </div>
 <button id="followBtn" class="on" title="영상 재생에 맞춰 지도를 따라 움직입니다">따라가기 켜짐</button>
 <div id="status">지도 준비 중…</div>
@@ -151,21 +155,25 @@ async function addBasemapIfAvailable() {
 }
 
 function buildFeatures(points, flagged) {
-  const solid = [], dashed = [], flaggedLines = [];
-  const flaggedSet = new Set();
-  (flagged || []).forEach(([s, e]) => { for (let i = s; i <= e; i++) flaggedSet.add(i); });
+  const solid = [], dashed = [], flaggedLines = [], decelLines = [];
+  // 구간 종류: 급가속(accel) / 급감속(decel). 같은 구간의 두 점이 모두 표시돼야 그 선이 칠해진다.
+  const flaggedKind = new Map();
+  (flagged || []).forEach(([s, e, kind]) => { for (let i = s; i <= e; i++) flaggedKind.set(i, kind || "accel"); });
 
   let prev = null;
   let sawDropout = false;
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
     if (p.lat === null || p.lon === null) {
+      // 이상치(o)는 좌표를 지도에 쓰지 않되 끊김으로도 치지 않는다 - 앞뒤 정상 지점을 실선으로 잇는다.
       if (p.d) sawDropout = true;
       continue;
     }
     if (prev !== null) {
       const seg = [[points[prev].lon, points[prev].lat], [p.lon, p.lat]];
-      if (flaggedSet.has(i) && flaggedSet.has(prev)) flaggedLines.push(seg);
+      // 두 끝점이 같은 종류의 구간에 있을 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
+      const k1 = flaggedKind.get(i), k0 = flaggedKind.get(prev);
+      if (k1 && k0 && k1 === k0) (k1 === "decel" ? decelLines : flaggedLines).push(seg);
       else if (sawDropout) dashed.push(seg);
       else solid.push(seg);
     }
@@ -176,7 +184,7 @@ function buildFeatures(points, flagged) {
     type: "FeatureCollection",
     features: coords.map((c) => ({ type: "Feature", geometry: { type: "LineString", coordinates: c }, properties: {} })),
   });
-  return { solid: fc(solid), dashed: fc(dashed), flagged: fc(flaggedLines) };
+  return { solid: fc(solid), dashed: fc(dashed), flagged: fc(flaggedLines), decel: fc(decelLines) };
 }
 
 function renderTrack(payload) {
@@ -193,6 +201,7 @@ function renderTrack(payload) {
   setData("trk-solid", f.solid);
   setData("trk-dashed", f.dashed);
   setData("trk-flagged", f.flagged);
+  setData("trk-decel", f.decel);
 
   const ends = { type: "FeatureCollection", features: [] };
   if (fixes.length) {
@@ -224,7 +233,9 @@ function renderTrack(payload) {
     map.once("idle", function () { window.__trackIdle = true; });
 
     const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
+    const outliers = pts.reduce((n, p) => n + (p.o ? 1 : 0), 0);
     setStatus(`좌표 ${fixes.length}개` + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : "")
+      + (outliers ? ` · 이상치 ${outliers}개 제외` : "")
       + (window.__hasBasemap ? "" : " · 배경지도 없음(궤적만 표시)") + fallbackNote);
   } else {
     setStatus(pts.length ? "GPS 수신이 없는 구간뿐이라 표시할 좌표가 없습니다."
@@ -242,7 +253,8 @@ function setPlaybackTime(sec) {
   }
   const fc = { type: "FeatureCollection", features: [] };
   if (best) {
-    fc.features.push({ type: "Feature", properties: {},
+    const props = (best.h === null || best.h === undefined) ? {} : { bearing: best.h };
+    fc.features.push({ type: "Feature", properties: props,
       geometry: { type: "Point", coordinates: [best.lon, best.lat] } });
   }
   map.getSource("trk-pos").setData(fc);
@@ -273,11 +285,33 @@ function setFollow(on) {
   }
 }
 
+// 진행 방향 화살표 아이콘. 위(북)를 향하는 삼각형을 그려 두고 icon-rotate로 돌린다.
+function makeArrowImage(size) {
+  const c = document.createElement("canvas");
+  c.width = size; c.height = size;
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, size, size);
+  g.beginPath();
+  g.moveTo(size / 2, size * 0.06);
+  g.lineTo(size * 0.90, size * 0.90);
+  g.lineTo(size / 2, size * 0.70);
+  g.lineTo(size * 0.10, size * 0.90);
+  g.closePath();
+  g.fillStyle = "#1c7ed6";
+  g.fill();
+  g.lineWidth = size * 0.09;
+  g.strokeStyle = "#ffffff";
+  g.lineJoin = "round";
+  g.stroke();
+  return g.getImageData(0, 0, size, size);
+}
+
 function addTrackLayers() {
   const empty = { type: "FeatureCollection", features: [] };
-  for (const id of ["trk-solid", "trk-dashed", "trk-flagged", "trk-ends", "trk-pos"]) {
+  for (const id of ["trk-solid", "trk-dashed", "trk-flagged", "trk-decel", "trk-ends", "trk-pos"]) {
     map.addSource(id, { type: "geojson", data: empty });
   }
+  if (!map.hasImage("pos-arrow")) map.addImage("pos-arrow", makeArrowImage(64), { pixelRatio: 2 });
   map.addLayer({ id: "l-dashed", type: "line", source: "trk-dashed",
     paint: { "line-color": "#9aa4ad", "line-width": 2, "line-dasharray": [2, 2] } });
   map.addLayer({ id: "l-solid", type: "line", source: "trk-solid",
@@ -286,15 +320,27 @@ function addTrackLayers() {
   map.addLayer({ id: "l-flagged", type: "line", source: "trk-flagged",
     layout: { "line-cap": "round", "line-join": "round" },
     paint: { "line-color": "#e03131", "line-width": 6 } });
+  map.addLayer({ id: "l-decel", type: "line", source: "trk-decel",
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: { "line-color": "#f08c00", "line-width": 6 } });
   map.addLayer({ id: "l-ends", type: "circle", source: "trk-ends",
     paint: {
       "circle-radius": 7,
       "circle-color": ["match", ["get", "kind"], "start", "#1a9e5c", "#111111"],
       "circle-stroke-color": "#ffffff", "circle-stroke-width": 2,
     } });
+  // 방향을 모르는 지점(첫 측정 전 등)은 원, 아는 지점은 진행 방향으로 돌린 화살표.
   map.addLayer({ id: "l-pos", type: "circle", source: "trk-pos",
+    filter: ["!", ["has", "bearing"]],
     paint: { "circle-radius": 8, "circle-color": "#1c7ed6",
              "circle-stroke-color": "#ffffff", "circle-stroke-width": 3 } });
+  map.addLayer({ id: "l-pos-arrow", type: "symbol", source: "trk-pos",
+    filter: ["has", "bearing"],
+    layout: {
+      "icon-image": "pos-arrow", "icon-size": 0.55,
+      "icon-rotate": ["get", "bearing"], "icon-rotation-alignment": "map",
+      "icon-allow-overlap": true, "icon-ignore-placement": true,
+    } });
 }
 
 let initStarted = false;
