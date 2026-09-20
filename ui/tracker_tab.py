@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -10,13 +10,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from core import geocode
+from core import geocode, gpstime
 from core.acceleration import FlaggedSegment
 from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
@@ -25,6 +26,84 @@ from ui.map_view import MapView
 SKIP_MS = 5000
 PLAYBACK_RATES = ((0.5, "0.5×"), (0.75, "0.75×"), (1.0, "1×"), (1.5, "1.5×"), (2.0, "2×"))
 _SYNC_TOLERANCE_MS = 400
+# 전방/후방 중 하나를 눌러 키웠을 때의 폭 비율(누른 쪽 : 다른 쪽)
+ENLARGED_RATIO = (3, 1)
+FRONT, REAR = 0, 1
+
+
+class _ElideLabel(QLabel):
+    """칸보다 긴 글은 끝을 …로 줄여 그린다. 주소처럼 길이가 들쭉날쭉한 글이 레이아웃 폭을
+    밀지 못하게 하려고 쓴다(QLabel은 기본으로 줄이지 않고 그냥 잘린다)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._full = ""
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full = text or ""
+        self._refresh()
+
+    def fullText(self) -> str:  # noqa: N802
+        return self._full
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        width = max(0, self.width() - 4)
+        super().setText(self.fontMetrics().elidedText(self._full, Qt.ElideRight, width))
+
+
+class _VideoPane(QWidget):
+    """영상 하나 + 위쪽의 작은 이름표("전방"/"후방"). 어디를 눌러도 clicked를 낸다.
+
+    Qt6의 QVideoWidget은 안에 영상 창을 두되 입력을 투과시키므로(WindowTransparentForInput)
+    마우스 이벤트는 QVideoWidget 자체로 온다 - 그걸 걸러서 클릭으로 쓴다."""
+
+    clicked = Signal()
+
+    def __init__(self, video_widget: QVideoWidget, parent=None):
+        super().__init__(parent)
+        self._caption = QLabel("")
+        self._caption.setAlignment(Qt.AlignCenter)
+        self._caption.setStyleSheet("color: #8a8a8a; font-size: 11px;")
+        self._caption.setFixedHeight(16)
+        self._caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._caption.hide()
+        self._video = video_widget
+        self._video.setParent(self)
+        self._video.installEventFilter(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+        layout.addWidget(self._caption)
+        layout.addWidget(self._video, 1)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_caption(self, text: str, visible: bool) -> None:
+        self._caption.setText(text)
+        self._caption.setVisible(visible)
+        self._caption.setToolTip("클릭하면 이 영상을 크게 봅니다. 다시 누르면 원래대로." if visible else "")
+
+    def caption_text(self) -> str:
+        return self._caption.text()
+
+    def caption_visible(self) -> bool:
+        return not self._caption.isHidden()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self._video and event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            return True
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 def _fmt_ms(ms: int) -> str:
@@ -44,8 +123,14 @@ class TrackerTab(QWidget):
         self._rear_player = QMediaPlayer(self)
         self._rear_widget = QVideoWidget(self)
         self._rear_player.setVideoOutput(self._rear_widget)
-        self._rear_widget.hide()
         self._rear_active = False
+        # 전방/후방 중 눌러서 키운 쪽(FRONT/REAR). None이면 반반.
+        self._enlarged: Optional[int] = None
+        self._front_pane = _VideoPane(self._video_widget)
+        self._rear_pane = _VideoPane(self._rear_widget)
+        self._rear_pane.hide()
+        self._front_pane.clicked.connect(lambda: self._on_pane_clicked(FRONT))
+        self._rear_pane.clicked.connect(lambda: self._on_pane_clicked(REAR))
 
         self._play_btn = QPushButton("▶")
         self._play_btn.setFixedWidth(40)
@@ -94,18 +179,45 @@ class TrackerTab(QWidget):
         controls.addWidget(self._time_label)
         controls.addWidget(self._rate_combo)
 
+        # 영상 위: 재생 지점의 GPS 기록 시각. GPS는 UTC로 찍히므로 한국 시간으로 옮기고
+        # "(UTC+9)"를 붙인다. GPS가 없는 순간에는 마지막 시각을 그대로 둔다.
+        self._clock_label = QLabel("날짜·시간 -")
+        clock_font = self._clock_label.font()
+        clock_font.setBold(True)
+        self._clock_label.setFont(clock_font)
+        self._clock_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._clock_label.setFixedHeight(self._clock_label.fontMetrics().height() + 6)
+        self._clock_label.setContentsMargins(4, 0, 4, 0)
+        self._clock_label.setToolTip("현재 재생 지점의 GPS 기록 시각. 한국 시간(UTC+9)으로 표시합니다.")
+        self._last_clock = ""
+
         # 재생 중인 지점의 속도/좌표를 영상 바로 아래에 보여준다. 위경도만으로는
         # 어디인지 바로 읽기 어려워서 주소도 함께 둔다. 주소는 외부 조회가 필요해
         # 온라인 모드에서만 채워지고, 조회는 워커(AddressResolver)가 맡는다.
         # GPS가 없는 순간(미기록·끊김·이상치)에는 값을 지우지 않고 마지막 정상값을 그대로
         # 두며, 오른쪽 상태 표시로만 알린다 - 1초마다 "미기록"으로 바뀌면 읽을 수가 없다.
+        #
+        # 이 줄의 크기는 내용과 무관하게 고정한다. 처음엔 "(GPS 미기록)"이 나타날 때마다
+        # 줄이 넓어져 영상 칸이 커졌다 작아졌다 했고, 그 바람에 옆의 지도 컨테이너 크기가
+        # 바뀌어 지도 확대까지 풀렸다(검토 제보). 각 칸은 가장 긴 문구 폭으로 잡아 두고,
+        # 줄 전체는 폭을 레이아웃에 요구하지 않는다(Ignored).
         self._speed_label = QLabel("속도 -")
-        self._speed_label.setStyleSheet("font-weight: 600;")
+        speed_font = self._speed_label.font()
+        speed_font.setBold(True)
+        self._speed_label.setFont(speed_font)
         self._coord_label = QLabel("위치 -")
-        self._addr_label = QLabel("")
+        self._addr_label = _ElideLabel()
         self._addr_label.setStyleSheet("color: #666;")
+        self._addr_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._status_label = QLabel("")
-        self._status_label.setStyleSheet("color: #b36b00; font-weight: 600;")
+        status_font = self._status_label.font()
+        status_font.setBold(True)
+        self._status_label.setFont(status_font)
+        self._status_label.setStyleSheet("color: #b36b00;")
+        self._status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._speed_label.setFixedWidth(self._speed_label.fontMetrics().horizontalAdvance("속도 000.0 km/h") + 8)
+        self._coord_label.setFixedWidth(self._coord_label.fontMetrics().horizontalAdvance("위치 -00.000000, -000.000000") + 8)
+        self._status_label.setFixedWidth(self._status_label.fontMetrics().horizontalAdvance("(GPS 미기록)") + 12)
 
         info_row = QHBoxLayout()
         info_row.setContentsMargins(4, 2, 4, 2)
@@ -115,20 +227,29 @@ class TrackerTab(QWidget):
         info_row.addSpacing(10)
         info_row.addWidget(self._addr_label, 1)
         info_row.addWidget(self._status_label)
+        self._info_bar = QWidget()
+        self._info_bar.setLayout(info_row)
+        self._info_bar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._info_bar.setFixedHeight(self._speed_label.fontMetrics().height() + 10)
 
         # 전방/후방 영상: 후방이 있으면 영상 칸을 반으로 나눠 왼쪽 전방, 오른쪽 후방.
+        # 한쪽을 누르면 그쪽이 3:1로 커지고, 다시 누르면 반반으로 돌아온다.
         self._video_split = QSplitter(Qt.Horizontal)
-        self._video_split.addWidget(self._video_widget)
-        self._video_split.addWidget(self._rear_widget)
+        self._video_split.addWidget(self._front_pane)
+        self._video_split.addWidget(self._rear_pane)
+        self._video_split.setChildrenCollapsible(False)
         self._video_split.setSizes([1, 1])
 
         video_panel = QVBoxLayout()
         video_panel.setContentsMargins(0, 0, 0, 0)
+        video_panel.setSpacing(2)
+        video_panel.addWidget(self._clock_label)
         video_panel.addWidget(self._video_split, 1)
         video_panel.addLayout(controls)
-        video_panel.addLayout(info_row)
+        video_panel.addWidget(self._info_bar)
         video_container = QWidget()
         video_container.setLayout(video_panel)
+        self._video_container = video_container
 
         self._points: List[TrackPoint] = []
         self._map = MapView()
@@ -171,9 +292,35 @@ class TrackerTab(QWidget):
 
     def _set_rear_active(self, active: bool) -> None:
         self._rear_active = active
-        self._rear_widget.setVisible(active)
-        if active:
-            self._video_split.setSizes([1, 1])
+        self._rear_pane.setVisible(active)
+        self._front_pane.set_caption("전방", active)
+        self._rear_pane.set_caption("후방", active)
+        self._enlarged = None
+        self._apply_split_sizes()
+
+    def enlarged_pane(self) -> Optional[int]:
+        """눌러서 키운 쪽(FRONT/REAR), 반반이면 None."""
+        return self._enlarged
+
+    def _on_pane_clicked(self, which: int) -> None:
+        if not self._rear_active:
+            return  # 영상이 하나뿐이면 키울 상대가 없다
+        self._enlarged = None if self._enlarged == which else which
+        self._apply_split_sizes()
+
+    def _apply_split_sizes(self) -> None:
+        total = sum(self._video_split.sizes()) or max(self._video_split.width(), 200)
+        if self._enlarged is None:
+            weights = (1, 1)
+        elif self._enlarged == FRONT:
+            weights = ENLARGED_RATIO
+        else:
+            weights = tuple(reversed(ENLARGED_RATIO))
+        self._video_split.setStretchFactor(0, weights[0])
+        self._video_split.setStretchFactor(1, weights[1])
+        if self._rear_active:
+            unit = total / float(sum(weights))
+            self._video_split.setSizes([int(unit * weights[0]), int(unit * weights[1])])
 
     def _on_media_status(self, status) -> None:
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
@@ -232,6 +379,8 @@ class TrackerTab(QWidget):
         self._map.set_track(points, segments)
         self._addr_key = None
         self._last_valid: Optional[TrackPoint] = None
+        self._last_clock = ""
+        self._clock_label.setText("날짜·시간 -")
         self._update_info(0.0)
 
     def _point_at(self, seconds: float) -> Optional[TrackPoint]:
@@ -254,6 +403,12 @@ class TrackerTab(QWidget):
             self._status_label.setText("")
             self._addr_key = None
             return
+
+        # 시각은 좌표가 없는 행(status=V)에도 대개 남아 있어 좌표와 별개로 갱신한다.
+        clock = gpstime.format_point(point)
+        if clock:
+            self._last_clock = clock
+        self._clock_label.setText(f"날짜·시간 {self._last_clock}" if self._last_clock else "날짜·시간 -")
 
         if point.is_outlier:
             status = "(이상치)"

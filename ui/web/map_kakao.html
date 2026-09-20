@@ -86,6 +86,11 @@ let trackData = null;
 let pendingTrack = null;
 let followEnabled = true;
 let polylines = [];
+// 사용자가 확대/축소하거나 끈 뒤(true)에는 컨테이너 크기가 바뀌어도 궤적 전체로 다시
+// 맞추지 않는다. 예전엔 옆 패널 글자가 바뀌어 지도 칸이 조금만 커져도 fitToTrack이 불려
+// 확대가 풀렸다(검토 제보: "(미기록) 구간에서 확대가 꺼진다").
+let viewTouched = false;
+let fitting = false;
 // 따라가기 상자: 화면의 80% (가장자리에서 10%씩 안쪽)
 const FOLLOW_MARGIN = 0.10;
 let startOverlay = null, endOverlay = null, posOverlay = null;
@@ -198,15 +203,17 @@ function initMap() {
     });
     map.addControl(new kakao.maps.ZoomControl(), kakao.maps.ControlPosition.TOPLEFT);
     // 사용자가 끌면 따라가기를 끈다. 우리가 panTo로 움직인 건 dragstart를 내지 않는다.
-    kakao.maps.event.addListener(map, "dragstart", function () { setFollow(false); });
+    kakao.maps.event.addListener(map, "dragstart", function () { viewTouched = true; setFollow(false); });
+    kakao.maps.event.addListener(map, "zoom_changed", function () { if (!fitting) viewTouched = true; });
 
     startOverlay = makeDot("trk-start");
     endOverlay = makeDot("trk-end");
     posOverlay = makePosOverlay();
 
     // 컨테이너 크기가 바뀌면(탭 분할선 이동, 창 크기 변경) 카카오 지도는 내부 뷰포트를
-    // 다시 잡아야 한다. 초기화 당시 작았던 화면 기준으로 맞춘 범위도 다시 맞춘다 -
-    // 단, 사용자가 직접 지도를 움직인 뒤(따라가기 꺼짐)에는 보던 곳을 뺏지 않는다.
+    // 다시 잡아야 한다. 초기화 당시 작았던 화면 기준으로 맞춘 범위는, 사용자가 아직
+    // 확대/이동을 한 번도 안 했을 때만 다시 맞춘다. 한 번이라도 손댔으면 확대 수준과
+    // 중심을 그대로 두고, 마커가 화면을 벗어나면 따라가기가 알아서 옮긴다.
     let resizeTimer = null;
     window.addEventListener("resize", function () {
       if (resizeTimer) clearTimeout(resizeTimer);
@@ -214,7 +221,7 @@ function initMap() {
         resizeTimer = null;
         if (!map) return;
         map.relayout();
-        if (followEnabled && trackData) fitToTrack(trackData);
+        if (followEnabled && trackData && !viewTouched) fitToTrack(trackData);
       }, 150);
     });
 
@@ -331,12 +338,19 @@ function fitToTrack(payload) {
   if (!fixes.length) return;
   const bounds = new kakao.maps.LatLngBounds();
   fixes.forEach((p) => bounds.extend(latLng(p)));
-  if (fixes.length === 1 || bounds.isEmpty()) {
-    map.setCenter(latLng(fixes[0]));
-    map.setLevel(3);
-  } else {
-    map.setBounds(bounds, 48, 48, 48, 48);
-    if (map.getLevel() < 2) map.setLevel(2);
+  fitting = true;
+  try {
+    if (fixes.length === 1 || bounds.isEmpty()) {
+      map.setCenter(latLng(fixes[0]));
+      map.setLevel(3);
+    } else {
+      map.setBounds(bounds, 48, 48, 48, 48);
+      if (map.getLevel() < 2) map.setLevel(2);
+    }
+  } finally {
+    // zoom_changed가 비동기로 늦게 와도 우리가 낸 것으로 치도록 한 틱 뒤에 푼다.
+    setTimeout(function () { fitting = false; }, 0);
+    viewTouched = false;
   }
 }
 

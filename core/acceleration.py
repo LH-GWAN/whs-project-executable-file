@@ -65,6 +65,22 @@ def _distinct_fix_indices(points: List[TrackPoint]) -> List[int]:
     return out
 
 
+def compute_point_accelerations(points: List[TrackPoint],
+                                max_gap_sec: float = MAX_GAP_SEC) -> List[Optional[float]]:
+    """행마다 '직전 실측 → 이 행' 구간의 가속도(m/s², 부호 유지). 첫 실측, 끊김(max_gap 초과)
+    뒤의 첫 실측, 미기록·이상치·반복 기록 행은 None. 급가감속 판정과 그래프 툴팁이 같은
+    값을 쓰도록 한 곳에 둔다."""
+    out: List[Optional[float]] = [None] * len(points)
+    usable = _distinct_fix_indices(points)
+    for prev_i, cur_i in zip(usable, usable[1:]):
+        prev_p, cur_p = points[prev_i], points[cur_i]
+        dt = _time_of(cur_p) - _time_of(prev_p)
+        if dt <= 0 or dt > max_gap_sec:
+            continue
+        out[cur_i] = ((cur_p.speed_kmh - prev_p.speed_kmh) / 3.6) / dt
+    return out
+
+
 def compute_flagged_segments(points: List[TrackPoint],
                               threshold_mps2: float = DEFAULT_THRESHOLD_MPS2,
                               max_gap_sec: float = MAX_GAP_SEC) -> List[FlaggedSegment]:
@@ -73,16 +89,11 @@ def compute_flagged_segments(points: List[TrackPoint],
     accel_at: List[Optional[float]] = [None] * n
 
     usable = _distinct_fix_indices(points)
+    per_point = compute_point_accelerations(points, max_gap_sec)
 
     for prev_i, cur_i in zip(usable, usable[1:]):
-        prev_p, cur_p = points[prev_i], points[cur_i]
-        t0, t1 = _time_of(prev_p), _time_of(cur_p)
-        dt = t1 - t0
-        if dt <= 0 or dt > max_gap_sec:
-            continue
-        dv_mps = (cur_p.speed_kmh - prev_p.speed_kmh) / 3.6
-        accel = dv_mps / dt
-        if abs(accel) < threshold_mps2:
+        accel = per_point[cur_i]
+        if accel is None or abs(accel) < threshold_mps2:
             continue
         for i in range(prev_i, cur_i + 1):
             flags[i] = True

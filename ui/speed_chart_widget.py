@@ -7,7 +7,8 @@ from PySide6.QtCore import QBuffer, QIODevice, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
-from core.acceleration import FlaggedSegment, _distinct_fix_indices
+from core import gpstime
+from core.acceleration import FlaggedSegment, _distinct_fix_indices, compute_point_accelerations
 from engine.engine_adapter import TrackPoint
 
 _BG = QColor("#0d1117")
@@ -23,6 +24,13 @@ _GRID_MINOR = QColor(255, 255, 255, 38)
 _GRID_Y = QColor(255, 255, 255, 45)
 
 _Y_PADDING_RATIO = 0.18
+
+# 마우스를 점 가까이 대면 그 측정값을 말풍선으로 보여준다.
+HOVER_RADIUS_PX = 12
+_HOVER_RING = QColor("#ffffff")
+_BUBBLE_BG = QColor(22, 30, 40, 235)
+_BUBBLE_BORDER = QColor("#5b6b7a")
+_BUBBLE_TEXT = QColor("#e8edf2")
 
 # 시간 눈금 간격. 블랙박스 영상은 대개 20초~2분이라 10초 단위가 기본이고(사이에 5초 보조선),
 # 더 길면 눈금이 10개 안쪽이 되는 간격을 고른다.
@@ -55,13 +63,71 @@ class SpeedChartWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(260)
+        self.setMouseTracking(True)
         self._records: List[TrackPoint] = []
         self._segments: List[FlaggedSegment] = []
+        self._accels: List[Optional[float]] = []
+        # 마지막으로 화면에 그린 점들의 위치 (원본 인덱스, x, y). 마우스 위치와 맞춰 본다.
+        self._screen_pts: List[Tuple[int, float, float]] = []
+        self._hover: Optional[int] = None
 
     def set_data(self, records: List[TrackPoint], segments: List[FlaggedSegment]) -> None:
         self._records = records
         self._segments = segments
+        self._accels = compute_point_accelerations(records)
+        self._hover = None
+        self._screen_pts = []
         self.update()
+
+    # ---------- 마우스 올린 점의 정보 ----------
+    def hovered_index(self) -> Optional[int]:
+        return self._hover
+
+    def hover_lines(self, index: int) -> List[str]:
+        """말풍선에 들어갈 줄들. 영상 시각·GPS 시각·속도·가속도·좌표·급가감속 구간."""
+        if not (0 <= index < len(self._records)):
+            return []
+        r = self._records[index]
+        lines: List[str] = []
+        if r.start_time_sec is not None:
+            total = int(round(r.start_time_sec))
+            m, sec = divmod(total, 60)
+            lines.append(f"영상 {m:02d}:{sec:02d}")
+        clock = gpstime.format_point(r)
+        if clock:
+            lines.append(f"GPS 시각 {clock}")
+        lines.append(f"속도 {r.speed_kmh:.1f} km/h" if r.speed_kmh is not None else "속도 -")
+        accel = self._accels[index] if index < len(self._accels) else None
+        lines.append(f"가속도 {accel:+.2f} m/s²" if accel is not None else "가속도 - (직전 측정 없음)")
+        if r.latitude is not None and r.longitude is not None:
+            lines.append(f"위치 {r.latitude:.6f}, {r.longitude:.6f}")
+        for seg in self._segments:
+            if seg.start_index <= index <= seg.end_index:
+                lines.append(f"{seg.label} 의심 구간 (최대 {seg.max_acceleration_mps2:+.2f} m/s²)")
+                break
+        return lines
+
+    def _nearest_index(self, x: float, y: float) -> Optional[int]:
+        best, best_d2 = None, float(HOVER_RADIUS_PX * HOVER_RADIUS_PX)
+        for index, px, py in self._screen_pts:
+            d2 = (px - x) ** 2 + (py - y) ** 2
+            if d2 <= best_d2:
+                best, best_d2 = index, d2
+        return best
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        pos = event.position()
+        found = self._nearest_index(pos.x(), pos.y())
+        if found != self._hover:
+            self._hover = found
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        if self._hover is not None:
+            self._hover = None
+            self.update()
+        super().leaveEvent(event)
 
     def grab_png(self, width: int = 900, height: int = 300) -> Optional[bytes]:
         """그래프를 PNG로 캡처한다. 화면 크기와 무관하게 리포트용 크기로 그린다."""
@@ -98,13 +164,17 @@ class SpeedChartWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), _BG)
-        self._paint_to(painter, self.rect())
+        self._paint_to(painter, self.rect(), record_positions=True)
+        self._paint_hover(painter)
         painter.end()
 
-    def _paint_to(self, painter, area) -> None:
+    def _paint_to(self, painter, area, record_positions: bool = False) -> None:
         """화면과 리포트 이미지가 같은 코드로 그려지도록 분리했다.
-        area만 다르고 나머지는 동일하다."""
+        area만 다르고 나머지는 동일하다. record_positions는 화면에 그릴 때만 켜서
+        마우스 판정용 점 위치를 남긴다(리포트 이미지 크기로 남기면 어긋난다)."""
         pts = self._plot_points()
+        if record_positions:
+            self._screen_pts = []
         if len(pts) < 2:
             painter.setPen(_AXIS)
             painter.drawText(area, Qt.AlignCenter, "표시할 속도 데이터가 없습니다.")
@@ -178,6 +248,8 @@ class SpeedChartWidget(QWidget):
 
         # 실측 지점을 점으로 남긴다. 곡선은 이 점들을 정확히 지나며 그 사이만 부드럽게
         # 이은 것이라, 점이 곧 실제 측정값이다.
+        if record_positions:
+            self._screen_pts = [(i, x_for_time(t), y_for(v)) for i, t, v in pts]
         if len(pts) <= 400:
             painter.setPen(Qt.NoPen)
             painter.setBrush(_DOT)
@@ -188,6 +260,45 @@ class SpeedChartWidget(QWidget):
         painter.setPen(_AXIS)
         painter.drawText(4, int(plot.top()) + 10, f"{hi:.0f} km/h")
         painter.drawText(4, int(plot.bottom()) + 4, f"{lo:.0f} km/h")
+
+    def _paint_hover(self, painter) -> None:
+        """마우스를 올린 점을 고리로 강조하고 옆에 말풍선을 그린다. 화면에만 그리고
+        리포트 이미지에는 넣지 않는다."""
+        if self._hover is None:
+            return
+        pos = next(((x, y) for i, x, y in self._screen_pts if i == self._hover), None)
+        if pos is None:
+            return
+        lines = self.hover_lines(self._hover)
+        if not lines:
+            return
+        px, py = pos
+        painter.setPen(QPen(_HOVER_RING, 2))
+        painter.setBrush(_LINE)
+        painter.drawEllipse(QPointF(px, py), 4.5, 4.5)
+        painter.setBrush(Qt.NoBrush)
+
+        fm = painter.fontMetrics()
+        pad, gap = 8, 3
+        width = max(fm.horizontalAdvance(line) for line in lines) + pad * 2
+        height = len(lines) * fm.height() + (len(lines) - 1) * gap + pad * 2
+        # 기본은 점의 오른쪽 위. 화면 밖으로 나가면 왼쪽/아래로 뒤집는다.
+        x = px + 14
+        if x + width > self.width() - 4:
+            x = px - 14 - width
+        y = py - height - 10
+        if y < 4:
+            y = py + 12
+        x = max(4, x)
+        painter.setPen(QPen(_BUBBLE_BORDER, 1))
+        painter.setBrush(_BUBBLE_BG)
+        painter.drawRoundedRect(QRectF(x, y, width, height), 5, 5)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(_BUBBLE_TEXT)
+        ty = y + pad + fm.ascent()
+        for line in lines:
+            painter.drawText(int(x + pad), int(ty), line)
+            ty += fm.height() + gap
 
     def _build_path(self, pts, x_for_time, y_for) -> QPainterPath:
         """실측 지점들을 **정확히 지나는** 부드러운 곡선으로 잇는다.
