@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.appinfo import APP_NAME
 from core.pipeline import PipelineResult
 from ui.location_tab import LocationTab
 from ui.speed_tab import SpeedTab
@@ -127,7 +128,7 @@ class AnalysisView(QWidget):
         super().__init__(parent)
         self._result: PipelineResult | None = None
 
-        title = QLabel("GPS Tracer")
+        title = QLabel(APP_NAME)
         title.setProperty("role", "title")
         self._case_label = QLabel("")
 

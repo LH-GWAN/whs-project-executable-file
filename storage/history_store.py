@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
+from core.appinfo import app_data_dir
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,11 +43,7 @@ CREATE TABLE IF NOT EXISTS engine_runs (
 
 
 def default_app_data_dir() -> str:
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
-    else:
-        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "GPSTracer")
+    return app_data_dir()
 
 
 @dataclass

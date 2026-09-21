@@ -25,7 +25,9 @@ def _diagnose() -> int:
     from ui.map_server import vendor_dir as web_vendor_dir, web_dir
 
     print("=" * 60)
-    print("GPS Tracer 진단")
+    from core.appinfo import APP_NAME
+
+    print(f"{APP_NAME} 진단")
     print("=" * 60)
     print(f"실행 형태        : {'exe (frozen)' if is_frozen() else '소스'}")
     print(f"sys.executable   : {sys.executable}")

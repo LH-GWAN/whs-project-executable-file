@@ -21,6 +21,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
+from core.appinfo import USER_AGENT
+
 SDK_URL = "https://dapi.kakao.com/v2/maps/sdk.js"
 COORD2ADDRESS_URL = "https://dapi.kakao.com/v2/local/geo/coord2address.json"
 
@@ -45,7 +47,7 @@ class HttpResult:
 
 
 def _request(url: str, headers: Dict[str, str], timeout: float) -> HttpResult:
-    req = urllib.request.Request(url, headers={"User-Agent": "GPSTracer", **headers})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **headers})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return HttpResult(resp.status, resp.read())

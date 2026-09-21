@@ -58,7 +58,7 @@
 파일(`.pmtiles`)만 본다. 두 파일이 같은 폴더에 있어도 서로 방해하지 않는다.
 
 - **폴더가 두 개다.** 소스로 실행하면 프로젝트의 `assets\`, exe로 실행하면
-  `dist\GPSTracer\_internal\assets\`를 본다. 안내 창과 `--diagnose`가 지금 보는 폴더의
+  `dist\IDAS\_internal\assets\`를 본다. 안내 창과 `--diagnose`가 지금 보는 폴더의
   전체 경로를 그대로 보여주니 그 경로에 넣으면 된다. **다시 빌드할 필요 없다** — 빌드 전에
   프로젝트 `assets\`에 넣으면 번들에 들어가고, 빌드 뒤라면 `_internal\assets\`에 넣는다.
 - **이름은 자유, 확장자는 `.json` 또는 `.txt`.** `online_keys (1).json`, `online_keys.json.txt`
@@ -80,15 +80,15 @@
 ```
 
 - **개발 실행**: 이 폴더(`assets/`)에 넣고 프로그램을 다시 시작하면 인식된다.
-- **exe 빌드**: 빌드 전에 넣으면 `gpstracer.spec`이 번들에 넣는다. 이미 빌드했으면
-  `dist\GPSTracer\_internal\assets\`에 넣어도 된다(재빌드 불필요).
-- **재빌드 없이 키 교체**: `%LOCALAPPDATA%\GPSTracer\settings.json`에
+- **exe 빌드**: 빌드 전에 넣으면 `idas.spec`이 번들에 넣는다. 이미 빌드했으면
+  `dist\IDAS\_internal\assets\`에 넣어도 된다(재빌드 불필요).
+- **재빌드 없이 키 교체**: `%LOCALAPPDATA%\IDAS\settings.json`에
   `"kakao_js_key"`, `"kakao_rest_key"`를 넣으면 파일보다 우선한다(유출로 재발급했을 때).
 
 확인:
 
 ```cmd
-GPSTracer.exe --diagnose
+IDAS.exe --diagnose
 ```
 
 `온라인 지도 (카카오맵)` 항목에 키가 앞뒤 4자리로 표시되면 인식된 것이다.
@@ -176,7 +176,7 @@ curl -sI https://build.protomaps.com/20260825.pmtiles | head -1
 
 만들어진 `korea.pmtiles`를 이 폴더에 넣으면 끝이다.
 - **개발 실행 시**: 바로 인식된다.
-- **exe 빌드 시**: `gpstracer.spec`이 파일이 있으면 자동으로 번들에 포함한다.
+- **exe 빌드 시**: `idas.spec`이 파일이 있으면 자동으로 번들에 포함한다.
 
 ### 줌 레벨별 크기 (실측)
 

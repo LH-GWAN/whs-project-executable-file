@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from core.appinfo import app_data_dir
 from core.paths import resource_root
 
 MAP_MODE_OFFLINE = "offline"
@@ -46,11 +47,7 @@ _keys_cache: Optional[Dict[str, str]] = None
 
 
 def _app_data_dir() -> str:
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
-    else:
-        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "GPSTracer")
+    return app_data_dir()
 
 
 def _config_path() -> str:

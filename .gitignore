@@ -3,10 +3,10 @@ __pycache__/
 .DS_Store
 /build/
 /dist/
-# PyInstaller가 자동 생성하는 spec만 제외 - gpstracer.spec은 직접 작성한 빌드
+# PyInstaller가 자동 생성하는 spec만 제외 - idas.spec은 직접 작성한 빌드
 # 정의 파일이라 반드시 저장소에 포함되어야 한다.
 *.spec
-!gpstracer.spec
+!idas.spec
 .venv/
 
 # 배경지도 타일 (수백 MB - 저장소에 넣지 않고 assets/README.md 절차로 각자 생성)
@@ -16,8 +16,8 @@ assets/*.pmtiles.zip
 assets/*.zip
 
 # 빌드 후 생성되는 실행 바로가기
-GPSTracer.lnk
+IDAS.lnk
 
 # 온라인 지도(카카오맵) API 키 - 저장소가 공개라 절대 커밋하지 않는다.
-# 빌드하는 PC의 assets/에만 두면 gpstracer.spec이 번들에 넣는다.
+# 빌드하는 PC의 assets/에만 두면 idas.spec이 번들에 넣는다.
 assets/online_keys.json

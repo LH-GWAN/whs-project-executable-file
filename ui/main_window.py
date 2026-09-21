@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import geocode
+from core.appinfo import APP_NAME, SETTINGS_APP, SETTINGS_ORG
 from core.case_deletion import case_folder_of, delete_cases
 from core.appconfig import (
     MAP_MODE_OFFLINE,
@@ -45,7 +46,7 @@ from ui.workers import AnalysisWorker, HashWorker
 class MainWindow(QMainWindow):
     def __init__(self, app_data_dir: Optional[str] = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("GPS Tracer")
+        self.setWindowTitle(APP_NAME)
         self.resize(1100, 720)
 
         self._app_data_dir = app_data_dir or default_app_data_dir()
@@ -149,12 +150,12 @@ class MainWindow(QMainWindow):
     def _on_reset_map_settings(self) -> None:
         """지도 사용 방식 선택과 '다시 표시하지 않음' 표시를 지우고 첫 실행 절차를 다시 밟는다.
 
-        이 값들은 %LOCALAPPDATA%/GPSTracer 와 레지스트리(QSettings)에 있어서 clean 스크립트나
+        이 값들은 %LOCALAPPDATA%/IDAS 와 레지스트리(QSettings)에 있어서 clean 스크립트나
         재빌드로는 지워지지 않는다. 사건 이력·증거 폴더는 건드리지 않는다.
         """
         previous = get_map_mode()
         reset_map_mode()
-        settings = QSettings("GPSTracer", "GPSTracer")
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         settings.remove("basemap_notice/suppressed")
         settings.remove("online_keys_notice/suppressed")
         self._online_notified.clear()
@@ -248,7 +249,7 @@ class MainWindow(QMainWindow):
     def _compute_hash_with_progress(self, video_path: str) -> tuple:
         """영상 해시를 진행률 창과 함께 계산한다. (해시, 오류) - 취소하면 ("", ""), 실패하면 ("", 사유)."""
         progress = QProgressDialog("파일 확인 중 (SHA-256)...", "취소", 0, 100, self)
-        progress.setWindowTitle("GPS Tracer")
+        progress.setWindowTitle(APP_NAME)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(300)
         worker = HashWorker(video_path, self)
@@ -343,7 +344,7 @@ class MainWindow(QMainWindow):
         self._pending_memo = info.memo
 
         self._progress = QProgressDialog("분석 준비 중...", "취소", 0, 0, self)
-        self._progress.setWindowTitle("GPS Tracer")
+        self._progress.setWindowTitle(APP_NAME)
         # 모달로 띄워 분석 중에 Home의 삭제 조작이 안 되게 한다. 진행 중인 사건의 레코드가
         # 지워지면 워커가 마지막에 외래키 오류로 죽고 사건 폴더만 고아로 남는다.
         self._progress.setWindowModality(Qt.WindowModal)

@@ -2,10 +2,18 @@
 https://github.com/LH-GWAN/whs-project
 여기에 모아 놨다
 
-# GPS Tracer
+# IDAS
 
 블랙박스 영상(AVI/MP4)에서 GPS·속도·G센서 메타데이터를 추출해 지도와 그래프로
 시각화하고, 사건 리포트(PDF)를 생성하는 데스크톱 포렌식 도구. Windows exe로 배포한다.
+
+> 이름이 **GPS Tracer → IDAS**로 바뀌었다. 창 제목, exe(`IDAS.exe`, `dist\IDAS\`), 바로가기
+> (`IDAS.lnk`), 사용자 데이터 폴더(`%LOCALAPPDATA%\IDAS`), 레지스트리(`HKCU\Software\IDAS`)가
+> 모두 새 이름을 쓴다. 이름은 `core/appinfo.py` 한 곳에서 정한다. 예전 이름의 데이터 폴더
+> (`%LOCALAPPDATA%\GPSTracer`)가 있고 새 폴더가 없으면 첫 실행 때 이름만 바꿔 넘기므로 사건
+> 이력·증거 폴더는 그대로 유지된다. 안내 창의 "다시 표시하지 않음" 표시(레지스트리)는 옮기지
+> 않아 한 번 더 뜬다. 예전 `dist\GPSTracer\`와 `GPSTracer.lnk`는 `clean_windows.bat`이 지우지
+> 않으니 직접 지운다.
 
 분석 엔진은 별도 저장소([LH-GWAN/whs-project](https://github.com/LH-GWAN/whs-project))에서
 개발된 것을 `engine/vendor/`에 그대로 가져와 쓴다. **이 저장소의 코드는 그 엔진을
@@ -46,7 +54,7 @@ exe 빌드는 [`BUILD.md`](BUILD.md), 배경지도 준비는 [`assets/README.md`
 
 검증(엔진 저장소가 없는 곳으로 앱만 복사해 확인):
 - 소스 실행: 실샘플 추출 정상 (600지점 / fix 60 / `tfdt_trun`)
-- exe 실행: **소스 트리를 전부 지운 뒤** `GPSTracer` + `_internal/`만으로
+- exe 실행: **소스 트리를 전부 지운 뒤** `IDAS` + `_internal/`만으로
   MP4 fragmented 600지점, AVI FineVu 1035좌표 추출 + GUI 기동 정상
 
 `../whs-project/`가 필요한 경우는 **엔진을 고칠 때뿐**이다(주의사항 2번 참고).
@@ -107,7 +115,7 @@ ui/                       PySide6 화면
 
 assets/korea.pmtiles      오프라인 배경지도 (371MB, git 제외)
 assets/online_keys.json   카카오 API 키 (git 제외, 빌드 시 번들). 없으면 안내 창의 [키 파일 만들기]
-gpstracer.spec            PyInstaller 빌드 정의
+idas.spec            PyInstaller 빌드 정의
 ```
 
 ---
@@ -201,7 +209,7 @@ Windows는 안에 열린 파일이 있으면 이름 변경부터 실패하므로
 거절한다(진행 중인 사건의 레코드를 지우면 워커가 외래키 오류로 죽는다).
 
 ```
-%LOCALAPPDATA%/GPSTracer/
+%LOCALAPPDATA%/IDAS/
 ├── history.db
 └── cases/<사건번호>_<id>/
     ├── source/           원본 영상 사본 (해시로 무결성 고정)
@@ -311,10 +319,10 @@ Python → JS는 `runJavaScript()` 단방향 주입만 쓴다(지도가 되물�
 ### 지도 사용 방식 — 오프라인 / 온라인(카카오맵)
 
 첫 실행 때 `ui/map_mode_dialog.py`가 오프라인·온라인 중 하나를 고르게 하고, 값은
-`%LOCALAPPDATA%/GPSTracer/settings.json`(`map_mode`)에 남는다. 나중에 화면 우측 상단
+`%LOCALAPPDATA%/IDAS/settings.json`(`map_mode`)에 남는다. 나중에 화면 우측 상단
 **⚙ 설정 > 지도 사용 방식** 메뉴에서 바꿀 수 있다(메뉴바가 아니라 홈 화면 제목 줄의 버튼이다 —
 메뉴바는 눈에 안 띈다는 피드백으로 옮겼다). 이 값과 안내 창의 "다시 표시하지 않음"(레지스트리
-`HKCU\Software\GPSTracer`, QSettings)은 **사용자 데이터 영역**이라 `clean_windows.bat`이나
+`HKCU\Software\IDAS`, QSettings)은 **사용자 데이터 영역**이라 `clean_windows.bat`이나
 재빌드로는 지워지지 않는다 — 그래서 두 번째 실행부터는 묻지 않는다. 처음처럼 다시 묻게
 하려면 **설정 > 지도 설정 초기화** 메뉴를 쓰거나, clean 스크립트 끝의 "Reset app settings"에
 Y를 답한다(사건 이력·증거 폴더는 어느 쪽도 건드리지 않는다). 수사 자료를 다루는 도구라 "외부로 나가는가"는
@@ -404,7 +412,7 @@ Report 버튼 → report.report_builder → PDF
 갈라져 다음 갱신 때 충돌한다. **엔진 버그는 원본 저장소에서 고치고 vendor로
 복사**해서 두 곳이 항상 바이트 동일하게 유지한다(`diff -q`로 확인). 갱신 절차와 확인 항목은 [`engine/vendor/README_VENDOR.md`](engine/vendor/README_VENDOR.md) 참고.
 
-특히 **엔진 갱신 시 `gpstracer.spec`의 `hiddenimports`를 반드시 다시 확인**해야 한다.
+특히 **엔진 갱신 시 `idas.spec`의 `hiddenimports`를 반드시 다시 확인**해야 한다.
 vendor는 데이터 파일로 번들되어 PyInstaller의 정적 분석 대상이 아니라서, 엔진이 새로
 쓰기 시작한 표준 라이브러리가 빠지면 **얼린 뒤에야** `ModuleNotFoundError`로 터진다
 (실제로 `shlex`에서 겪음).
@@ -529,7 +537,7 @@ vendor는 수정하지 않는 원칙이라 `app.py`의 `_ensure_std_streams()`�
   두 번째 키(`9cfb…1967`)에 등록돼 있어 그 키를 쓴다. 대표 키로 바꾸면 지도가 안 뜬다.
   어느 키에 등록됐는지는 콘솔 플랫폼 키 화면에서 "JS SDK 도메인" 배지로 구분된다.
 
-`GPSTracer.exe --diagnose`가 등록할 주소와 키 유무(마스킹)를 출력한다. 페이지가 SDK
+`IDAS.exe --diagnose`가 등록할 주소와 키 유무(마스킹)를 출력한다. 페이지가 SDK
 로드에 실패하면 브라우저는 이유를 숨기므로, 로컬 서버의 `/online-map-diagnose`가 같은
 조건으로 다시 받아 보고 원인을 돌려준다(성공 경로에서는 부르지 않는다 — SDK 로드
 횟수가 한도에 잡힌다).
@@ -537,7 +545,7 @@ vendor는 수정하지 않는 원칙이라 `app.py`의 `_ensure_std_streams()`�
 ### 16. API 키 파일은 git에 넣지 말 것
 
 이 저장소는 공개돼 있다. `assets/online_keys.json`은 `.gitignore`에 있고, 빌드하는
-PC의 `assets/`에 있을 때만 `gpstracer.spec`이 번들에 넣는다. 배포된 exe 안에는 키가
+PC의 `assets/`에 있을 때만 `idas.spec`이 번들에 넣는다. 배포된 exe 안에는 키가
 그대로 들어가므로(데스크톱 앱의 한계) 유출되면 카카오 디벨로퍼스에서 재발급하고,
 재빌드 없이 바꾸려면 `settings.json`에 새 키를 넣으면 된다(주의사항 15의 우선순위).
 

@@ -1,4 +1,4 @@
-# GPS Tracer dependencies
+# IDAS dependencies
 #
 # The analysis engine (engine/vendor/) and backend logic use only the
 # standard library. The packages below are for the GUI and packaging.

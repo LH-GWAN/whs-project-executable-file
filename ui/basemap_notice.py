@@ -6,10 +6,11 @@ from PySide6.QtCore import QSettings, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QCheckBox, QMessageBox
 
+from core.appinfo import SETTINGS_APP, SETTINGS_ORG
 from core.basemap import BASEMAP_DOWNLOAD_URL, assets_dir, basemap_path
 
-_SETTINGS_ORG = "GPSTracer"
-_SETTINGS_APP = "GPSTracer"
+_SETTINGS_ORG = SETTINGS_ORG
+_SETTINGS_APP = SETTINGS_APP
 _SUPPRESS_KEY = "basemap_notice/suppressed"
 
 

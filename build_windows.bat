@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  GPS Tracer - Windows exe build script
+REM  IDAS - Windows exe build script
 REM
 REM  NOTE: This file is intentionally ASCII-only. Korean text in a
 REM  .bat breaks under CP949 consoles and mangled bytes can be parsed
@@ -15,10 +15,10 @@ cd /d "%~dp0"
 
 REM Building while the app is running fails: PyInstaller cannot replace
 REM the files under dist\ that the running exe has open.
-tasklist /FI "IMAGENAME eq GPSTracer.exe" 2>nul | find /I "GPSTracer.exe" >nul
+tasklist /FI "IMAGENAME eq IDAS.exe" 2>nul | find /I "IDAS.exe" >nul
 if not errorlevel 1 (
     echo.
-    echo [ERROR] GPSTracer.exe is running. Close the app first, then run
+    echo [ERROR] IDAS.exe is running. Close the app first, then run
     echo         this script again.
     echo.
     pause
@@ -64,26 +64,26 @@ if errorlevel 1 (
 
 if exist "assets\online_keys.json" (
     echo [INFO] Online map key file found: assets\online_keys.json
-    echo        It will be bundled into dist\GPSTracer\_internal\assets\.
+    echo        It will be bundled into dist\IDAS\_internal\assets\.
 ) else (
     echo [INFO] No assets\online_keys.json - online map stays off until a key
-    echo        file is put in dist\GPSTracer\_internal\assets\ after the build.
+    echo        file is put in dist\IDAS\_internal\assets\ after the build.
 )
 
 echo.
 echo [3/5] Cleaning previous build...
 if exist "build\" rmdir /s /q build
 if exist "dist\"  rmdir /s /q dist
-if exist "GPSTracer.lnk" del /q "GPSTracer.lnk"
+if exist "IDAS.lnk" del /q "IDAS.lnk"
 
 echo.
 echo [4/5] Building exe (this takes a few minutes)...
-pyinstaller gpstracer.spec --noconfirm
+pyinstaller idas.spec --noconfirm
 if errorlevel 1 goto :error
 
-if not exist "dist\GPSTracer\GPSTracer.exe" (
+if not exist "dist\IDAS\IDAS.exe" (
     echo.
-    echo [ERROR] Build finished but GPSTracer.exe was not found.
+    echo [ERROR] Build finished but IDAS.exe was not found.
     echo         Check the PyInstaller output above.
     pause
     exit /b 1
@@ -91,25 +91,25 @@ if not exist "dist\GPSTracer\GPSTracer.exe" (
 
 echo.
 echo [5/5] Creating shortcut in this folder...
-REM The exe cannot be moved out of dist\GPSTracer on its own: a one-dir
+REM The exe cannot be moved out of dist\IDAS on its own: a one-dir
 REM build needs the _internal folder sitting right next to it. So we put
 REM a shortcut here instead - double-click it and the app starts.
-set "APPDIR=%CD%\dist\GPSTracer"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%CD%\GPSTracer.lnk');$s.TargetPath='%APPDIR%\GPSTracer.exe';$s.WorkingDirectory='%APPDIR%';$s.Description='GPS Tracer';$s.Save()"
-if not exist "GPSTracer.lnk" (
+set "APPDIR=%CD%\dist\IDAS"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%CD%\IDAS.lnk');$s.TargetPath='%APPDIR%\IDAS.exe';$s.WorkingDirectory='%APPDIR%';$s.Description='IDAS';$s.Save()"
+if not exist "IDAS.lnk" (
     echo [WARN] Could not create the shortcut.
-    echo        Run the app directly: dist\GPSTracer\GPSTracer.exe
+    echo        Run the app directly: dist\IDAS\IDAS.exe
 )
 
 echo.
 echo ============================================================
 echo  BUILD OK
 echo.
-echo  To run : double-click GPSTracer.lnk in this folder.
+echo  To run : double-click IDAS.lnk in this folder.
 echo.
-echo  Real exe : dist\GPSTracer\GPSTracer.exe
+echo  Real exe : dist\IDAS\IDAS.exe
 echo.
-echo  To ship: copy the WHOLE dist\GPSTracer folder, not just the
+echo  To ship: copy the WHOLE dist\IDAS folder, not just the
 echo           exe. The _internal folder next to the exe holds Qt,
 echo           the analysis engine and the offline basemap.
 echo           The shortcut only works on this machine.

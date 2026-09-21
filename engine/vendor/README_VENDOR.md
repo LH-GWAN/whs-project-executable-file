@@ -15,7 +15,7 @@
 1. 위 3개 파일을 원본 레포에서 다시 복사
 2. `ENGINE_COMMIT.txt`를 새 커밋 해시로 갱신
 3. `ENGINE_README.md` / `ENGINE_ARCHITECT.md`도 같이 갱신(출력 형식 변경 여부 확인용)
-4. `gpstracer.spec`의 `hiddenimports` 재확인 (아래 명령으로 목록 추출 — vendor는
+4. `idas.spec`의 `hiddenimports` 재확인 (아래 명령으로 목록 추출 — vendor는
    데이터 파일로 번들되어 PyInstaller 정적 분석 대상이 아니라, 빠지면 얼린 뒤에만
    ModuleNotFoundError로 터진다):
    ```bash

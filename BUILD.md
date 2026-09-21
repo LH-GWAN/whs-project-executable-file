@@ -1,4 +1,4 @@
-# GPS Tracer 빌드 안내
+# IDAS 빌드 안내
 
 ## Windows exe 만들기
 
@@ -8,9 +8,9 @@
 ### 준비물
 - Windows 10/11 64bit
 - Python 3.11 또는 3.12 (64bit) — 설치 시 **"Add python.exe to PATH"** 체크
-- **GPSTracer가 실행 중이면 먼저 끌 것.** 실행 중에 빌드하면 exe가 잡고 있는 `dist\` 파일을
+- **IDAS가 실행 중이면 먼저 끌 것.** 실행 중에 빌드하면 exe가 잡고 있는 `dist\` 파일을
   PyInstaller가 바꾸지 못해 깨진다. `build_windows.bat`과 `clean_windows.bat`은 실행 중인
-  `GPSTracer.exe`가 있으면 시작하지 않고 안내 후 멈춘다.
+  `IDAS.exe`가 있으면 시작하지 않고 안내 후 멈춘다.
 
 ### 빌드
 프로젝트 폴더에서 `build_windows.bat`을 더블클릭하거나:
@@ -19,29 +19,29 @@
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-pyinstaller gpstracer.spec --noconfirm
+pyinstaller idas.spec --noconfirm
 ```
 
 결과물:
-- **`GPSTracer.lnk`** — 프로젝트 폴더에 바로 생기는 실행 바로가기. **이걸 더블클릭**하면 실행된다.
-- `dist\GPSTracer\GPSTracer.exe` — 실제 실행파일
+- **`IDAS.lnk`** — 프로젝트 폴더에 바로 생기는 실행 바로가기. **이걸 더블클릭**하면 실행된다.
+- `dist\IDAS\IDAS.exe` — 실제 실행파일
 
 ### exe를 폴더 밖으로 옮길 수 없는 이유
 
 one-dir 방식이라 **exe 옆에 `_internal\` 폴더가 반드시 같이 있어야** 한다
 (Qt 라이브러리·분석 엔진·오프라인 지도 약 896MB). exe만 떼면 실행되지 않는다.
-그래서 exe는 `dist\GPSTracer\`에 두고, 폴더 루트에는 바로가기만 만든다.
+그래서 exe는 `dist\IDAS\`에 두고, 폴더 루트에는 바로가기만 만든다.
 
 **바로가기는 이 PC에서만 동작한다** — 절대 경로를 가리키므로 다른 PC로 복사해도
-소용없다. 배포할 때는 `dist\GPSTracer\` 폴더 전체를 옮기고, 받는 쪽에서
-`GPSTracer.exe`를 직접 실행하거나 바탕화면 바로가기를 새로 만들면 된다.
+소용없다. 배포할 때는 `dist\IDAS\` 폴더 전체를 옮기고, 받는 쪽에서
+`IDAS.exe`를 직접 실행하거나 바탕화면 바로가기를 새로 만들면 된다.
 
 ### ⚠ 배포 시 주의
-**exe 파일 하나만 떼어내면 실행되지 않는다.** `dist\GPSTracer\` **폴더 전체**를
+**exe 파일 하나만 떼어내면 실행되지 않는다.** `dist\IDAS\` **폴더 전체**를
 옮겨야 한다. exe 옆 `_internal\` 안에 Qt 라이브러리와 분석 엔진(`engine\vendor\*.py`)이
 들어 있다.
 
-one-file(단일 exe) 대신 one-dir(폴더)로 만든 이유는 `gpstracer.spec` 상단 주석 참고 —
+one-file(단일 exe) 대신 one-dir(폴더)로 만든 이유는 `idas.spec` 상단 주석 참고 —
 요약하면 구동 속도, QtWebEngine 경로 문제, 백신 오탐 세 가지 때문이다.
 
 ---
@@ -49,8 +49,8 @@ one-file(단일 exe) 대신 one-dir(폴더)로 만든 이유는 `gpstracer.spec`
 ### clean 해도 남는 것
 
 `clean_windows.bat`은 `.venv\`, `dist\`, `build\`, 바로가기, `__pycache__\`만 지운다.
-지도 온라인/오프라인 선택(`%LOCALAPPDATA%\GPSTracer\settings.json`)과 안내 창의 "다시
-표시하지 않음"(레지스트리 `HKCU\Software\GPSTracer`)은 사용자 데이터라 남고, 그래서
+지도 온라인/오프라인 선택(`%LOCALAPPDATA%\IDAS\settings.json`)과 안내 창의 "다시
+표시하지 않음"(레지스트리 `HKCU\Software\IDAS`)은 사용자 데이터라 남고, 그래서
 재빌드 후에도 처음처럼 묻지 않는다. 스크립트 끝에서 "Reset app settings"에 Y를 답하거나
 앱의 **설정 > 지도 설정 초기화**를 쓰면 다시 묻는다. 사건 이력(`history.db`)과 증거
 폴더(`cases\`)는 어느 쪽도 지우지 않는다.
@@ -72,7 +72,7 @@ exe 자체는 Windows에서 만들어야 하지만, 빌드 설정(spec)과 패�
 ### 빌드 중 실제로 잡은 문제
 `integration_blackbox.py`가 쓰는 `shlex`가 번들에서 빠져 얼린 뒤에만
 `ModuleNotFoundError`로 터졌다. vendor 스크립트를 **데이터 파일**로 넣기 때문에
-PyInstaller의 정적 분석 대상이 아니어서 생긴 문제다. `gpstracer.spec`의
+PyInstaller의 정적 분석 대상이 아니어서 생긴 문제다. `idas.spec`의
 `hiddenimports`에 vendor가 쓰는 표준 라이브러리를 명시해서 해결했다.
 
 **→ vendor 엔진을 새 버전으로 갱신하면 이 목록을 반드시 다시 확인할 것:**
@@ -97,14 +97,14 @@ PY
 ## 배경지도 넣는 시점 (둘 다 됨)
 
 **방법 A — 빌드 전** (권장): 지도 파일을 `assets\`에 먼저 넣고 빌드하면
-번들에 포함돼서, `dist\GPSTracer\` 폴더만 옮겨도 지도가 따라간다. 배포용.
+번들에 포함돼서, `dist\IDAS\` 폴더만 옮겨도 지도가 따라간다. 배포용.
 
 **방법 B — 빌드 후**: 이미 빌드한 상태라면 재빌드 없이
-`dist\GPSTracer\_internal\assets\` 에 파일을 넣기만 하면 된다.
+`dist\IDAS\_internal\assets\` 에 파일을 넣기만 하면 된다.
 (폴더가 없으면 만들면 된다.) 확인:
 
 ```cmd
-dist\GPSTracer\GPSTracer.exe --diagnose
+dist\IDAS\IDAS.exe --diagnose
 ```
 
 `[OK] 배경지도 ...` 로 나오면 인식된 것이다. 371MB 전국판을 넣겠다고
@@ -134,9 +134,9 @@ dist\GPSTracer\GPSTracer.exe --diagnose
 온라인 모드(카카오맵)를 쓰려면 빌드 전에 `assets/online_keys.json`을 만든다.
 발급 절차(앱 생성 → 카카오맵 사용 설정 → 키 복사 → JS SDK 도메인 등록)는
 [`assets/README.md`](assets/README.md)에 있고, 프로그램 안에서도 온라인을 고르면
-안내 창이 뜬다. 파일이 있으면 `gpstracer.spec`이 자동으로 번들에 넣고, 없으면 온라인을
+안내 창이 뜬다. 파일이 있으면 `idas.spec`이 자동으로 번들에 넣고, 없으면 온라인을
 골라도 오프라인 지도로 표시된다. 빌드 후에 넣으려면 배경지도처럼
-`dist\GPSTracer\_internal\assets\`에 두면 된다 — **재빌드도, 재시작도 필요 없다.**
+`dist\IDAS\_internal\assets\`에 두면 된다 — **재빌드도, 재시작도 필요 없다.**
 프로그램 안내 창의 [다시 확인]을 누르면 바로 인식한다. 넣었는데도 "키 없음"이면 안내 창에
 파일별 사유가 적혀 있고, `assets/README.md`의 "넣었는데 키 없음이 뜰 때"를 참고한다.
 
@@ -146,7 +146,7 @@ dist\GPSTracer\GPSTracer.exe --diagnose
 빌드 후 확인:
 
 ```cmd
-dist\GPSTracer\GPSTracer.exe --diagnose
+dist\IDAS\IDAS.exe --diagnose
 ```
 
 `온라인 지도 (카카오맵)` 항목에 키 유무(앞뒤 4자리만)와 카카오 디벨로퍼스에 등록할
@@ -163,7 +163,7 @@ JavaScript 키가 여러 개면 도메인을 등록한 키를 `online_keys.json`
 `assets/korea.pmtiles`를 넣으면 지도에 실제 도로/건물이 표시되고, 없으면 주행 궤적만
 그려진다(프로그램은 양쪽 다 정상 동작). 만드는 방법은 `assets/README.md` 참고.
 
-파일이 있으면 `gpstracer.spec`이 빌드 시 자동으로 번들에 포함한다.
+파일이 있으면 `idas.spec`이 빌드 시 자동으로 번들에 포함한다.
 
 ---
 
@@ -172,7 +172,7 @@ JavaScript 키가 여러 개면 도메인을 등록한 키를 `online_keys.json`
 개발 PC가 아닌 **깨끗한 Windows PC**(Python 미설치)에서 확인해야 의미가 있다.
 개발 PC에는 필요한 DLL이 이미 깔려 있어 문제가 가려진다.
 
-1. `GPSTracer.exe` 실행 → 창이 뜨는지
+1. `IDAS.exe` 실행 → 창이 뜨는지
    (안 뜨면 Qt 플랫폼 플러그인 누락 — `_internal\PySide6\Qt\plugins\platforms\qwindows.dll` 확인)
 2. 블랙박스 영상 업로드 → 분석 완료까지
 3. Tracker 탭에서 **영상이 재생되는지** (H.264 디코딩 — Windows Media Foundation 사용)
@@ -191,7 +191,7 @@ JavaScript 키가 여러 개면 도메인을 등록한 키를 `online_keys.json`
   그래도 안 되면 아래 플래그로 소프트웨어 렌더링을 강제한다:
   ```cmd
   set QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --enable-unsafe-swiftshader
-  GPSTracer.exe
+  IDAS.exe
   ```
   (개발 환경의 헤드리스 테스트에서 5회 중 1회꼴로 이 현상이 재현됐다 — 실제 GPU가
   있는 PC에서는 훨씬 안정적이지만, 가상머신/원격 접속 환경이면 확인이 필요하다.)

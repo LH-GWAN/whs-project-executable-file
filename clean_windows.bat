@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  GPS Tracer - clean build artifacts
+REM  IDAS - clean build artifacts
 REM
 REM  Removes the virtual environment, build output and shortcut so
 REM  you can rebuild from a clean state. Source files are NOT touched.
@@ -13,10 +13,10 @@ REM ============================================================
 setlocal
 cd /d "%~dp0"
 
-tasklist /FI "IMAGENAME eq GPSTracer.exe" 2>nul | find /I "GPSTracer.exe" >nul
+tasklist /FI "IMAGENAME eq IDAS.exe" 2>nul | find /I "IDAS.exe" >nul
 if not errorlevel 1 (
     echo.
-    echo [ERROR] GPSTracer.exe is running. Close the app first.
+    echo [ERROR] IDAS.exe is running. Close the app first.
     echo.
     pause
     exit /b 1
@@ -26,12 +26,12 @@ echo.
 echo This will delete, in "%CD%":
 echo.
 echo   .venv\          virtual environment
-echo   dist\           build output (including GPSTracer.exe)
+echo   dist\           build output (including IDAS.exe)
 echo   build\          PyInstaller work folder
-echo   GPSTracer.lnk   shortcut
+echo   IDAS.lnk   shortcut
 echo   __pycache__\    python caches
 echo.
-echo Source files, gpstracer.spec and assets\korea.pmtiles are kept.
+echo Source files, idas.spec and assets\korea.pmtiles are kept.
 echo.
 choice /c YN /m "Delete these"
 if errorlevel 2 (
@@ -44,7 +44,7 @@ echo.
 if exist ".venv\"        rmdir /s /q ".venv"
 if exist "dist\"         rmdir /s /q "dist"
 if exist "build\"        rmdir /s /q "build"
-if exist "GPSTracer.lnk" del /q "GPSTracer.lnk"
+if exist "IDAS.lnk" del /q "IDAS.lnk"
 for /d /r %%d in (__pycache__) do @if exist "%%d" rmdir /s /q "%%d"
 
 echo Done.
@@ -52,17 +52,17 @@ echo.
 
 REM The online/offline map choice and the "do not show again" boxes live in the
 REM user's data area, not in this folder, so they survive clean + rebuild:
-REM   %LOCALAPPDATA%\GPSTracer\settings.json   (map mode, key overrides)
-REM   HKCU\Software\GPSTracer                    (notice preferences, QSettings)
+REM   %LOCALAPPDATA%\IDAS\settings.json   (map mode, key overrides)
+REM   HKCU\Software\IDAS                    (notice preferences, QSettings)
 REM Case history and evidence folders (history.db, cases\) are NEVER touched here.
 echo The map online/offline choice and notice preferences are stored in
-echo   %LOCALAPPDATA%\GPSTracer\settings.json  and  HKCU\Software\GPSTracer
+echo   %LOCALAPPDATA%\IDAS\settings.json  and  HKCU\Software\IDAS
 echo They are NOT deleted by this script. Reset them so the app asks again
 echo at the next start? Case history and evidence folders are kept either way.
 choice /c YN /d N /t 15 /m "Reset app settings (auto-no in 15s)"
 if not errorlevel 2 (
-    if exist "%LOCALAPPDATA%\GPSTracer\settings.json" del /q "%LOCALAPPDATA%\GPSTracer\settings.json"
-    reg delete "HKCU\Software\GPSTracer" /f >nul 2>&1
+    if exist "%LOCALAPPDATA%\IDAS\settings.json" del /q "%LOCALAPPDATA%\IDAS\settings.json"
+    reg delete "HKCU\Software\IDAS" /f >nul 2>&1
     echo App settings reset. The app will ask online/offline at the next start.
 ) else (
     echo App settings kept. Use Settings ^> Reset map settings inside the app instead.

@@ -12,6 +12,7 @@ from PySide6.QtCore import QSettings, Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QCheckBox, QMessageBox
 
+from core.appinfo import SETTINGS_APP, SETTINGS_ORG
 from core.appconfig import (
     MAP_MODE_ONLINE,
     MAP_SERVER_PREFERRED_PORTS,
@@ -24,8 +25,8 @@ from core.appconfig import (
     online_keys,
 )
 
-_SETTINGS_ORG = "GPSTracer"
-_SETTINGS_APP = "GPSTracer"
+_SETTINGS_ORG = SETTINGS_ORG
+_SETTINGS_APP = SETTINGS_APP
 _SUPPRESS_KEY = "online_keys_notice/suppressed"
 
 KAKAO_CONSOLE_URL = "https://developers.kakao.com/console/app"

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.appinfo import APP_NAME
 from core.video_pairs import find_rear_sibling
 from storage.history_store import CaseRecord
 
@@ -36,7 +37,7 @@ class HomeView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        title = QLabel("GPS Tracer")
+        title = QLabel(APP_NAME)
         title.setProperty("role", "title")
 
         heading = QLabel("Title")
