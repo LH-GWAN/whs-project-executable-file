@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from core.appinfo import APP_NAME
 from core.video_pairs import PairCheck, find_rear_sibling
+from core.video_tracks import TRACK_MODE_BOTH, TRACK_MODE_FRONT, TRACK_MODE_REAR, has_dual_video_tracks
 from ui.pair_check_worker import PairCheckWorker
 from storage.history_store import CaseRecord
 
@@ -30,7 +31,7 @@ VIDEO_FILTER = "블랙박스 영상 (*.mp4 *.avi);;모든 파일 (*)"
 
 
 class HomeView(QWidget):
-    video_selected = Signal(str, str)   # (전방 영상, 후방 영상 또는 "")
+    video_selected = Signal(str, str, str)   # (전방 영상, 후방 영상 또는 "", 2트랙 보기 방식 또는 "")
     history_item_opened = Signal(int)
     history_edit_requested = Signal(int)
     # 삭제는 확인 창과 실제 삭제를 MainWindow가 맡는다(사건 폴더·DB 경로를 아는 곳).
@@ -125,8 +126,44 @@ class HomeView(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "블랙박스 영상 선택 (전방)", "", VIDEO_FILTER)
         if not path:
             return
-        rear = self._pick_rear(path) if self._dual_cb.isChecked() else ""
-        self.video_selected.emit(path, rear)
+        track_mode = ""
+        if has_dual_video_tracks(path):
+            # 전·후방이 한 파일에 든 영상: 어떻게 볼지 묻는다. 따로 고른 후방 파일은 받지 않는다
+            # (이미 후방이 들어 있다).
+            track_mode = self._ask_dual_track_mode(path) or ""
+            if not track_mode:
+                return  # 아니요(취소)
+            rear = ""
+        else:
+            rear = self._pick_rear(path) if self._dual_cb.isChecked() else ""
+        self.video_selected.emit(path, rear, track_mode)
+
+    def _ask_dual_track_mode(self, path: str) -> Optional[str]:
+        """전·후방 트랙이 한 파일에 든 영상을 어떻게 볼지. both/front/rear, 취소면 None."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("전방/후방 영상이 붙어 있는 영상")
+        box.setText("해당 영상은 전방/후방 영상이 붙어 있는 영상입니다.\n전방/후방 영상을 동시에 보여드릴까요?")
+        box.setInformativeText(
+            f"{os.path.basename(path)}\n\n같이 보기를 고르면 Tracker에서 왼쪽 전방·오른쪽 후방으로 재생하고, "
+            "전방만/후방만을 고르면 그 영상 하나만 보여 줍니다. GPS 분석은 어느 쪽을 골라도 같습니다. "
+            "선택은 사건에 저장돼 다시 열 때도 유지됩니다.")
+        # 셋 다 AcceptRole로 두어야 넣은 순서대로 나란히 놓인다(역할별로 재배치되므로 ActionRole을
+        # 섞으면 취소가 가운데로 온다). 아니요는 RejectRole이라 Esc로도 닫힌다.
+        both = box.addButton("예, 같이 보기", QMessageBox.AcceptRole)
+        front = box.addButton("전방만 보기", QMessageBox.AcceptRole)
+        rear = box.addButton("후방만 보기", QMessageBox.AcceptRole)
+        box.addButton("아니요 (취소)", QMessageBox.RejectRole)
+        box.setDefaultButton(both)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is both:
+            return TRACK_MODE_BOTH
+        if clicked is front:
+            return TRACK_MODE_FRONT
+        if clicked is rear:
+            return TRACK_MODE_REAR
+        return None
 
     def _pick_rear(self, front_path: str) -> str:
         """후방 파일을 고르게 하고 전방과 같은 녹화인지 검사한다. 어긋나면(길이·녹화 시각 차이)

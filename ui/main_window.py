@@ -319,7 +319,7 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is yes_btn
 
-    def _on_video_selected(self, video_path: str, rear_path: str = "") -> None:
+    def _on_video_selected(self, video_path: str, rear_path: str = "", track_mode: str = "") -> None:
         sha256, error = self._compute_hash_with_progress(video_path)
         if error:
             QMessageBox.critical(
@@ -364,6 +364,7 @@ class MainWindow(QMainWindow):
             carve_slack=info.carve_slack,
             sha256=sha256,
             rear_video_path=rear_path or "",
+            track_mode=track_mode or "",
         )
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_ok.connect(self._on_worker_finished)

@@ -225,7 +225,7 @@ class AnalysisView(QWidget):
             self._tracker_tab.set_duration_hint(result.duration_sec)
             if video_path and os.path.isfile(video_path):
                 rear = result.rear_copy_path if result.rear_copy_path and os.path.isfile(result.rear_copy_path) else ""
-                self._tracker_tab.load_video(video_path, rear)
+                self._tracker_tab.load_video(video_path, rear, track_mode=result.track_mode)
             self._tracker_tab.load_track(result.extraction.points, result.flagged_segments)
         else:
             self._tracker_tab.stop()

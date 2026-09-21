@@ -34,6 +34,7 @@ class PipelineResult:
     sha256: str
     accel_threshold_mps2: float
     rear_copy_path: str = ""   # 후방 영상 사본(같이 보기로 올린 경우). 없으면 빈 문자열
+    track_mode: str = ""       # 파일 하나에 전·후방 트랙이 든 영상의 보기 방식(both/front/rear)
 
     @property
     def points(self) -> List[TrackPoint]:
@@ -59,6 +60,7 @@ def run_analysis_pipeline(
     cancel_event=None,
     precomputed_sha256: str = "",
     rear_video_path: str = "",
+    track_mode: str = "",
 ) -> PipelineResult:
     def report(msg: str) -> None:
         if progress_cb:
@@ -144,7 +146,7 @@ def run_analysis_pipeline(
 
     _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
                       routing, extraction, dur, settings, flagged, carve_slack,
-                      rear_copy_path=rear_copy_path)
+                      rear_copy_path=rear_copy_path, track_mode=track_mode)
 
     for run in extraction.engine_runs:
         log_path = os.path.join(
@@ -170,6 +172,8 @@ def run_analysis_pipeline(
     )
     if rear_copy_path:
         history_store.set_rear_video(case_id, os.path.basename(rear_copy_path))
+    if track_mode:
+        history_store.set_track_mode(case_id, track_mode)
 
     report("완료")
     return PipelineResult(
@@ -182,6 +186,7 @@ def run_analysis_pipeline(
         sha256=sha256,
         accel_threshold_mps2=accel_threshold_mps2,
         rear_copy_path=rear_copy_path,
+        track_mode=track_mode,
     )
 
 
@@ -218,6 +223,7 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
         sha256=case.source_video_sha256,
         accel_threshold_mps2=threshold,
         rear_copy_path=rear_copy if rear_copy and os.path.isfile(rear_copy) else "",
+        track_mode=case.track_mode or "",
     )
 
 
@@ -248,7 +254,7 @@ def _avi_was_repaired(output_dir: str) -> bool:
 
 def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
                       routing, extraction: ExtractionResult, dur, settings, flagged,
-                      carve_slack, rear_copy_path: str = "") -> None:
+                      carve_slack, rear_copy_path: str = "", track_mode: str = "") -> None:
     case_json_path = os.path.join(case_folder, "case.json")
     with open(case_json_path, "w", encoding="utf-8") as f:
         json.dump({
@@ -277,4 +283,5 @@ def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_pa
             "flagged_accel_count": acceleration.count_by_kind(flagged)[0],
             "flagged_decel_count": acceleration.count_by_kind(flagged)[1],
             "rear_video_filename": os.path.basename(rear_copy_path) if rear_copy_path else "",
+            "track_mode": track_mode,
         }, f, ensure_ascii=False, indent=2)

@@ -65,6 +65,8 @@ class CaseRecord:
     last_opened_at: Optional[str] = None
     report_pdf_path: Optional[str] = None
     rear_video_filename: str = ""   # 후방 영상 사본 이름(source/ 안). 없으면 빈 문자열
+    # 파일 하나에 전·후방 트랙이 든 영상을 어떻게 볼지(core/video_tracks.TRACK_MODES). 빈 문자열이면 해당 없음
+    track_mode: str = ""
 
 
 class HistoryStore:
@@ -83,6 +85,8 @@ class HistoryStore:
         existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(cases)")}
         if "rear_video_filename" not in existing:
             self._conn.execute("ALTER TABLE cases ADD COLUMN rear_video_filename TEXT")
+        if "track_mode" not in existing:
+            self._conn.execute("ALTER TABLE cases ADD COLUMN track_mode TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -184,6 +188,10 @@ class HistoryStore:
         self._conn.execute("UPDATE cases SET rear_video_filename = ? WHERE id = ?", (filename, case_id))
         self._conn.commit()
 
+    def set_track_mode(self, case_id: int, mode: str) -> None:
+        self._conn.execute("UPDATE cases SET track_mode = ? WHERE id = ?", (mode, case_id))
+        self._conn.commit()
+
     def set_report_path(self, case_id: int, report_pdf_path: str) -> None:
         self._conn.execute(
             "UPDATE cases SET report_pdf_path = ? WHERE id = ?", (report_pdf_path, case_id),
@@ -210,4 +218,5 @@ def _row_to_case(row: sqlite3.Row) -> CaseRecord:
         last_opened_at=row["last_opened_at"],
         report_pdf_path=row["report_pdf_path"],
         rear_video_filename=(row["rear_video_filename"] or "") if "rear_video_filename" in row.keys() else "",
+        track_mode=(row["track_mode"] or "") if "track_mode" in row.keys() else "",
     )

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import geocode, gpstime
+from core.video_tracks import TRACK_MODE_BOTH, TRACK_MODE_FRONT, TRACK_MODE_REAR
 from core.acceleration import FlaggedSegment
 from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
@@ -202,6 +203,7 @@ class TrackerTab(QWidget):
         self._rear_prime_pending = False
         # 후방 재생기가 틀 비디오 트랙(0=기본). 파일 하나에 두 트랙이 든 경우 1.
         self._rear_track_index = 0
+        self._track_mode = TRACK_MODE_BOTH
         # 마지막으로 load_video가 지정한 소스. setSource()는 이전 미디어를 멈추면서 그 미디어의
         # 상태 변화(LoadedMedia 등)를 소스가 바뀌기 전에 동기적으로 내보낸다(실측). 그 낡은
         # 이벤트를 새 파일 것으로 알고 처리하면 첫 장면 띄우기가 건너뛰어지고, 2트랙 파일 다음에
@@ -317,14 +319,21 @@ class TrackerTab(QWidget):
         return self._map
 
     # ---------- 영상 로드 ----------
-    def load_video(self, path: str, rear_path: str = "") -> None:
+    def load_video(self, path: str, rear_path: str = "", track_mode: str = "") -> None:
+        """track_mode는 파일 하나에 전·후방 트랙이 든 영상의 보기 방식(both/front/rear). 빈 문자열이면
+        both와 같다(트랙이 둘이면 같이 보여 준다)."""
         self._prime_pending = True
         self._rear_prime_pending = False
         self._rear_track_index = 0
+        self._track_mode = track_mode or TRACK_MODE_BOTH
         self._set_rear_active(False)
         self._front_url = QUrl.fromLocalFile(path)
         self._rear_url = QUrl.fromLocalFile(rear_path) if rear_path else QUrl()
         self._rear_player.setSource(QUrl())
+        if self._player.source() == self._front_url:
+            # 같은 파일을 다시 열면 setSource가 아무것도 안 해서(LoadedMedia가 다시 안 온다) 첫 장면
+            # 띄우기와 트랙 보기 방식이 적용되지 않는다. 비웠다가 다시 지정해 새로 로드시킨다.
+            self._player.setSource(QUrl())
         self._player.setSource(self._front_url)
         if rear_path:
             self._rear_prime_pending = True
@@ -391,11 +400,20 @@ class TrackerTab(QWidget):
                 except Exception:  # noqa: BLE001
                     tracks = []
                 if len(tracks) >= 2:
-                    self._rear_prime_pending = True
-                    self._rear_track_index = 1
-                    self._rear_url = self._player.source()
-                    self._rear_player.setSource(self._rear_url)
-                    self._set_rear_active(True)
+                    mode = getattr(self, "_track_mode", TRACK_MODE_BOTH)
+                    if mode == TRACK_MODE_REAR:
+                        # 후방만: 전방 재생기 하나로 2번 트랙을 튼다(로드 후라 전환이 먹는다).
+                        if self._player.activeVideoTrack() != 1:
+                            self._player.setActiveVideoTrack(1)
+                        self._front_pane.set_caption("후방", True)
+                    elif mode == TRACK_MODE_FRONT:
+                        self._front_pane.set_caption("전방", True)
+                    else:
+                        self._rear_prime_pending = True
+                        self._rear_track_index = 1
+                        self._rear_url = self._player.source()
+                        self._rear_player.setSource(self._rear_url)
+                        self._set_rear_active(True)
         if not self._prime_pending:
             return
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
