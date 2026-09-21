@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import List, Optional
+import bisect
+import statistics
+from typing import List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QMediaPlayer
@@ -29,6 +31,37 @@ _SYNC_TOLERANCE_MS = 400
 # 전방/후방 중 하나를 눌러 키웠을 때의 폭 비율(누른 쪽 : 다른 쪽)
 ENLARGED_RATIO = (3, 1)
 FRONT, REAR = 0, 1
+
+# GPS 기록 주기를 데이터에서 못 읽을 때(기록이 하나뿐 등) 쓰는 값. 블랙박스 GPS는 거의 1 Hz다.
+DEFAULT_GPS_INTERVAL_SEC = 1.0
+
+
+def _gps_key(p: TrackPoint):
+    return (p.gps_date or "", p.gps_utc_time or "")
+
+
+def gps_record_rows(points: List[TrackPoint]) -> List[Tuple[float, TrackPoint]]:
+    """(시각, 행) - GPS 기록(시각 필드)이 있는 행만, 시각순. G센서 전용 행은 빠진다."""
+    rows = [(p.start_time_sec, p) for p in points
+            if p.start_time_sec is not None and p.has_gps_record]
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def estimate_gps_interval(rows: List[Tuple[float, TrackPoint]]) -> float:
+    """GPS 기록 주기(초). 같은 기록이 여러 행에 반복된 기기(VUGERA는 초당 31행)를 감안해
+    기록 값이 바뀌는 시점 사이의 간격 중앙값을 쓴다."""
+    change_times: List[float] = []
+    prev_key = None
+    for t, p in rows:
+        key = _gps_key(p)
+        if key != prev_key:
+            change_times.append(t)
+            prev_key = key
+    gaps = [b - a for a, b in zip(change_times, change_times[1:]) if b - a > 0]
+    if not gaps:
+        return DEFAULT_GPS_INTERVAL_SEC
+    return min(10.0, max(0.1, statistics.median(gaps)))
 
 
 class _ElideLabel(QLabel):
@@ -167,6 +200,15 @@ class TrackerTab(QWidget):
         self._prime_pending = False
         self._priming = False
         self._rear_prime_pending = False
+        # 후방 재생기가 틀 비디오 트랙(0=기본). 파일 하나에 두 트랙이 든 경우 1.
+        self._rear_track_index = 0
+        # 마지막으로 load_video가 지정한 소스. setSource()는 이전 미디어를 멈추면서 그 미디어의
+        # 상태 변화(LoadedMedia 등)를 소스가 바뀌기 전에 동기적으로 내보낸다(실측). 그 낡은
+        # 이벤트를 새 파일 것으로 알고 처리하면 첫 장면 띄우기가 건너뛰어지고, 2트랙 파일 다음에
+        # 다른 파일을 열면 이전 파일의 트랙 수(2)를 보고 후방 칸을 다시 켰다. 그래서 상태 처리는
+        # 재생기의 현재 소스가 지정한 소스와 같을 때만 한다.
+        self._front_url = QUrl()
+        self._rear_url = QUrl()
         # 파이프라인이 계산한 영상 길이. 재생기가 길이를 0으로 주는 경우(가끔 AVI에서
         # 첫 로드에 못 읽음)의 대비책이자, 두 값이 다르면 파이프라인 값을 믿는다.
         self._duration_hint_ms = 0
@@ -252,6 +294,10 @@ class TrackerTab(QWidget):
         self._video_container = video_container
 
         self._points: List[TrackPoint] = []
+        self._gps_rows: List[Tuple[float, TrackPoint]] = []
+        self._gps_times: List[float] = []
+        self._gps_interval = DEFAULT_GPS_INTERVAL_SEC
+        self._gps_t0: Optional[float] = None
         self._map = MapView()
 
         self._resolver = AddressResolver.instance()
@@ -274,12 +320,15 @@ class TrackerTab(QWidget):
     def load_video(self, path: str, rear_path: str = "") -> None:
         self._prime_pending = True
         self._rear_prime_pending = False
+        self._rear_track_index = 0
         self._set_rear_active(False)
+        self._front_url = QUrl.fromLocalFile(path)
+        self._rear_url = QUrl.fromLocalFile(rear_path) if rear_path else QUrl()
         self._rear_player.setSource(QUrl())
-        self._player.setSource(QUrl.fromLocalFile(path))
+        self._player.setSource(self._front_url)
         if rear_path:
             self._rear_prime_pending = True
-            self._rear_player.setSource(QUrl.fromLocalFile(rear_path))
+            self._rear_player.setSource(self._rear_url)
             self._set_rear_active(True)
 
     def set_duration_hint(self, duration_sec: Optional[float]) -> None:
@@ -323,6 +372,8 @@ class TrackerTab(QWidget):
             self._video_split.setSizes([int(unit * weights[0]), int(unit * weights[1])])
 
     def _on_media_status(self, status) -> None:
+        if self._front_url.isEmpty() or self._player.source() != self._front_url:
+            return  # 이전 미디어의 낡은 상태 이벤트
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
             # 재생기가 길이를 늦게/0으로 주는 경우 대비 - 로드된 시점에 한 번 더 맞춘다.
             duration = self._player.duration()
@@ -330,7 +381,10 @@ class TrackerTab(QWidget):
                 duration = self._duration_hint_ms
             if duration > 0:
                 self._on_duration_changed(duration)
-            # 파일 하나에 전방·후방 트랙이 같이 든 경우: 두 번째 비디오 트랙을 후방으로 띄운다.
+            # 파일 하나에 전방·후방 트랙이 같이 든 경우(랜드로버 순정 블랙박스 등): 두 번째
+            # 비디오 트랙을 후방으로 띄운다. 트랙 전환은 후방 재생기가 파일을 다 읽은 뒤에 한다 -
+            # 로드 전에 setActiveVideoTrack을 부르면 무시돼서 후방 칸도 전방 트랙을 틀었다
+            # (검토 제보 "둘 다 전방 영상"). _on_rear_media_status가 _rear_track_index를 적용한다.
             if not self._rear_active and self._rear_player.source().isEmpty():
                 try:
                     tracks = self._player.videoTracks()
@@ -338,8 +392,9 @@ class TrackerTab(QWidget):
                     tracks = []
                 if len(tracks) >= 2:
                     self._rear_prime_pending = True
-                    self._rear_player.setSource(self._player.source())
-                    self._rear_player.setActiveVideoTrack(1)
+                    self._rear_track_index = 1
+                    self._rear_url = self._player.source()
+                    self._rear_player.setSource(self._rear_url)
                     self._set_rear_active(True)
         if not self._prime_pending:
             return
@@ -350,6 +405,15 @@ class TrackerTab(QWidget):
             QTimer.singleShot(150, self._finish_prime)
 
     def _on_rear_media_status(self, status) -> None:
+        if self._rear_url.isEmpty() or self._rear_player.source() != self._rear_url:
+            return  # 이전 미디어의 낡은 상태 이벤트
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            if self._rear_track_index and self._rear_player.activeVideoTrack() != self._rear_track_index:
+                try:
+                    if len(self._rear_player.videoTracks()) > self._rear_track_index:
+                        self._rear_player.setActiveVideoTrack(self._rear_track_index)
+                except Exception:  # noqa: BLE001
+                    pass
         if not self._rear_prime_pending:
             return
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
@@ -381,22 +445,44 @@ class TrackerTab(QWidget):
         self._last_valid: Optional[TrackPoint] = None
         self._last_clock = ""
         self._clock_label.setText("날짜·시간 -")
+        # GPS 기록 행만 따로 두고 첫 기록 시각과 주기를 잡는다. 정보 줄은 이 주기의 슬롯
+        # 단위로 판정한다(아래 _slot_point 설명).
+        self._gps_rows = gps_record_rows(points)
+        self._gps_times = [t for t, _ in self._gps_rows]
+        self._gps_interval = estimate_gps_interval(self._gps_rows)
+        self._gps_t0 = self._gps_times[0] if self._gps_times else None
         self._update_info(0.0)
 
-    def _point_at(self, seconds: float) -> Optional[TrackPoint]:
-        found = None
-        for p in self._points:
-            if p.start_time_sec is None:
-                continue
-            if p.start_time_sec <= seconds:
-                found = p
-            else:
-                break
-        return found
+    def gps_interval(self) -> float:
+        return getattr(self, "_gps_interval", DEFAULT_GPS_INTERVAL_SEC)
+
+    def _slot_point(self, seconds: float) -> Optional[TrackPoint]:
+        """재생 시각이 속한 GPS 슬롯의 기록 행. 없으면 None(= 그 슬롯은 GPS 미기록).
+
+        기기는 GPS(1 Hz)보다 훨씬 자주 행을 쓴다(INAVI는 0.1초마다 G센서 행). 예전엔 재생
+        시각 이하의 마지막 행을 그대로 봐서, GPS 행 사이의 G센서 행을 만날 때마다 "미기록"이
+        떴다(0.4·1.4·2.4초에만 GPS가 있는 파일에서 문구가 계속 나온다는 제보). 이제 GPS 첫
+        기록 시각 t0을 기준으로 t0, t0+주기, t0+2주기 … 슬롯을 두고, 재생 시각이 속한 슬롯
+        시각에서 주기의 절반 안에 GPS 기록 행이 있으면 그 행을, 없으면 미기록으로 본다.
+        슬롯이 시작되기 전(t0 이전)도 미기록이다.
+        """
+        if self._gps_t0 is None or seconds < self._gps_t0 - 1e-6:
+            return None
+        interval = self._gps_interval
+        k = int((seconds - self._gps_t0) / interval + 1e-6)
+        slot_t = self._gps_t0 + k * interval
+        # slot_t에 가장 가까운 GPS 기록 행 (양쪽 이웃만 보면 된다)
+        i = bisect.bisect_left(self._gps_times, slot_t)
+        best = None
+        for j in (i - 1, i):
+            if 0 <= j < len(self._gps_times):
+                d = abs(self._gps_times[j] - slot_t)
+                if d <= interval / 2 + 1e-6 and (best is None or d < best[0]):
+                    best = (d, self._gps_rows[j][1])
+        return best[1] if best else None
 
     def _update_info(self, seconds: float) -> None:
-        point = self._point_at(seconds)
-        if point is None:
+        if not self._points:
             self._speed_label.setText("속도 -")
             self._coord_label.setText("위치 -")
             self._addr_label.setText("")
@@ -404,13 +490,11 @@ class TrackerTab(QWidget):
             self._addr_key = None
             return
 
-        # 시각은 좌표가 없는 행(status=V)에도 대개 남아 있어 좌표와 별개로 갱신한다.
-        clock = gpstime.format_point(point)
-        if clock:
-            self._last_clock = clock
-        self._clock_label.setText(f"날짜·시간 {self._last_clock}" if self._last_clock else "날짜·시간 -")
+        point = self._slot_point(seconds)
 
-        if point.is_outlier:
+        if point is None:
+            status = "(GPS 미기록)"
+        elif point.is_outlier:
             status = "(이상치)"
         elif point.has_fix:
             status = ""
@@ -422,12 +506,19 @@ class TrackerTab(QWidget):
         self._status_label.setToolTip(
             "이 시점의 GPS 기록이 없거나 이상치라 마지막 정상 측정값을 그대로 표시합니다." if status else "")
 
+        # 시각은 좌표가 없는 행(status=V)에도 대개 남아 있어 좌표와 별개로 갱신한다.
+        clock = gpstime.format_point(point) if point is not None else ""
+        if clock:
+            self._last_clock = clock
+        self._clock_label.setText(f"날짜·시간 {self._last_clock}" if self._last_clock else "날짜·시간 -")
+
         # 정상 측정이면 값을 갱신하고, 아니면 마지막 정상값을 그대로 둔다.
-        shown = point if point.has_fix else getattr(self, "_last_valid", None)
-        if point.has_fix:
+        has_fix = point is not None and point.has_fix
+        shown = point if has_fix else getattr(self, "_last_valid", None)
+        if has_fix:
             self._last_valid = point
         if shown is None:
-            if point.speed_kmh is not None and not point.is_outlier:
+            if point is not None and point.speed_kmh is not None and not point.is_outlier:
                 self._speed_label.setText(f"속도 {point.speed_kmh:.1f} km/h")
             else:
                 self._speed_label.setText("속도 -")
@@ -436,7 +527,7 @@ class TrackerTab(QWidget):
             self._addr_key = None
             return
 
-        speed = shown.speed_kmh if shown.speed_kmh is not None else point.speed_kmh
+        speed = shown.speed_kmh if shown.speed_kmh is not None else (point.speed_kmh if point else None)
         self._speed_label.setText(f"속도 {speed:.1f} km/h" if speed is not None else "속도 -")
         self._coord_label.setText(f"위치 {shown.latitude:.6f}, {shown.longitude:.6f}")
         self._show_address(shown.latitude, shown.longitude)
@@ -508,6 +599,8 @@ class TrackerTab(QWidget):
         self._update_info(position / 1000.0)
 
     def _on_duration_changed(self, duration: int) -> None:
+        if not self._front_url.isEmpty() and self._player.source() != self._front_url:
+            return  # 이전 미디어의 길이
         if duration <= 0 and self._duration_hint_ms > 0:
             duration = self._duration_hint_ms
         self._seek_slider.setRange(0, max(0, duration))
@@ -542,6 +635,9 @@ class TrackerTab(QWidget):
         """영상 파일 잠금을 푼다. 사건 폴더를 지우기 전에 부른다 - Windows는 재생기가
         열어 둔 파일이 있으면 폴더 삭제가 실패한다."""
         self.stop()
+        self._rear_track_index = 0
+        self._front_url = QUrl()
+        self._rear_url = QUrl()
         self._player.setSource(QUrl())
         self._rear_player.setSource(QUrl())
         self._set_rear_active(False)

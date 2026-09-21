@@ -14,13 +14,14 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from core.appinfo import APP_NAME
-from core.video_pairs import find_rear_sibling
+from core.video_pairs import compare_pair, find_rear_sibling
 from storage.history_store import CaseRecord
 
 VIDEO_FILTER = "블랙박스 영상 (*.mp4 *.avi);;모든 파일 (*)"
@@ -122,15 +123,49 @@ class HomeView(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "블랙박스 영상 선택 (전방)", "", VIDEO_FILTER)
         if not path:
             return
-        rear = ""
-        if self._dual_cb.isChecked():
-            suggested = find_rear_sibling(path) or ""
+        rear = self._pick_rear(path) if self._dual_cb.isChecked() else ""
+        self.video_selected.emit(path, rear)
+
+    def _pick_rear(self, front_path: str) -> str:
+        """후방 파일을 고르게 하고 전방과 같은 녹화인지 검사한다. 어긋나면(길이·녹화 시각 차이)
+        받지 않고 다시 고르거나 전방만 분석하게 한다 - 전혀 다른 영상을 나란히 틀면 뒤죽박죽이
+        되는데 막을 방법이 없다는 검토 의견. 취소하면 전방만 분석."""
+        suggested = find_rear_sibling(front_path) or ""
+        while True:
             rear, _ = QFileDialog.getOpenFileName(
                 self, "후방 영상 선택 (취소하면 전방만 분석)",
-                suggested or os.path.dirname(path), VIDEO_FILTER)
-            if rear and os.path.abspath(rear) == os.path.abspath(path):
-                rear = ""  # 같은 파일을 두 번 고른 경우
-        self.video_selected.emit(path, rear)
+                suggested or os.path.dirname(front_path), VIDEO_FILTER)
+            if not rear:
+                return ""
+            if os.path.abspath(rear) == os.path.abspath(front_path):
+                problems = ["전방으로 고른 파일과 같은 파일입니다."]
+                notes: List[str] = []
+            else:
+                check = compare_pair(front_path, rear)
+                problems, notes = check.problems, check.notes
+            if not problems:
+                return rear
+            if not self._ask_repick_rear(front_path, rear, problems, notes):
+                return ""
+            suggested = rear
+
+    def _ask_repick_rear(self, front_path: str, rear_path: str,
+                         problems: List[str], notes: List[str]) -> bool:
+        """어긋난 후방 파일을 알리고 [다시 고르기]면 True, [전방만 분석]이면 False."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("후방 영상이 전방과 맞지 않습니다")
+        box.setText("고른 후방 영상은 전방 영상과 같은 녹화로 볼 수 없어 후방으로 받지 않습니다.")
+        detail = [f"전방: {os.path.basename(front_path)}", f"후방: {os.path.basename(rear_path)}", ""]
+        detail += [f"• {p}" for p in problems]
+        if notes:
+            detail += [""] + [f"참고: {n}" for n in notes]
+        box.setInformativeText("\n".join(detail))
+        repick = box.addButton("다시 고르기", QMessageBox.AcceptRole)
+        box.addButton("전방만 분석", QMessageBox.RejectRole)
+        box.setDefaultButton(repick)
+        box.exec()
+        return box.clickedButton() is repick
 
     def dual_view_enabled(self) -> bool:
         return self._dual_cb.isChecked()
