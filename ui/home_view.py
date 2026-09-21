@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import List
+from typing import List, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
@@ -15,13 +15,15 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from core.appinfo import APP_NAME
-from core.video_pairs import compare_pair, find_rear_sibling
+from core.video_pairs import PairCheck, find_rear_sibling
+from ui.pair_check_worker import PairCheckWorker
 from storage.history_store import CaseRecord
 
 VIDEO_FILTER = "블랙박스 영상 (*.mp4 *.avi);;모든 파일 (*)"
@@ -137,17 +139,57 @@ class HomeView(QWidget):
                 suggested or os.path.dirname(front_path), VIDEO_FILTER)
             if not rear:
                 return ""
-            if os.path.abspath(rear) == os.path.abspath(front_path):
-                problems = ["전방으로 고른 파일과 같은 파일입니다."]
-                notes: List[str] = []
-            else:
-                check = compare_pair(front_path, rear)
-                problems, notes = check.problems, check.notes
-            if not problems:
+            check = self._run_pair_check(front_path, rear)
+            if check is None or check.cancelled:
+                return ""  # 대조를 취소하면 전방만 분석
+            if check.ok:
                 return rear
-            if not self._ask_repick_rear(front_path, rear, problems, notes):
+            if not self._ask_repick_rear(front_path, rear, check.problems, check.notes):
                 return ""
             suggested = rear
+
+    def _run_pair_check(self, front_path: str, rear_path: str) -> Optional[PairCheck]:
+        """전방/후방 대조를 워커에서 돌리고 진행 창을 띄운다. 사용자가 취소하면 None."""
+        if os.path.abspath(front_path) == os.path.abspath(rear_path):
+            check = PairCheck(front_path=front_path, rear_path=rear_path)
+            check.problems.append("전방으로 고른 파일과 같은 파일입니다.")
+            return check
+        dialog = QProgressDialog("전방/후방 영상을 대조하는 중...", "취소", 0, 0, self)
+        dialog.setWindowTitle("전방/후방 영상 대조")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        worker = PairCheckWorker(front_path, rear_path, self)
+        result: List[Optional[PairCheck]] = [None]
+        user_cancelled = [False]
+
+        def on_done(check: PairCheck) -> None:
+            result[0] = check
+            dialog.close()
+
+        def on_failed(message: str) -> None:
+            check = PairCheck(front_path=front_path, rear_path=rear_path)
+            check.problems.append(f"대조 중 오류가 나 후방을 받지 않습니다: {message}")
+            result[0] = check
+            dialog.close()
+
+        def on_cancel() -> None:
+            # QProgressDialog는 close()에도 canceled를 내므로 결과가 없을 때만 사용자 취소로 본다.
+            if result[0] is None:
+                user_cancelled[0] = True
+                worker.cancel()
+
+        worker.status.connect(dialog.setLabelText)
+        worker.finished_check.connect(on_done)
+        worker.failed.connect(on_failed)
+        dialog.canceled.connect(on_cancel)
+        worker.start()
+        dialog.exec()
+        worker.wait(30000)
+        if user_cancelled[0] or result[0] is None:
+            return None
+        return result[0]
 
     def _ask_repick_rear(self, front_path: str, rear_path: str,
                          problems: List[str], notes: List[str]) -> bool:
