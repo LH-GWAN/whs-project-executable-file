@@ -87,3 +87,22 @@ def count_video_tracks(path: str) -> int:
 
 def has_dual_video_tracks(path: str) -> bool:
     return count_video_tracks(path) >= 2
+
+
+def view_tag(track_mode: str, has_separate_rear: bool = False) -> str:
+    """History·파일 정보 줄에 붙는 보기 표기. F=전방, B=후방.
+    2트랙 파일: both → "F, B", front → "F", rear → "B". 후방을 별도 파일로 붙인 사건도 "F, B".
+    보통 전방 파일 하나면 빈 문자열(표기 없음)."""
+    if track_mode == TRACK_MODE_BOTH:
+        return "F, B"
+    if track_mode == TRACK_MODE_FRONT:
+        return "F"
+    if track_mode == TRACK_MODE_REAR:
+        return "B"
+    return "F, B" if has_separate_rear else ""
+
+
+def same_view(mode_a: str, mode_b: str) -> bool:
+    """같은 파일이라도 보기 방식이 다르면(전방만 vs 후방만) 다른 분석으로 본다 - '이미 분석한
+    파일' 경고는 보기 방식까지 같을 때만 낸다."""
+    return (mode_a or "") == (mode_b or "")

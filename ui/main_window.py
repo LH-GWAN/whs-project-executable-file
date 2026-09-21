@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from core import geocode
 from core.appinfo import APP_NAME, SETTINGS_APP, SETTINGS_ORG
 from core.case_deletion import case_folder_of, delete_cases
+from core.video_tracks import same_view, view_tag
 from core.appconfig import (
     MAP_MODE_OFFLINE,
     MAP_SERVER_PREFERRED_PORTS,
@@ -301,7 +302,10 @@ class MainWindow(QMainWindow):
     def _confirm_reanalysis(self, previous: list) -> bool:
         """같은 파일을 이미 분석한 적이 있을 때. 예: 새 사건으로 다시 분석, 아니요: 홈으로."""
         shown = previous[:5]
-        lines = [f"  · {c.case_number} ({c.created_at})" for c in shown]
+        lines = []
+        for c in shown:
+            tag = view_tag(c.track_mode, bool(c.rear_video_filename))
+            lines.append(f"  · {c.case_number} ({c.created_at})" + (f" - {tag}" if tag else ""))
         if len(previous) > len(shown):
             lines.append(f"  · … 외 {len(previous) - len(shown)}건")
         box = QMessageBox(self)
@@ -331,6 +335,8 @@ class MainWindow(QMainWindow):
             return  # 취소
         with HistoryStore(self._history_db_path) as store:
             previous = store.find_cases_by_sha256(sha256)
+        # 같은 파일이라도 보기 방식(전방만/후방만/같이)이 다르면 다른 분석이다 - 경고하지 않는다.
+        previous = [c for c in previous if same_view(c.track_mode, track_mode)]
         if previous and not self._confirm_reanalysis(previous):
             return
 

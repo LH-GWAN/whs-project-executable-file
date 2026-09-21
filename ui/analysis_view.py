@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.appinfo import APP_NAME
+from core.video_tracks import view_tag
 from core.pipeline import PipelineResult
 from ui.location_tab import LocationTab
 from ui.speed_tab import SpeedTab
@@ -210,8 +211,10 @@ class AnalysisView(QWidget):
 
         container = (result.extraction.routing.container or "").upper()
         self._file_badge.setText(container or "-")
-        self._file_name_label.setText(filename)
-        self._file_name_label.setToolTip(video_path or "")
+        tag = view_tag(result.track_mode, bool(result.rear_copy_path))
+        self._file_name_label.setText(f"{filename} - {tag}" if tag else filename)
+        self._file_name_label.setToolTip(
+            (video_path or "") + ({"F": "\n전방만 보기", "B": "\n후방만 보기", "F, B": "\n전방·후방 같이 보기"}.get(tag, "")))
         self._file_size_label.setText(_format_size(size_bytes))
         self._duration_label.setText(_format_duration(result.duration_sec))
         self._hash_label.set_hash(result.sha256)

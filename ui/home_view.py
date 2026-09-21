@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from core.appinfo import APP_NAME
 from core.video_pairs import PairCheck, find_rear_sibling
-from core.video_tracks import TRACK_MODE_BOTH, TRACK_MODE_FRONT, TRACK_MODE_REAR, has_dual_video_tracks
+from core.video_tracks import TRACK_MODE_BOTH, TRACK_MODE_FRONT, TRACK_MODE_REAR, has_dual_video_tracks, view_tag
 from ui.pair_check_worker import PairCheckWorker
 from storage.history_store import CaseRecord
 
@@ -310,6 +310,9 @@ class HomeView(QWidget):
         self._history_list.clear()
         for case in cases:
             label = f"{case.case_number} - {case.source_video_filename} ({case.created_at})"
+            tag = view_tag(case.track_mode, bool(case.rear_video_filename))
+            if tag:
+                label += f" - {tag}"
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, case.id)
             self._history_list.addItem(item)
