@@ -1,0 +1,191 @@
+{
+  "baseline_commit": "ba699200282eb7fbbd2180fb1abbeaee4555f6a9",
+  "fixed_product_commit": "76df33b8d96a281641101aaf0a15f1ad64f3caa2",
+  "input_description": "User-provided 60.06-second MP4; coordinates and private paths omitted",
+  "before": {
+    "extraction": {
+      "status": "ok",
+      "rows": 600,
+      "fixes": 60,
+      "duration": 60.06,
+      "engine_exit_codes": [
+        0
+      ]
+    },
+    "loaded": true,
+    "real_video_seeks": [
+      {
+        "target_ms": 40700,
+        "position_ms": 40700,
+        "frame_count": 1,
+        "last_frame_ms": 40673.967,
+        "coords_correct": true,
+        "speed_correct": true
+      },
+      {
+        "target_ms": 1500,
+        "position_ms": 1500,
+        "frame_count": 1,
+        "last_frame_ms": 1468.133,
+        "coords_correct": true,
+        "speed_correct": true
+      },
+      {
+        "target_ms": 0,
+        "position_ms": 0,
+        "frame_count": 1,
+        "last_frame_ms": 0.0,
+        "coords_correct": false,
+        "speed_correct": false
+      },
+      {
+        "target_ms": 390,
+        "position_ms": 390,
+        "frame_count": 1,
+        "last_frame_ms": 367.033,
+        "coords_correct": false,
+        "speed_correct": false
+      },
+      {
+        "target_ms": 10000,
+        "position_ms": 10000,
+        "frame_count": 1,
+        "last_frame_ms": 9976.633,
+        "coords_correct": true,
+        "speed_correct": true
+      }
+    ],
+    "right_key": {
+      "slider_ms": 2001,
+      "player_ms": 2000
+    },
+    "reopen": [
+      {
+        "ready": true,
+        "playing": true,
+        "position_ms": 533
+      },
+      {
+        "ready": true,
+        "playing": true,
+        "position_ms": 533
+      },
+      {
+        "ready": true,
+        "playing": true,
+        "position_ms": 533
+      }
+    ],
+    "audio_connected": false,
+    "controlled_gap": {
+      "coords_correct": true,
+      "speed_correct": true
+    },
+    "stats": {
+      "average": "평균 속도: 514.5 km/h",
+      "maximum": "최고 속도: 999.0 km/h"
+    },
+    "numbered_rear_found": false,
+    "report_gap_rows": 189
+  },
+  "after": {
+    "extraction": {
+      "status": "ok",
+      "rows": 600,
+      "fixes": 60,
+      "duration": 60.06,
+      "engine_exit_codes": [
+        0
+      ]
+    },
+    "loaded": true,
+    "real_video_seeks": [
+      {
+        "target_ms": 40700,
+        "position_ms": 40700,
+        "frame_count": 1,
+        "last_frame_ms": 40673.967,
+        "coords_correct": true,
+        "speed_correct": true
+      },
+      {
+        "target_ms": 1500,
+        "position_ms": 1500,
+        "frame_count": 1,
+        "last_frame_ms": 1468.133,
+        "coords_correct": true,
+        "speed_correct": true
+      },
+      {
+        "target_ms": 0,
+        "position_ms": 0,
+        "frame_count": 1,
+        "last_frame_ms": 0.0,
+        "coords_correct": true,
+        "speed_correct": true
+      },
+      {
+        "target_ms": 390,
+        "position_ms": 390,
+        "frame_count": 1,
+        "last_frame_ms": 367.033,
+        "coords_correct": true,
+        "speed_correct": true
+      },
+      {
+        "target_ms": 10000,
+        "position_ms": 10000,
+        "frame_count": 1,
+        "last_frame_ms": 9976.633,
+        "coords_correct": true,
+        "speed_correct": true
+      }
+    ],
+    "right_key": {
+      "slider_ms": 3000,
+      "player_ms": 3000
+    },
+    "reopen": [
+      {
+        "ready": true,
+        "playing": true,
+        "position_ms": 533
+      },
+      {
+        "ready": true,
+        "playing": true,
+        "position_ms": 533
+      },
+      {
+        "ready": true,
+        "playing": true,
+        "position_ms": 533
+      }
+    ],
+    "audio_connected": true,
+    "controlled_gap": {
+      "coords_correct": true,
+      "speed_correct": true
+    },
+    "stats": {
+      "average": "평균 속도: 30.0 km/h",
+      "maximum": "최고 속도: 30.0 km/h"
+    },
+    "numbered_rear_found": true,
+    "report_gap_rows": 0
+  },
+  "priming_before": {
+    "seek_prime_ready": true,
+    "seek_final_ms": 0,
+    "play_prime_ready": true,
+    "playing": false,
+    "play_position_ms": 0
+  },
+  "priming_after": {
+    "seek_prime_ready": true,
+    "seek_final_ms": 3500,
+    "play_prime_ready": true,
+    "playing": true,
+    "play_position_ms": 333
+  }
+}
