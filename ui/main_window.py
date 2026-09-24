@@ -244,6 +244,7 @@ class MainWindow(QMainWindow):
             self._home.set_history(store.list_cases())
 
     def _show_home(self) -> None:
+        self._analysis_view._tracker_tab.stop()
         self._refresh_history()
         self._stack.setCurrentWidget(self._home)
 
