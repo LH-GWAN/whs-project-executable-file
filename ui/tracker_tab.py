@@ -37,24 +37,36 @@ FRONT, REAR = 0, 1
 
 # GPS 기록 주기를 데이터에서 못 읽을 때(기록이 하나뿐 등) 쓰는 값. 블랙박스 GPS는 거의 1 Hz다.
 DEFAULT_GPS_INTERVAL_SEC = 1.0
+# GPS 기록 하나는 다음 기록이 올 때까지, 즉 한 주기 동안 유효하다. 기기의 기록 시각 흔들림
+# (±0.1초 안팎)으로 다음 기록이 조금 늦어도 "미기록"이 깜빡이지 않게 이만큼 더 봐준다.
+GPS_JITTER_TOLERANCE_SEC = 0.15
+
+
+def _is_gps_row(p: TrackPoint) -> bool:
+    """GPS 기록으로 볼 행. NMEA 기기는 시각 필드(gps_utc_time)가 있고, FineVu처럼 자체 형식으로
+    좌표·속도만 쓰는 기기는 시각 필드가 없다 - 좌표가 있으면 GPS 기록이다(검토 제보: FineVu
+    샘플이 표에는 나오는데 영상 밑에는 "미기록"만 떴다)."""
+    return p.has_gps_record or p.has_coords
 
 
 def _gps_key(p: TrackPoint):
-    return (p.gps_date or "", p.gps_utc_time or "")
+    utc = (p.gps_utc_time or "").strip()
+    if utc:
+        return ("utc", p.gps_date or "", utc)
+    return ("val", p.latitude, p.longitude, p.speed_kmh)
 
 
 def gps_record_rows(points: List[TrackPoint]) -> List[Tuple[float, TrackPoint]]:
-    """(시각, 행) - GPS 기록(시각 필드)이 있는 행만, 시각순. G센서 전용 행은 빠진다."""
+    """(시각, 행) - GPS 기록 행만(_is_gps_row), 시각순. G센서 전용 행은 빠진다."""
     rows = [(p.start_time_sec, p) for p in points
-            if p.start_time_sec is not None and math.isfinite(p.start_time_sec)
-            and p.start_time_sec >= 0 and (p.has_gps_record or p.has_coords)]
+            if p.start_time_sec is not None and _is_gps_row(p)]
     rows.sort(key=lambda r: r[0])
     return rows
 
 
 def estimate_gps_interval(rows: List[Tuple[float, TrackPoint]]) -> float:
-    """GPS 기록 주기(초). 같은 기록이 여러 행에 반복된 기기(VUGERA는 초당 31행)를 감안해
-    기록 값이 바뀌는 시점 사이의 간격 중앙값을 쓴다."""
+    """GPS 기록 주기(초). 같은 기록이 여러 행에 반복된 기기(VUGERA는 초당 31행, FineVu는 17행)를
+    감안해 기록 값(시각, 없으면 좌표·속도)이 바뀌는 시점 사이의 간격 중앙값을 쓴다."""
     change_times: List[float] = []
     prev_key = None
     for t, p in rows:
@@ -65,7 +77,18 @@ def estimate_gps_interval(rows: List[Tuple[float, TrackPoint]]) -> float:
     gaps = [b - a for a, b in zip(change_times, change_times[1:]) if b - a > 0]
     if not gaps:
         return DEFAULT_GPS_INTERVAL_SEC
-    return min(10.0, max(0.1, statistics.median(gaps)))
+    # 중앙값으로 대표 간격을 잡되(끊김의 긴 간격에 안 흔들리게), 그 근처 간격들의 평균으로 다듬는다.
+    # 행 간격이 0.058초인 기기(FineVu)는 값이 바뀌는 시점이 행 간격 단위로만 잡혀 간격이 0.986과
+    # 1.044로 번갈아 나오는데, 중앙값 0.986을 그대로 쓰면 60초 뒤 슬롯이 0.8초 밀린다.
+    median = statistics.median(gaps)
+    near = [g for g in gaps if abs(g - median) <= 0.3 * median]
+    interval = statistics.mean(near) if near else median
+    # 기기 주기는 0.1초 단위의 깔끔한 값(1초, 0.5초, 0.2초…)이다. 3% 안이면 거기에 맞춘다 -
+    # 1.0003 같은 값으로 슬롯을 세면 정수 초마다 경계 직전이 되어 앞 초의 값이 잠깐 보인다.
+    snapped = round(interval * 10) / 10.0
+    if snapped >= 0.1 and abs(interval - snapped) <= 0.03 * snapped:
+        interval = snapped
+    return min(10.0, max(0.1, interval))
 
 
 class _ElideLabel(QLabel):
@@ -332,7 +355,6 @@ class TrackerTab(QWidget):
         self._gps_rows: List[Tuple[float, TrackPoint]] = []
         self._gps_times: List[float] = []
         self._gps_interval = DEFAULT_GPS_INTERVAL_SEC
-        self._gps_t0: Optional[float] = None
         self._map = MapView()
 
         self._resolver = AddressResolver.instance()
@@ -513,20 +535,33 @@ class TrackerTab(QWidget):
         self._gps_rows = gps_record_rows(points)
         self._gps_times = [t for t, _ in self._gps_rows]
         self._gps_interval = estimate_gps_interval(self._gps_rows)
-        self._gps_t0 = self._gps_times[0] if self._gps_times else None
-        self._fix_rows = [(t, p) for t, p in self._gps_rows if p.has_fix]
-        self._fix_times = [t for t, _ in self._fix_rows]
         self._update_info(0.0)
 
     def gps_interval(self) -> float:
         return getattr(self, "_gps_interval", DEFAULT_GPS_INTERVAL_SEC)
 
     def _slot_point(self, seconds: float) -> Optional[TrackPoint]:
-        """현재 시각 이하의 마지막 GPS 기록. 미래 행은 절대 선택하지 않는다."""
-        i = bisect.bisect_right(self._gps_times, seconds) - 1
-        if i < 0 or seconds - self._gps_times[i] >= self._gps_interval * 1.5:
+        """재생 시각에 해당하는 GPS 기록 행. 없으면 None(= 그 순간은 GPS 미기록).
+
+        기기는 GPS(1 Hz)보다 훨씬 자주 행을 쓴다(INAVI는 0.1초마다 G센서 행). 예전엔 재생
+        시각 이하의 마지막 행을 그대로 봐서, GPS 행 사이의 G센서 행을 만날 때마다 "미기록"이
+        떴다(0.4·1.4·2.4초에만 GPS가 있는 파일에서 문구가 계속 나온다는 제보). 이제 재생 시각
+        이하의 **마지막 GPS 기록 행**을 보여 주고, 그 행이 GPS 주기(+흔들림 여유 0.15초)보다
+        오래됐으면(그 주기의 기록이 빠졌으면) 미기록으로 본다. 첫 GPS 기록 전도 미기록이다.
+
+        슬롯(t0+k·주기)에 가장 가까운 행을 고르는 방식은 버렸다 - FineVu는 좌표와 속도가 초 안의
+        다른 시점에 갱신돼 슬롯 하나에 값 변화가 두 번 들어가고, 화면 오버레이(기기가 프레임에
+        찍는 속도)와 어긋났다. 재생 시각의 최신 행은 오버레이와 같다(X3000·X700 실측).
+        """
+        if not self._gps_rows:
             return None
-        return self._gps_rows[i][1]
+        i = bisect.bisect_right(self._gps_times, seconds + 1e-6) - 1
+        if i < 0:
+            return None
+        t, point = self._gps_rows[i]
+        if seconds - t > self._gps_interval + GPS_JITTER_TOLERANCE_SEC:
+            return None
+        return point
 
     def _update_info(self, seconds: float) -> None:
         if not self._points:
