@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import html
 import os
+from datetime import datetime, timezone
+from core.acceleration import _distinct_fix_indices
 from typing import List, Optional
 
 from PySide6.QtCore import QMarginsF, QObject, QUrl
@@ -31,31 +33,23 @@ def _esc(value) -> str:
 
 def _select_row_indices(records: List[TrackPoint], segments: List[FlaggedSegment],
                           max_rows: int = MAX_TABLE_ROWS) -> List[int]:
-    flagged_indices = set()
-    for seg in segments:
-        flagged_indices.update(range(seg.start_index, seg.end_index + 1))
-
+    if max_rows <= 0 or not records:
+        return []
     if len(records) <= max_rows:
         return list(range(len(records)))
-
-    flagged = sorted(flagged_indices)
+    def sample(values, count):
+        if count <= 0:
+            return []
+        if count == 1:
+            return values[:1]
+        return [values[round(i * (len(values) - 1) / (count - 1))] for i in range(count)]
+    flagged = sorted({i for seg in segments for i in range(max(0, seg.start_index),
+                       min(len(records), seg.end_index + 1))})
     if len(flagged) >= max_rows:
-        step = len(flagged) / max_rows
-        return [flagged[int(i * step)] for i in range(max_rows)]
-
-    remaining = max_rows - len(flagged)
-    stride = max(1, len(records) // remaining)
-    sampled = set(range(0, len(records), stride))
-    combined = sorted(flagged_indices | sampled)
-    if len(combined) <= max_rows:
-        return combined
-
-    keep = set(flagged_indices)
-    for index in combined:
-        if len(keep) >= max_rows:
-            break
-        keep.add(index)
-    return sorted(keep)
+        return sample(flagged, max_rows)
+    flagged_set = set(flagged)
+    others = [i for i in range(len(records)) if i not in flagged_set]
+    return sorted(flagged + sample(others, max_rows - len(flagged)))
 
 
 def _image_section(title: str, png_bytes: Optional[bytes], caption: str) -> str:
@@ -83,10 +77,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     accel_count, decel_count = count_by_kind(segments)
 
     rows_html = []
-    prev_index: Optional[int] = None
     for idx in row_indices:
-        if prev_index is not None and idx != prev_index + 1:
-            rows_html.append('<tr class="gap"><td colspan="6">...</td></tr>')
         rec = records[idx]
         row_class = ""
         if idx in flagged_indices:
@@ -100,6 +91,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
         if rec.is_outlier:
             lat_text = lon_text = "(이상치)"
             speed_text = "(이상치)"
+        elif rec.gps_checksum_ok is False or rec.gps_trusted is False:
+            lat_text = lon_text = speed_text = "(검증 실패)"
         elif rec.has_fix:
             lat_text, lon_text = f"{rec.latitude:.6f}", f"{rec.longitude:.6f}"
         elif rec.is_dropout:
@@ -116,7 +109,6 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
             f"<td>{_esc(g_text)}</td>"
             "</tr>"
         )
-        prev_index = idx
 
     body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="6">추출된 좌표가 없습니다.</td></tr>'
     extraction = pipeline_result.extraction
@@ -136,6 +128,13 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
                           "회색 점선은 GPS 수신이 끊긴 구간입니다. 분석 완료 시점의 전체 경로입니다.")
     )
     outlier_count = extraction.outlier_count
+    warning_html = "".join(f"<li>{_esc(w)}</li>" for w in extraction.warnings)
+    failed_checks = sum(p.gps_checksum_ok is False or p.gps_trusted is False for p in records)
+    ok_checks = sum(p.gps_checksum_ok is True and p.gps_trusted is not False for p in records)
+    unknown_checks = len(records) - failed_checks - ok_checks
+    speeds = [records[i].speed_kmh for i in _distinct_fix_indices(records)]
+    speed_summary = f"평균 {sum(speeds)/len(speeds):.1f} / 최고 {max(speeds):.1f} km/h" if speeds else "-"
+    generated = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -177,8 +176,17 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>급가·감속 의심 구간</b>{_esc(len(segments))}개 (급가속 {accel_count} · 급감속 {decel_count})</div>
   <div class="kv"><b>이상치 제외</b>{_esc(outlier_count)}개 지점 (좌표 급변·비정상 속도, 원본 CSV에는 보존)</div>
 
+  <div class="kv"><b>분석 상태</b>{_esc(extraction.status)} — {_esc(extraction.status_detail)}</div>
+  <div class="kv"><b>AVI 복구</b>{'적용' if extraction.avi_repaired else '없음'}</div>
+  <div class="kv"><b>GPS 검증(행)</b>정상 {ok_checks} / 실패 {failed_checks} / 미제공 {unknown_checks}</div>
+  <p>검증 실패·이상치·비유한 수치는 지도·속도 계산에서 제외합니다. 미제공은 검증 성공을 뜻하지 않습니다.</p>
+  <div class="kv"><b>속도 통계</b>{speed_summary} (유효 GPS 측정 산술평균, 반복 기록 제외)</div>
+  <div class="kv"><b>슬랙 별도 좌표</b>{len(extraction.slack_points)}개 (현재 영상 궤적에 합치지 않음)</div>
+  <div class="kv"><b>보고서 생성(UTC)</b>{generated}</div>
+  <h2>분석 경고 ({len(extraction.warnings)}건)</h2><ul>{warning_html}</ul>
   {visuals_html}
-  <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 급가속 구간 우선)</h2>
+  <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 급가·감속 구간 우선, 나머지 전체 구간 균등 표본)</h2>
+  <p>전체 원자료 CSV: {_esc(extraction.primary_source_file or "없음")}</p>
   <table>
     <thead><tr><th>#</th><th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th><th>충격(g)</th></tr></thead>
     <tbody>{body_rows}</tbody>

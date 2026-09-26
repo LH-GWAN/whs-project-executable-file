@@ -30,35 +30,27 @@ def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def compute_headings(points: List[TrackPoint]) -> List[Optional[float]]:
     """지점별 진행 방향(도). 지도 위치 마커를 화살표로 그리기 위한 값.
 
-    GPS가 준 진행각(track_deg)이 있고 움직이는 중이면 그것을, 없으면 다음(없으면 이전)
-    좌표와의 방위각을 쓴다. 정지 중(같은 좌표 반복)에는 마지막 방향을 유지한다.
+    이동 중에는 실측 진행각 또는 직전 좌표로 추정한다. 정지 중에는 마지막 방향을
+    유지하고, 처음부터 방향을 모르면 None(원형 마커). 5초 초과 공백은 연결하지 않는다.
     """
-    n = len(points)
-    fixes = [i for i, p in enumerate(points) if p.has_fix]
-    out: List[Optional[float]] = [None] * n
-    last: Optional[float] = None
-    for k, i in enumerate(fixes):
-        p = points[i]
-        h: Optional[float] = None
-        if p.track_deg is not None and (p.speed_kmh or 0.0) >= 3.0:
-            h = float(p.track_deg) % 360.0
-        else:
-            # 다음(또는 이전) 다른 좌표까지의 방위각
-            for j in fixes[k + 1:k + 30]:
-                q = points[j]
-                if abs(q.latitude - p.latitude) > 1e-7 or abs(q.longitude - p.longitude) > 1e-7:
-                    h = _bearing_deg(p.latitude, p.longitude, q.latitude, q.longitude)
-                    break
-            if h is None and last is None:
-                for j in reversed(fixes[max(0, k - 30):k]):
-                    q = points[j]
-                    if abs(q.latitude - p.latitude) > 1e-7 or abs(q.longitude - p.longitude) > 1e-7:
-                        h = _bearing_deg(q.latitude, q.longitude, p.latitude, p.longitude)
-                        break
-        if h is None:
-            h = last
-        out[i] = h
-        last = h
+    out = [None] * len(points)
+    last = None
+    previous = None
+    for i, p in enumerate(points):
+        if not p.has_fix or p.start_time_sec is None or not math.isfinite(p.start_time_sec):
+            continue
+        if previous is not None and not 0 <= p.start_time_sec - previous.start_time_sec <= 5.0:
+            last = None
+            previous = None
+        moving = p.speed_kmh is not None and math.isfinite(p.speed_kmh) and p.speed_kmh >= 3.0
+        if moving and p.track_deg is not None and math.isfinite(p.track_deg):
+            last = p.track_deg % 360.0
+        elif moving and previous is not None:
+            from core.outliers import haversine_m
+            if haversine_m(previous.latitude, previous.longitude, p.latitude, p.longitude) >= 2.0:
+                last = _bearing_deg(previous.latitude, previous.longitude, p.latitude, p.longitude)
+        out[i] = last
+        previous = p
     return out
 
 
@@ -174,10 +166,11 @@ class MapView(QWidget):
         if self._loaded:
             self._view.page().runJavaScript(script)
         else:
-            self._pending_js.append(script)
+            self._pending_js = [s for s in (self._last_track_js, self._last_time_js) if s]
 
     def set_track(self, points: List[TrackPoint],
                    segments: Optional[List[FlaggedSegment]] = None) -> None:
+        self._pending_js = []
         headings = compute_headings(points)
         payload = {
             "points": [

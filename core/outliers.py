@@ -24,16 +24,16 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dphi = p2 - p1
     dlmb = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
-    return 2 * _EARTH_R * math.asin(math.sqrt(a))
+    return 2 * _EARTH_R * math.asin(math.sqrt(min(1.0, max(0.0, a))))
 
 
 def _coords_valid(p: TrackPoint) -> bool:
     if p.latitude is None or p.longitude is None:
         return False
+    if not math.isfinite(p.latitude) or not math.isfinite(p.longitude):
+        return False
     if abs(p.latitude) > 90 or abs(p.longitude) > 180:
         return False
-    if abs(p.latitude) < 1e-6 and abs(p.longitude) < 1e-6:
-        return False  # (0, 0) - 수신 실패를 0으로 채운 기기
     return True
 
 
@@ -59,7 +59,7 @@ def _groups(points: List[TrackPoint]) -> List[_Group]:
     groups: List[_Group] = []
     prev_key = None
     for i, p in enumerate(points):
-        if p.is_outlier or p.start_time_sec is None or not _coords_valid(p):
+        if not p.has_fix or p.start_time_sec is None or not math.isfinite(p.start_time_sec):
             continue
         key = _fix_key(p)
         if groups and key == prev_key:
@@ -95,7 +95,7 @@ def mark_outliers(points: List[TrackPoint]) -> int:
     for i, p in enumerate(points):
         if p.latitude is not None and p.longitude is not None and not _coords_valid(p):
             _mark(points, [i], f"좌표가 유효 범위 밖 ({p.latitude}, {p.longitude})")
-        elif p.speed_kmh is not None and (p.speed_kmh > MAX_SPEED_KMH or p.speed_kmh < 0):
+        elif p.speed_kmh is not None and (not math.isfinite(p.speed_kmh) or p.speed_kmh > MAX_SPEED_KMH or p.speed_kmh < 0):
             _mark(points, [i], f"속도 비정상 ({p.speed_kmh:.0f} km/h)")
 
     # 2) 위치가 튄 측정: 직전 정상 측정에서 불가능한 속도로 멀어졌다가(그리고 다음 측정이

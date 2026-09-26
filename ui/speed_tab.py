@@ -4,7 +4,7 @@ from typing import List
 
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from core.acceleration import FlaggedSegment, count_by_kind
+from core.acceleration import FlaggedSegment, count_by_kind, _distinct_fix_indices
 from engine.engine_adapter import TrackPoint
 from ui.speed_chart_widget import SpeedChartWidget
 
@@ -37,7 +37,11 @@ class SpeedTab(QWidget):
 
     def load(self, records: List[TrackPoint], segments: List[FlaggedSegment]) -> None:
         self._chart.set_data(records, segments)
-        speeds = [r.speed_kmh for r in records if r.speed_kmh is not None]
+        indices = _distinct_fix_indices(records)
+        speeds = [records[i].speed_kmh for i in indices]
+        excluded = sum(r.speed_kmh is not None for r in records) - len(indices)
+        self._avg_label.setToolTip(
+            f"그래프와 같은 유효 GPS 측정의 산술평균. 반복·무효 속도 행 {excluded}개 제외 (시간 가중 평균 아님).")
         if speeds:
             self._avg_label.setText(f"평균 속도: {sum(speeds) / len(speeds):.1f} km/h")
             self._max_label.setText(f"최고 속도: {max(speeds):.1f} km/h")

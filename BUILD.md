@@ -213,3 +213,23 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python app.py
 ```
+
+## Linux 개발 환경 (Ubuntu 24.04)
+
+Python 패키지 외에 Qt WebEngine 시스템 라이브러리가 필요하다.
+`libXtst.so.6` / `libxkbfile.so.1` 오류가 나면 아래 의존성을 확인한다.
+
+```bash
+sudo apt-get update
+sudo apt-get install python3-venv libxtst6 libxkbfile1 libnss3 libxss1 libasound2t64 libxcb-cursor0
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt pytest
+python app.py
+```
+
+회귀 검증은 `python -m pytest -q tests`로 실행한다. 합성 영상 디코더 시험은
+FFmpeg, 지도 초기화 예외의 JavaScript 시험은 Node.js가 있으면 실행하고 없으면 skip한다.
+Linux CI에서 위젯 시험은 `QT_QPA_PLATFORM=offscreen`으로 실행할 수 있다.
+이 시험의 지도 위젯은 대체 객체로 격리하며, 실제 WebGL 지도·카카오맵·Windows EXE
+검증을 대신하지 않는다. 배포 설정에서 Chromium sandbox를 끄지 않는다.
