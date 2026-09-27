@@ -45,6 +45,7 @@ class TrackPoint:
     gps_date: str = ""
     gps_utc_time: str = ""
     gps_checksum_ok: Optional[bool] = None
+    gps_trusted: Optional[bool] = None
 
     latitude_last: Optional[float] = None
     longitude_last: Optional[float] = None
@@ -70,7 +71,10 @@ class TrackPoint:
 
     @property
     def has_fix(self) -> bool:
-        return self.has_coords and not self.is_outlier
+        return (self.has_coords and not self.is_outlier
+                and self.gps_checksum_ok is not False and self.gps_trusted is not False
+                and math.isfinite(self.latitude) and math.isfinite(self.longitude)
+                and -90 <= self.latitude <= 90 and -180 <= self.longitude <= 180)
 
     @property
     def has_gps_record(self) -> bool:
@@ -106,6 +110,7 @@ STATUS_UNSUPPORTED = "unsupported"
 STATUS_ENGINE_FAILED = "engine_failed"
 STATUS_TIMED_OUT = "timed_out"
 STATUS_NO_GPS = "no_gps"
+STATUS_GPS_UNTRUSTED = "gps_untrusted"
 
 
 @dataclass
@@ -120,6 +125,7 @@ class ExtractionResult:
     status: str = STATUS_OK
     status_detail: str = ""
     slack_points: List[TrackPoint] = field(default_factory=list)
+    avi_repaired: bool = False
 
     @property
     def fix_count(self) -> int:
@@ -147,8 +153,10 @@ class ExtractionResult:
             return f"분석이 제한 시간을 초과해 중단됐습니다. {self.status_detail}"
         if self.status == STATUS_ENGINE_FAILED:
             return f"분석 엔진이 실패했습니다. {self.status_detail}"
+        if self.status == STATUS_GPS_UNTRUSTED:
+            return "GPS 기록은 있으나 신뢰할 수 있는 좌표가 없습니다. 원본 CSV를 확인하세요."
         if self.status == STATUS_NO_GPS:
-            return "분석은 정상 완료됐지만 이 영상에는 GPS 데이터가 없습니다."
+            return "이 영상에서 GPS를 추출하지 못했습니다 (미기록 또는 미지원 메타데이터 형식)."
         return self.status_detail
 
 
@@ -235,7 +243,8 @@ def _f(value: Optional[str]) -> Optional[float]:
     if not value:
         return None
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except ValueError:
         return None
 
@@ -257,12 +266,9 @@ def find_csvs(output_dir: str, filename: str) -> List[str]:
 
 def _count_fixes(csv_path: str) -> int:
     try:
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            return sum(
-                1 for row in csv.DictReader(f)
-                if (row.get("latitude") or "").strip()
-            )
-    except OSError:
+        loader = load_timeline if os.path.basename(csv_path) == "timeline.csv" else load_coordinates_as_points
+        return sum(p.has_fix for p in loader(csv_path))
+    except (OSError, ValueError):
         return 0
 
 
@@ -289,6 +295,7 @@ def load_timeline(csv_path: str) -> List[TrackPoint]:
                 gps_date=(row.get("gps_date") or "").strip(),
                 gps_utc_time=(row.get("gps_utc_time") or "").strip(),
                 gps_checksum_ok=_b(row.get("gps_checksum_ok")),
+                gps_trusted=_b(row.get("gps_trusted")),
                 latitude_last=_f(row.get("latitude_last")),
                 longitude_last=_f(row.get("longitude_last")),
                 speed_kmh_last=_f(row.get("speed_kmh_last")),
@@ -297,7 +304,28 @@ def load_timeline(csv_path: str) -> List[TrackPoint]:
                 z_g_cal=_f(row.get("z_g_cal")),
                 source_file=csv_path,
             ))
+    _restore_timeline_trust(points, csv_path)
     return points
+
+
+def _restore_timeline_trust(points: List[TrackPoint], csv_path: str) -> None:
+    """Pinned engines omit trusted/status from timeline but retain it in coordinates.csv.
+
+    Match observed time/coordinates/GPS time, not row positions (sensor rows differ).
+    Ambiguous matches fail closed if any matched record is explicitly untrusted.
+    """
+    def key(p):
+        return (p.start_time_sec, p.latitude, p.longitude, p.gps_date, p.gps_utc_time)
+    trust = {}
+    for path in find_csvs(os.path.dirname(csv_path), "coordinates.csv"):
+        for p in load_coordinates_as_points(path):
+            value = p.gps_trusted
+            if value is not None:
+                k = key(p)
+                trust[k] = trust.get(k, True) and value
+    for p in points:
+        if key(p) in trust:
+            p.gps_trusted = trust[key(p)] if p.gps_trusted is None else p.gps_trusted and trust[key(p)]
 
 
 def load_coordinates_as_points(csv_path: str) -> List[TrackPoint]:
@@ -315,6 +343,8 @@ def load_coordinates_as_points(csv_path: str) -> List[TrackPoint]:
                 gps_date=(row.get("date") or "").strip(),
                 gps_utc_time=(row.get("utc_time") or "").strip(),
                 gps_checksum_ok=_b(row.get("checksum_ok")),
+                gps_trusted=(False if _b(row.get("status_valid")) is False
+                             else _b(row.get("trusted"))),
                 source_file=csv_path,
             ))
     _fill_last_known(points)
@@ -372,6 +402,9 @@ def run_full_extraction(input_path: str, output_dir: str, slack: bool = False,
             status=STATUS_UNSUPPORTED, status_detail=routing.reason,
         )
 
+    if os.path.isdir(output_dir) and os.listdir(output_dir):
+        raise ValueError("분석 출력 폴더가 비어 있지 않습니다. 새 폴더를 사용하세요.")
+
     engine_runs = [run_engine(input_path, output_dir, slack=slack,
                               timeout_sec=timeout_sec, cancel_event=cancel_event)]
 
@@ -388,6 +421,13 @@ def run_full_extraction(input_path: str, output_dir: str, slack: bool = False,
     time_source = next((p.time_source for p in points if p.time_source), "")
 
     status, detail = _classify_outcome(engine_runs, output_dir, points)
+    # Pinned MP4 engine intentionally SKIPs standard video/audio-only files without writing CSV.
+    # Only this explicit outcome plus readable duration is no_gps; arbitrary SKIP/errors are failures.
+    if (status == STATUS_ENGINE_FAILED and all(r.exit_code == 0 and not r.timed_out for r in engine_runs)
+            and any("text track도 없고 udta 안에 mamt도 없음" in r.stdout for r in engine_runs)):
+        from core.duration import get_duration_sec
+        if get_duration_sec(input_path, routing.container):
+            status, detail = STATUS_NO_GPS, "지원하는 GPS 메타데이터 트랙이 없습니다."
 
     return ExtractionResult(
         routing=routing, points=points, engine_runs=engine_runs,
@@ -414,6 +454,8 @@ def load_slack_points(output_dir: str) -> List[TrackPoint]:
                     gps_date=(row.get("date") or "").strip(),
                     gps_utc_time=(row.get("utc_time") or "").strip(),
                     gps_checksum_ok=_b(row.get("checksum_ok")),
+                gps_trusted=(False if _b(row.get("status_valid")) is False
+                             else _b(row.get("trusted"))),
                     source_file=path,
                 ))
     return out
@@ -437,6 +479,9 @@ def _classify_outcome(engine_runs: List[EngineRunResult], output_dir: str,
     #   산출물이 아예 없음    -> 엔진이 파일을 처리하지 못한 것
     if any(p.has_fix for p in points):
         return STATUS_OK, ""
+
+    if any(p.has_coords or p.gps_checksum_ok is False or p.gps_trusted is False for p in points):
+        return STATUS_GPS_UNTRUSTED, "GPS 검증 실패 또는 유효 범위 밖 좌표"
 
     ran = any(find_csvs(output_dir, name) for name in
               ("stream_table.csv", "track_table.csv", "index.csv", "warnings.log"))

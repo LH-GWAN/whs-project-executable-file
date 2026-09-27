@@ -6,3 +6,6 @@
 
 PySide6>=6.7          # QtWidgets + QtWebEngine (PDF report) + QtMultimedia (video)
 pyinstaller>=6.10     # exe packaging (build time only)
+
+# 테스트 전용 (tests/ 실행할 때만 필요, 빌드에는 안 들어감)
+pytest

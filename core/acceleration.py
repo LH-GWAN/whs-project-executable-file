@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -56,7 +57,9 @@ def _distinct_fix_indices(points: List[TrackPoint]) -> List[int]:
     out: List[int] = []
     prev_key = None
     for i, p in enumerate(points):
-        if p.speed_kmh is None or _time_of(p) is None or p.is_outlier:
+        if (not p.has_fix or p.speed_kmh is None or not math.isfinite(p.speed_kmh)
+                or p.speed_kmh < 0 or _time_of(p) is None
+                or not math.isfinite(_time_of(p)) or _time_of(p) < 0):
             continue
         key = _fix_key(p)
         if prev_key is None or key != prev_key:
