@@ -30,10 +30,12 @@ def test_invalid_coordinates(bad):
     assert p.is_outlier
 
 
-def test_zero_coordinates_valid():
+def test_zero_coordinates_rejected():
+    # (0, 0)은 수신 실패를 0으로 채우는 기기의 값이다(기니만 한가운데). 정상 좌표로 받으면 궤적이
+    # 아프리카 앞바다로 튄다. PR #2가 이 규칙을 뺐다가 머지 검토에서 되살렸다.
     p = TrackPoint(latitude=0, longitude=0)
     outliers.mark_outliers([p])
-    assert p.has_fix
+    assert p.is_outlier and not p.has_fix
 
 
 def test_stats_and_chart_share_trusted_distinct_records():

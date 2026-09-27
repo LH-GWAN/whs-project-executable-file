@@ -34,6 +34,8 @@ def _coords_valid(p: TrackPoint) -> bool:
         return False
     if abs(p.latitude) > 90 or abs(p.longitude) > 180:
         return False
+    if abs(p.latitude) < 1e-6 and abs(p.longitude) < 1e-6:
+        return False  # (0, 0) - 수신 실패를 0으로 채운 기기. PR #2에서 빠졌던 것을 복원
     return True
 
 

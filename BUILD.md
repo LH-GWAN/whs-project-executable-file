@@ -224,7 +224,7 @@ sudo apt-get update
 sudo apt-get install python3-venv libxtst6 libxkbfile1 libnss3 libxss1 libasound2t64 libxcb-cursor0
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt pytest
+pip install -r requirements.txt   # pytest 포함
 python app.py
 ```
 

@@ -354,6 +354,11 @@ class TrackerTab(QWidget):
         self._points: List[TrackPoint] = []
         self._gps_rows: List[Tuple[float, TrackPoint]] = []
         self._gps_times: List[float] = []
+        # 정상 좌표(has_fix) 행만 따로: 정보 줄의 속도·좌표는 "현재 시각 이하의 마지막 정상 좌표"라서
+        # 되감기해도 미래 값이 남지 않는다(PR #2 검토 지적. 머지 과정에서 이 목록 초기화가 빠져
+        # 정보 줄이 죽던 것을 복원).
+        self._fix_rows: List[Tuple[float, TrackPoint]] = []
+        self._fix_times: List[float] = []
         self._gps_interval = DEFAULT_GPS_INTERVAL_SEC
         self._map = MapView()
 
@@ -534,6 +539,8 @@ class TrackerTab(QWidget):
         # GPS 기록 주기는 수신 공백 판정에만 쓰고, 조회는 항상 현재 시각 이하로 제한한다.
         self._gps_rows = gps_record_rows(points)
         self._gps_times = [t for t, _ in self._gps_rows]
+        self._fix_rows = [(t, p) for t, p in self._gps_rows if p.has_fix]
+        self._fix_times = [t for t, _ in self._fix_rows]
         self._gps_interval = estimate_gps_interval(self._gps_rows)
         self._update_info(0.0)
 
@@ -632,7 +639,7 @@ class TrackerTab(QWidget):
         if cached is not None:
             self._addr_label.setText(f"({cached})" if cached else "")
             return
-        self._addr_label.setText("(주소 조회 중…)")
+        # 조회가 끝날 때까지 직전 주소를 그대로 둔다. 매초 비웠다 채우면 깜빡인다.
         self._resolver.request(lat, lon)
 
     def _on_address_resolved(self, lat: float, lon: float, address: str) -> None:
