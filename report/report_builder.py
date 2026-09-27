@@ -3,14 +3,14 @@ from __future__ import annotations
 import base64
 import html
 import os
-from datetime import datetime, timezone
-from core.acceleration import _distinct_fix_indices
+import tempfile
 from typing import List, Optional
 
-from PySide6.QtCore import QMarginsF, QObject, QUrl
+from PySide6.QtCore import QMarginsF, QObject, QTimer, QUrl
 from PySide6.QtGui import QPageLayout, QPageSize
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
+from core.impact import (IMPACT_RATIO, detect_impacts)
 from core.acceleration import KIND_DECEL, FlaggedSegment, count_by_kind
 from core.pipeline import PipelineResult
 from engine.engine_adapter import TrackPoint
@@ -33,23 +33,31 @@ def _esc(value) -> str:
 
 def _select_row_indices(records: List[TrackPoint], segments: List[FlaggedSegment],
                           max_rows: int = MAX_TABLE_ROWS) -> List[int]:
-    if max_rows <= 0 or not records:
-        return []
+    flagged_indices = set()
+    for seg in segments:
+        flagged_indices.update(range(seg.start_index, seg.end_index + 1))
+
     if len(records) <= max_rows:
         return list(range(len(records)))
-    def sample(values, count):
-        if count <= 0:
-            return []
-        if count == 1:
-            return values[:1]
-        return [values[round(i * (len(values) - 1) / (count - 1))] for i in range(count)]
-    flagged = sorted({i for seg in segments for i in range(max(0, seg.start_index),
-                       min(len(records), seg.end_index + 1))})
+
+    flagged = sorted(flagged_indices)
     if len(flagged) >= max_rows:
-        return sample(flagged, max_rows)
-    flagged_set = set(flagged)
-    others = [i for i in range(len(records)) if i not in flagged_set]
-    return sorted(flagged + sample(others, max_rows - len(flagged)))
+        step = len(flagged) / max_rows
+        return [flagged[int(i * step)] for i in range(max_rows)]
+
+    remaining = max_rows - len(flagged)
+    stride = max(1, len(records) // remaining)
+    sampled = set(range(0, len(records), stride))
+    combined = sorted(flagged_indices | sampled)
+    if len(combined) <= max_rows:
+        return combined
+
+    keep = set(flagged_indices)
+    for index in combined:
+        if len(keep) >= max_rows:
+            break
+        keep.add(index)
+    return sorted(keep)
 
 
 def _image_section(title: str, png_bytes: Optional[bytes], caption: str) -> str:
@@ -63,7 +71,7 @@ def _image_section(title: str, png_bytes: Optional[bytes], caption: str) -> str:
 
 def render_report_html(pipeline_result: PipelineResult, case_number: str, examiner: str,
                         memo: str, chart_png: Optional[bytes] = None,
-                        map_png: Optional[bytes] = None) -> str:
+                        map_png: Optional[bytes] = None, impact_captures=None) -> str:
     records = pipeline_result.extraction.points
     segments = pipeline_result.flagged_segments
     row_indices = _select_row_indices(records, segments)
@@ -77,7 +85,10 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     accel_count, decel_count = count_by_kind(segments)
 
     rows_html = []
+    prev_index: Optional[int] = None
     for idx in row_indices:
+        if prev_index is not None and idx != prev_index + 1:
+            rows_html.append('<tr class="gap"><td colspan="6">...</td></tr>')
         rec = records[idx]
         row_class = ""
         if idx in flagged_indices:
@@ -91,8 +102,6 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
         if rec.is_outlier:
             lat_text = lon_text = "(이상치)"
             speed_text = "(이상치)"
-        elif rec.gps_checksum_ok is False or rec.gps_trusted is False:
-            lat_text = lon_text = speed_text = "(검증 실패)"
         elif rec.has_fix:
             lat_text, lon_text = f"{rec.latitude:.6f}", f"{rec.longitude:.6f}"
         elif rec.is_dropout:
@@ -109,6 +118,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
             f"<td>{_esc(g_text)}</td>"
             "</tr>"
         )
+        prev_index = idx
 
     body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="6">추출된 좌표가 없습니다.</td></tr>'
     extraction = pipeline_result.extraction
@@ -128,13 +138,30 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
                           "회색 점선은 GPS 수신이 끊긴 구간입니다. 분석 완료 시점의 전체 경로입니다.")
     )
     outlier_count = extraction.outlier_count
-    warning_html = "".join(f"<li>{_esc(w)}</li>" for w in extraction.warnings)
-    failed_checks = sum(p.gps_checksum_ok is False or p.gps_trusted is False for p in records)
-    ok_checks = sum(p.gps_checksum_ok is True and p.gps_trusted is not False for p in records)
-    unknown_checks = len(records) - failed_checks - ok_checks
-    speeds = [records[i].speed_kmh for i in _distinct_fix_indices(records)]
-    speed_summary = f"평균 {sum(speeds)/len(speeds):.1f} / 최고 {max(speeds):.1f} km/h" if speeds else "-"
-    generated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    events = detect_impacts(records)
+    impact_html = ("<h2>충격 급증 시점 영상</h2>"
+                   f'<p class="kv">현재 G-sensor 합력 ≥ 직전 합력 × {IMPACT_RATIO:g}. '
+                   "직전 값이 0이거나 유효하지 않으면 비교하지 않습니다. "
+                   "시간 간격 1초 제한은 적용하지 않습니다. "
+                   "처음 감지된 시점의 주 영상 1장만 캡처합니다(후방만 선택 시 후방). "
+                   "충돌 확정이나 물리적 충격량(N·s) 판정이 아닙니다.</p>")
+    impact_html += f'<p class="kv">조건 충족 {len(events)}개 지점 / 리포트당 최대 1장</p>'
+    if not events:
+        impact_html += '<p class="kv">기준을 만족하는 충격 급증 구간이 없거나 유효한 G-sensor/시각 데이터가 부족합니다.</p>'
+    elif not impact_captures:
+        impact_html += '<p class="kv">영상 캡처가 제공되지 않았습니다.</p>'
+    for capture in (impact_captures or [])[:1]:
+        e = capture.event
+        caption = (f"{capture.camera} · {capture.filename} · 감지 시각 {e.time_sec:.3f}초 · "
+                   f"직전 {e.previous_g:.3f}g → 현재 {e.magnitude_g:.3f}g")
+        if capture.png:
+            caption += f" · 캡처 프레임 시각 {capture.frame_time_sec:.3f}초"
+            encoded = base64.b64encode(capture.png).decode("ascii")
+            impact_html += (f'<figure><img src="data:image/png;base64,{encoded}">'
+                            f'<figcaption>{_esc(caption)}</figcaption></figure>')
+        else:
+            impact_html += f'<p class="kv">{_esc(caption)} · 캡처 실패: {_esc(capture.error)}</p>'
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -176,17 +203,9 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>급가·감속 의심 구간</b>{_esc(len(segments))}개 (급가속 {accel_count} · 급감속 {decel_count})</div>
   <div class="kv"><b>이상치 제외</b>{_esc(outlier_count)}개 지점 (좌표 급변·비정상 속도, 원본 CSV에는 보존)</div>
 
-  <div class="kv"><b>분석 상태</b>{_esc(extraction.status)} — {_esc(extraction.status_detail)}</div>
-  <div class="kv"><b>AVI 복구</b>{'적용' if extraction.avi_repaired else '없음'}</div>
-  <div class="kv"><b>GPS 검증(행)</b>정상 {ok_checks} / 실패 {failed_checks} / 미제공 {unknown_checks}</div>
-  <p>검증 실패·이상치·비유한 수치는 지도·속도 계산에서 제외합니다. 미제공은 검증 성공을 뜻하지 않습니다.</p>
-  <div class="kv"><b>속도 통계</b>{speed_summary} (유효 GPS 측정 산술평균, 반복 기록 제외)</div>
-  <div class="kv"><b>슬랙 별도 좌표</b>{len(extraction.slack_points)}개 (현재 영상 궤적에 합치지 않음)</div>
-  <div class="kv"><b>보고서 생성(UTC)</b>{generated}</div>
-  <h2>분석 경고 ({len(extraction.warnings)}건)</h2><ul>{warning_html}</ul>
   {visuals_html}
-  <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 급가·감속 구간 우선, 나머지 전체 구간 균등 표본)</h2>
-  <p>전체 원자료 CSV: {_esc(extraction.primary_source_file or "없음")}</p>
+  {impact_html}
+  <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 급가속 구간 우선)</h2>
   <table>
     <thead><tr><th>#</th><th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th><th>충격(g)</th></tr></thead>
     <tbody>{body_rows}</tbody>
@@ -201,20 +220,47 @@ class ReportExporter(QObject):
         super().__init__(parent)
         self._out_path = out_path
         self._on_done = on_done
+        self._finished = False
         self._view = QWebEngineView()
+        self.destroyed.connect(self._view.deleteLater)
+        self._timeout = QTimer(self)
+        self._timeout.setSingleShot(True)
+        self._timeout.timeout.connect(lambda: self._finish(False, "PDF 생성 시간 초과"))
+        self._timeout.start(45000)
         self._view.loadFinished.connect(self._on_load_finished)
         self._view.page().pdfPrintingFinished.connect(self._on_pdf_finished)
-        self._view.setHtml(html_str, QUrl("about:blank"))
+        # setHtml uses a data URL with a ~2 MB limit; embedded frames can exceed it.
+        # The temporary HTML is local and removed on every completion/destruction path.
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="idas-report-")
+        self.destroyed.connect(self._temp_dir.cleanup)
+        html_path = os.path.join(self._temp_dir.name, "report.html")
+        try:
+            with open(html_path, "w", encoding="utf-8") as stream:
+                stream.write(html_str)
+            self._view.load(QUrl.fromLocalFile(html_path))
+        except OSError as exc:
+            QTimer.singleShot(0, lambda message=str(exc): self._finish(False, message))
 
     # A4에 글 쓸 때처럼 양쪽에 여백을 둔다. printToPdf의 기본 레이아웃은 여백 0이다.
     PAGE_LAYOUT = QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait,
                               QMarginsF(20, 18, 20, 18), QPageLayout.Millimeter)
 
     def _on_load_finished(self, ok: bool) -> None:
+        if self._finished:
+            return
         if not ok:
-            self._on_done(False, "리포트 HTML 로드 실패")
+            self._finish(False, "리포트 HTML 로드 실패")
             return
         self._view.page().printToPdf(self._out_path, self.PAGE_LAYOUT)
 
     def _on_pdf_finished(self, file_path: str, success: bool) -> None:
-        self._on_done(success, "" if success else "PDF 저장 실패")
+        self._finish(success, "" if success else "PDF 저장 실패")
+
+    def _finish(self, success: bool, message: str) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._timeout.stop()
+        self._view.deleteLater()
+        self._temp_dir.cleanup()
+        self._on_done(success, message)

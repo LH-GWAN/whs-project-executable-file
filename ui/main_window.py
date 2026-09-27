@@ -27,6 +27,8 @@ from core.appconfig import (
     set_map_mode,
 )
 from core.pipeline import PipelineResult, reopen_case, update_case_json
+from core.impact import detect_impacts, select_report_impacts
+from report.impact_capture import ImpactCaptureJob
 from report.report_builder import ReportExporter, render_report_html
 from storage.history_store import HistoryStore, default_app_data_dir
 from ui.address_resolver import AddressResolver
@@ -98,6 +100,8 @@ class MainWindow(QMainWindow):
         self._worker: Optional[AnalysisWorker] = None
         self._progress: Optional[QProgressDialog] = None
         self._report_exporter: Optional[ReportExporter] = None
+        self._impact_job = None
+        self._report_progress = None
 
         self._current_case_id: Optional[int] = None
         self._current_case_number: str = ""
@@ -244,7 +248,6 @@ class MainWindow(QMainWindow):
             self._home.set_history(store.list_cases())
 
     def _show_home(self) -> None:
-        self._analysis_view._tracker_tab.stop()
         self._refresh_history()
         self._stack.setCurrentWidget(self._home)
 
@@ -533,32 +536,72 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "일부 삭제 실패", f"{summary}\n\n{detail}")
 
     def _on_report_requested(self, result: PipelineResult) -> None:
+        if self._impact_job is not None or self._report_exporter is not None:
+            return
         default_name = f"{self._current_case_number or 'case'}_report.pdf"
         out_path, _ = QFileDialog.getSaveFileName(self, "리포트 저장", default_name, "PDF (*.pdf)")
         if not out_path:
             return
 
+        # Freeze case metadata before asynchronous capture (history selection may change).
+        case_id = result.case_id
+        case_number, examiner, memo = self._current_case_number, self._current_examiner, self._current_memo
         chart_png, map_png = self._analysis_view.capture_visuals()
-        html_str = render_report_html(
-            result, self._current_case_number, self._current_examiner, self._current_memo,
-            chart_png=chart_png, map_png=map_png,
-        )
+        events = select_report_impacts(detect_impacts(result.extraction.points))
+        progress = QProgressDialog("충격 시점 영상 캡처 준비 중…", "취소", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        self._report_progress = progress
+
+        def close_progress():
+            progress.close()
+            progress.deleteLater()
+            self._report_progress = None
+
+        def cancel():
+            if self._impact_job is not None:
+                self._impact_job.cancel()
+                self._impact_job.deleteLater()
+                self._impact_job = None
+                close_progress()
 
         def on_done(success: bool, error_message: str) -> None:
             exporter, self._report_exporter = self._report_exporter, None
             if exporter is not None:
                 exporter.deleteLater()
+            close_progress()
             if not success:
                 QMessageBox.critical(self, "Report", f"리포트 생성에 실패했습니다: {error_message}")
                 return
-            if self._current_case_id is not None:
+            if case_id is not None:
                 with HistoryStore(self._history_db_path) as store:
-                    store.set_report_path(self._current_case_id, out_path)
+                    store.set_report_path(case_id, out_path)
             QMessageBox.information(self, "Report", f"리포트를 저장했습니다:\n{out_path}")
 
-        self._report_exporter = ReportExporter(html_str, out_path, on_done, parent=self)
+        def captured(captures):
+            job, self._impact_job = self._impact_job, None
+            if job is not None:
+                job.deleteLater()
+            progress.setCancelButton(None)
+            progress.setLabelText("캡처를 포함한 PDF 생성 중…")
+            html_str = render_report_html(
+                result, case_number, examiner, memo, chart_png=chart_png,
+                map_png=map_png, impact_captures=captures,
+            )
+            self._report_exporter = ReportExporter(html_str, out_path, on_done, parent=self)
+
+        progress.canceled.connect(cancel)
+        self._impact_job = ImpactCaptureJob(result, events, self)
+        self._impact_job.progress.connect(
+            lambda done, total: progress.setLabelText(f"충격 시점 영상 캡처 중… {done + 1}/{total}"))
+        self._impact_job.finished.connect(captured)
+        progress.show()
+        self._impact_job.start()
 
     def closeEvent(self, event):  # noqa: N802
+        if self._impact_job is not None:
+            self._impact_job.cancel()
         AddressResolver.instance().stop()
         MapServer.shutdown_if_running()
         super().closeEvent(event)
