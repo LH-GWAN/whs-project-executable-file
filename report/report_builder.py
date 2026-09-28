@@ -12,6 +12,7 @@ from PySide6.QtGui import QPageLayout, QPageSize
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from core.acceleration import KIND_DECEL, FlaggedSegment, count_by_kind
+from core.impact import ImpactEvent
 from core.pipeline import PipelineResult
 from engine.engine_adapter import TrackPoint
 
@@ -63,7 +64,10 @@ def _image_section(title: str, png_bytes: Optional[bytes], caption: str) -> str:
 
 def render_report_html(pipeline_result: PipelineResult, case_number: str, examiner: str,
                         memo: str, chart_png: Optional[bytes] = None,
-                        map_png: Optional[bytes] = None) -> str:
+                        map_png: Optional[bytes] = None,
+                        impact_event: Optional[ImpactEvent] = None,
+                        impact_png: Optional[bytes] = None,
+                        impact_error: str = "") -> str:
     records = pipeline_result.extraction.points
     segments = pipeline_result.flagged_segments
     row_indices = _select_row_indices(records, segments)
@@ -127,6 +131,27 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
                           "초록 실선은 주행 경로, 붉은 구간은 급가속, 주황 구간은 급감속 의심 구간, "
                           "회색 점선은 GPS 수신이 끊긴 구간입니다. 분석 완료 시점의 전체 경로입니다.")
     )
+    # G센서 합력의 상대 증가만 표시한다. 차량 충돌의 확정 판정이나
+    # 물리학적 충격량(impulse, N·s)으로 표현하지 않는다.
+    if impact_event is None:
+        impact_html = ("<h2>충격값 급증 감지</h2>"
+                       "<p>직전 G센서 합력 대비 2.00배 이상인 연속 유효 구간이 없거나 "
+                       "판단할 센서 데이터가 없습니다.</p>")
+    else:
+        ev = impact_event
+        details = (f"영상 {ev.time_sec:.3f}초 / 직전 {ev.previous_g:.3f}g → "
+                   f"현재 {ev.current_g:.3f}g / 증가율 {ev.ratio:.3f}배 "
+                   f"(탐지 기준 {ev.threshold:.2f}배)")
+        impact_html = ("<h2>충격값 급증 감지</h2>"
+                       f"<p>{_esc(details)}</p>"
+                       "<p>G센서 합력의 순간적 상대 증가를 나타내는 참고 지표입니다. "
+                       "차량 충돌 확정 또는 물리적 충격량(N·s) 산출 결과가 아닙니다.</p>")
+        if impact_png:
+            impact_html += _image_section("최초 감지 시점 영상 프레임", impact_png, details)
+        else:
+            impact_html += ("<p>프레임 캡처 불가: "
+                            + _esc(impact_error or "영상 프레임을 확인하지 못했습니다.") + "</p>")
+    visuals_html += impact_html
     outlier_count = extraction.outlier_count
     warning_html = "".join(f"<li>{_esc(w)}</li>" for w in extraction.warnings)
     failed_checks = sum(p.gps_checksum_ok is False or p.gps_trusted is False for p in records)
