@@ -129,3 +129,65 @@ def test_report_renders_requested_and_actual_pts(video):
         impact_capture_method=actual.method)
     assert "캡처 영상 프레임 실제 PTS 0.760초" in html
     assert "감지 시각과 차이 +0.029초" in html
+
+
+def test_ffmpeg6_multiple_showinfo_lines_use_encoded_first_frame(video, monkeypatch):
+    """FFmpeg 6.x may log n:1 after encoding one PNG; n:0 is the PNG's PTS.
+
+    This is a regression for the six failures in the first v3 GitHub Actions run.
+    Preserve a real FFmpeg PNG but simulate extra informational log lines.
+    """
+    import report.impact_capture as capture
+    from types import SimpleNamespace
+    real_run = capture.subprocess.run
+
+    def multi_showinfo(cmd, **kwargs):
+        result = real_run(cmd, **kwargs)
+        # Confirm the successful real capture first, then emulate FFmpeg 6.x's
+        # additional showinfo output rather than mocking PNG data.
+        assert result.returncode == 0 and result.stdout.startswith(PNG_HEADER)
+        stderr = result.stderr + (
+            b"\n[Parsed_showinfo_2 @ 0x1] n:   1 pts: 10240 "
+            b"pts_time:0.8 fmt:yuv420p\n"
+        )
+        return SimpleNamespace(returncode=0, stdout=result.stdout, stderr=stderr)
+
+    monkeypatch.setattr(capture.subprocess, "run", multi_showinfo)
+    evidence = capture._ffmpeg_capture(shutil.which("ffmpeg"), str(video), .731, 0)
+    assert evidence.png and evidence.method == "ffmpeg", evidence.error
+    assert evidence.frame_time_sec == pytest.approx(.760)
+
+
+def test_ffmpeg_missing_first_pts_fails_closed(video, monkeypatch):
+    """An n:1-only log is insufficient to identify the PNG presentation time."""
+    import report.impact_capture as capture
+    from types import SimpleNamespace
+    real_run = capture.subprocess.run
+
+    def missing_first(cmd, **kwargs):
+        result = real_run(cmd, **kwargs)
+        return SimpleNamespace(
+            returncode=result.returncode, stdout=result.stdout,
+            stderr=b"[Parsed_showinfo_2 @ 0x1] n: 1 pts_time:0.8\n"
+        )
+
+    monkeypatch.setattr(capture.subprocess, "run", missing_first)
+    evidence = capture._ffmpeg_capture(shutil.which("ffmpeg"), str(video), .731, 0)
+    assert evidence.png is None and "시각" in evidence.error
+
+
+def test_ffmpeg_ambiguous_duplicate_first_pts_fails_closed(video, monkeypatch):
+    import report.impact_capture as capture
+    from types import SimpleNamespace
+    real_run = capture.subprocess.run
+
+    def duplicate_first(cmd, **kwargs):
+        result = real_run(cmd, **kwargs)
+        first = next(line for line in result.stderr.splitlines()
+                     if b"showinfo" in line and b"pts_time:" in line and b"n:" in line)
+        return SimpleNamespace(returncode=result.returncode, stdout=result.stdout,
+                               stderr=result.stderr + b"\n" + first + b"\n")
+
+    monkeypatch.setattr(capture.subprocess, "run", duplicate_first)
+    evidence = capture._ffmpeg_capture(shutil.which("ffmpeg"), str(video), .731, 0)
+    assert evidence.png is None and "시각" in evidence.error

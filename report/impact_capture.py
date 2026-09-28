@@ -77,14 +77,20 @@ def _ffmpeg_capture(executable: str, path: str, seconds: float, track_index: int
         last = [ln.strip() for ln in stderr.splitlines() if "Error" in ln or "error" in ln or "matches no" in ln]
         message = (last[-1] if last else stderr.strip().splitlines()[-1] if stderr.strip() else "PNG 결과 없음")
         return FrameEvidence(None, seconds, method="ffmpeg", error=f"ffmpeg 프레임 추출 실패: {message[:180]}")
-    # Only parse showinfo lines, not other filters' timing/diagnostic output.
-    stamps = []
+    # FFmpeg 6.x may log additional showinfo frames when encoder buffers drain
+    # despite -frames:v 1. The sole output PNG is the FIRST selected frame.
+    # Match n:0 instead of incorrectly requiring only one showinfo line.
+    # Missing or ambiguous first-frame PTS fails closed (no fabricated time).
+    first_pts = []
     for line in stderr.splitlines():
-        if "showinfo" in line and "pts_time:" in line:
-            match = _SHOWINFO_PTS.search(line)
-            if match:
-                stamps.append(float(match.group(1)))
-    actual = stamps[0] if len(stamps) == 1 else None
+        if "showinfo" not in line or "pts_time:" not in line:
+            continue
+        if not re.search(r"\bn:\s*0\b", line):
+            continue
+        match = _SHOWINFO_PTS.search(line)
+        if match:
+            first_pts.append(float(match.group(1)))
+    actual = first_pts[0] if len(first_pts) == 1 else None
     return _verified(run.stdout, seconds, actual, "ffmpeg")
 
 

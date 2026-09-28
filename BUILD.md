@@ -233,3 +233,79 @@ FFmpeg, 지도 초기화 예외의 JavaScript 시험은 Node.js가 있으면 실
 Linux CI에서 위젯 시험은 `QT_QPA_PLATFORM=offscreen`으로 실행할 수 있다.
 이 시험의 지도 위젯은 대체 객체로 격리하며, 실제 WebGL 지도·카카오맵·Windows EXE
 검증을 대신하지 않는다. 배포 설정에서 Chromium sandbox를 끄지 않는다.
+
+
+---
+
+## 이미지 캡처 V4: 리뷰 전 검증 및 Windows 실제 실행 안내
+
+V4는 기존 main을 기준으로 충격값 급증 구간의 **프레임 시각(Presentation
+Timestamp, PTS)** 을 검증한다. GPS 이상치 규칙이나 Tracker, vendor 엔진을
+변경하지 않는다. 보고서 기본 탐지 기준은 **직전 유효 G센서 합력의 2.00배**;
+1.30은 명시적으로 인수를 넘기는 교육용 단위 테스트에만 해당한다.
+G센서 값의 비율은 충돌 확정 또는 물리적 충격량(N·s)이 아니다.
+
+### 1. GitHub Actions 전체 회귀 테스트 (main 합친 *뒤* 실행)
+
+- V4 브랜치의 Actions → **IDAS regression (V4)** 에서 Linux 및 Windows
+  작업의 최종 결론과 python -m pytest -q tests 로그를 확인한다.
+- pytest가 실행 전 실패하거나 skipped가 나오면 전체 통과로 기록하지
+  않는다. -rs로 skip 원인을 확인한다. Merge 전 원본 최신 main으로
+  업데이트했다면 **업데이트 후** 테스트를 반드시 다시 실행한다.
+- 수동 실행: Windows CMD에서 py -3.12 -m venv .venv,
+  .venv\Scripts\activate.bat, python -m pip install -r requirements.txt,
+  python -m pytest -q tests. FFmpeg의 ffmpeg -version과
+  ffprobe -version도 함께 확인한다. 별도의 Git Bash는 필요 없다.
+- GitHub CI는 Linux offscreen에서 실제 PySide6 위젯 테스트를 포함하지만,
+  Windows 실사용 PC의 GPU, 코덱, 사용자 권한, QtWebEngine PDF 동작을
+  완전히 대신할 수 없다.
+
+### 2. 실제 Windows 10/11 64비트 검증 (개인정보 없는 시험 영상 사용)
+
+1. Python 3.11/3.12 x64를 설치하고, 프로젝트를 짧은 일반 사용자 경로
+   (예: C:\IDAS-v4)에 압축 해제한다. python -m venv .venv,
+   .venv\Scripts\activate.bat, python -m pip install -r requirements.txt,
+   python app.py 순서로 실행한다. 지도는 우선 오프라인으로 선택하고,
+   테스트 기간에 온라인 API 키나 실제 사고 증거를 공개 저장소에 넣지 않는다.
+2. 전방 또는 전후방 MP4/AVI를 분석한다. 원본 SHA-256과 분석 사본 해시
+   일치, 출력 CSV 및 기록, no_gps와 engine_failed 메시지 구분을 확인한다.
+   원본을 손상시키지 않는지 먼저 확인한다.
+3. Tracker에서 재생/일시정지/앞뒤 탐색을 반복하고, **미래 GPS 좌표나 속도가
+   뒤로 탐색한 화면에 남지 않는지** 확인한다. GPS (0,0), NaN, Inf 및
+   체크섬 실패 행이 정상 경로/속도 통계에 들어가지 않는지 확인한다.
+   주소 조회 동안 이전 주소가 깜빡이지 않는지도 확인한다.
+4. G센서 두 유효 연속 기록의 합력이 2배 이상 증가한 시험 데이터를 사용해
+   Report 버튼을 누른다. PDF의 감지 시각과 프레임 실제 PTS 및 편차를
+   확인한다. 감지 기준보다 작은 1.31배만 있는 사건에는 기본 기준
+   2배 보고서가 자동 캡처하지 않는 것이 현재 의도다. 원본 영상에서
+   프레임을 직접 비교하고 타임라인의 기록과 일치하는지 확인한다.
+   **원본 영상의 센서-비디오 내부 동기화는 PTS 검증만으로 증명되지 않는다.**
+5. 1080p 이상 큰 영상, GPS 없는 영상, G센서 없는 영상, 손상된 영상,
+   코덱 미지원 영상, 후방 전용 및 2영상 트랙을 차례로 확인한다.
+   잘못되거나 PTS를 확인할 수 없는 프레임은 성공한 캡처처럼 PDF에 들어가면
+   안 되고, 실패 사유를 보여주면서 일반 PDF 보고서는 만들어져야 한다.
+6. PDF를 다시 열어 한국어 글꼴, 이미지, 실제 프레임 시각/편차, A4 여백을
+   눈으로 확인한다. 큰 이미지에서도 PDF 저장 성공 여부를 확인한다.
+   임시 경로의 idas-report-* 폴더는 성공/실패 후 정리되어야 한다.
+   PDF에 원본 영상 파일 자체가 들어가는 기능은 아니다.
+7. 마지막으로 build_windows.bat로 Windows exe를 빌드한다.
+   dist\IDAS\ 폴더 **전체**를 깨끗한 Windows PC로 옮겨 실행해
+   GUI·코덱·보고서·오프라인 경로를 반복한다. exe 단독 복사는 지원하지 않는다.
+   CI는 이 실제 배포 테스트를 대체하지 않는다.
+
+### 3. 시험 실패 시 리뷰어에게 남길 정보
+
+python -m pytest -q -rs tests 마지막 요약과 실패한 테스트 이름,
+실행 OS/Python/FFmpeg 버전, 사용한 익명 시험 영상의 컨테이너·영상 길이·
+트랙 수, 기대 감지 시각과 실제 프레임 PTS, PDF 오류 문구를 남긴다.
+사건 원본, 얼굴, 차량번호, 위치좌표, API 키는 공개 PR에 첨부하지 않는다.
+
+### 4. 의도적으로 별도 범위로 남긴 기존 메모
+
+engine_adapter.py의 기존 vendor 한글 문구 기반 no_gps 분류와
+core/pipeline.py의 분석 사본 SHA-256 재검증의 단계별 진행률 UI는
+이번 이미지 캡처 PR의 변경 대상이 아니다. 기존 코드의 상태 판정/무결성
+규칙을 추측으로 바꾸지 않고 별도 이슈에서 벤더 API/출력 계약을 확인한 뒤
+수정해야 한다. GUI Report 캡처는 현재 동기 방식이므로 긴 영상의 FFmpeg
+디코딩에 시간이 걸리면 일시적으로 응답성이 낮아질 수 있다. 45초 추출
+상한 후 실패 사유 또는 Qt 대체 경로를 사용한다.
