@@ -13,6 +13,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from core.acceleration import KIND_DECEL, FlaggedSegment, count_by_kind
 from core.impact import ImpactEvent
+from report.report_html_snapshot import ReportHtmlSnapshot
 from core.pipeline import PipelineResult
 from engine.engine_adapter import TrackPoint
 
@@ -67,7 +68,9 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
                         map_png: Optional[bytes] = None,
                         impact_event: Optional[ImpactEvent] = None,
                         impact_png: Optional[bytes] = None,
-                        impact_error: str = "") -> str:
+                        impact_error: str = "",
+                        impact_frame_time_sec: Optional[float] = None,
+                        impact_capture_method: str = "") -> str:
     records = pipeline_result.extraction.points
     segments = pipeline_result.flagged_segments
     row_indices = _select_row_indices(records, segments)
@@ -146,8 +149,13 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
                        f"<p>{_esc(details)}</p>"
                        "<p>G센서 합력의 순간적 상대 증가를 나타내는 참고 지표입니다. "
                        "차량 충돌 확정 또는 물리적 충격량(N·s) 산출 결과가 아닙니다.</p>")
-        if impact_png:
-            impact_html += _image_section("최초 감지 시점 영상 프레임", impact_png, details)
+        if impact_png and impact_frame_time_sec is not None:
+            offset_sec = impact_frame_time_sec - ev.time_sec
+            frame_caption = (
+                f"{details} / 캡처 영상 프레임 실제 PTS {impact_frame_time_sec:.3f}초 "
+                f"(감지 시각과 차이 {offset_sec:+.3f}초, 추출 방식 {impact_capture_method or '미지정'})"
+            )
+            impact_html += _image_section("최초 감지 시점 인근 영상 프레임", impact_png, frame_caption)
         else:
             impact_html += ("<p>프레임 캡처 불가: "
                             + _esc(impact_error or "영상 프레임을 확인하지 못했습니다.") + "</p>")
@@ -227,19 +235,32 @@ class ReportExporter(QObject):
         self._out_path = out_path
         self._on_done = on_done
         self._view = QWebEngineView()
+        self._html_snapshot = ReportHtmlSnapshot(html_str)
+        self._completed = False
         self._view.loadFinished.connect(self._on_load_finished)
         self._view.page().pdfPrintingFinished.connect(self._on_pdf_finished)
-        self._view.setHtml(html_str, QUrl("about:blank"))
+        # Avoid the 2 MB data URL limit when charts and impact PNGs are embedded.
+        # Keep the report HTML in a private, short-lived temporary directory.
+        self._view.load(QUrl.fromLocalFile(self._html_snapshot.path))
 
     # A4에 글 쓸 때처럼 양쪽에 여백을 둔다. printToPdf의 기본 레이아웃은 여백 0이다.
     PAGE_LAYOUT = QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait,
                               QMarginsF(20, 18, 20, 18), QPageLayout.Millimeter)
 
+    def _finish(self, success: bool, message: str) -> None:
+        if self._completed:
+            return
+        self._completed = True
+        self._html_snapshot.close()
+        self._on_done(success, message)
+
     def _on_load_finished(self, ok: bool) -> None:
+        if self._completed:
+            return
         if not ok:
-            self._on_done(False, "리포트 HTML 로드 실패")
+            self._finish(False, "리포트 HTML 로드 실패")
             return
         self._view.page().printToPdf(self._out_path, self.PAGE_LAYOUT)
 
     def _on_pdf_finished(self, file_path: str, success: bool) -> None:
-        self._on_done(success, "" if success else "PDF 저장 실패")
+        self._finish(success, "" if success else "PDF 저장 실패")
