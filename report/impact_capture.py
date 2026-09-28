@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from typing import Optional, Tuple
 
-PNG_HEADER = b"\\x89PNG\\r\\n\\x1a\\n"
+PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 
 
 def choose_capture_source(result) -> Tuple[str, int]:
