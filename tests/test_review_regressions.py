@@ -250,3 +250,17 @@ def test_location_verification_labels(qapp, monkeypatch):
     assert tab._table.item(1, 3).text() == '(검증 실패)'
     assert tab._table.item(1, 6).text() == '-'
     tab.deleteLater()
+
+
+def test_mute_lowers_volume_and_restores(tracker):
+    tracker._volume.setValue(70)
+    tracker._mute_btn.click()
+    assert tracker._volume.value() == 0 and tracker._audio.volume() == 0 and tracker._audio.isMuted()
+    tracker._mute_btn.click()
+    assert tracker._volume.value() == 70 and abs(tracker._audio.volume() - 0.7) < 1e-6
+    assert not tracker._audio.isMuted()
+    tracker._mute_btn.click()
+    tracker._volume.setValue(30)   # 음소거 중 슬라이더를 올리면 해제
+    assert not tracker._mute_btn.isChecked() and abs(tracker._audio.volume() - 0.3) < 1e-6
+    tracker._volume.setValue(0)    # 0으로 내리면 음소거
+    assert tracker._mute_btn.isChecked() and tracker._audio.isMuted()

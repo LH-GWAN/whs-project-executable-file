@@ -4,10 +4,11 @@ import bisect
 import math
 import os
 import statistics
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTimer, QUrl, Signal
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QComboBox,
@@ -17,6 +18,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSplitter,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -28,7 +31,12 @@ from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
 from ui.map_view import MapView
 
-SKIP_MS = 5000
+# ±버튼 건너뛰기. 5초는 너무 많이 건너뛴다는 의견으로 3초.
+SKIP_MS = 3000
+# 방향키 한 번(←/→)
+ARROW_STEP_MS = 1000
+# 영상에서 프레임 빈도를 못 읽을 때 한 프레임 길이(30fps)
+DEFAULT_FRAME_MS = 1000.0 / 30.0
 PLAYBACK_RATES = ((0.5, "0.5×"), (0.75, "0.75×"), (1.0, "1×"), (1.5, "1.5×"), (2.0, "2×"))
 _SYNC_TOLERANCE_MS = 400
 # 전방/후방 중 하나를 눌러 키웠을 때의 폭 비율(누른 쪽 : 다른 쪽)
@@ -166,6 +174,58 @@ class _VideoPane(QWidget):
         super().mousePressEvent(event)
 
 
+@dataclass
+class PlaylistItem:
+    """Tracker가 재생할 영상 하나. 연속 영상 이어보기면 여러 개를 차례로 튼다."""
+    path: str
+    rear_path: str = ""
+    track_mode: str = ""
+    duration_sec: Optional[float] = None
+    label: str = ""
+    primary_is_rear: bool = False   # 전방 없이 후방만 있는 구간(주 재생기가 후방을 튼다)
+
+
+class _SeekSlider(QSlider):
+    """재생 막대. 막대 아무 곳이나 누르면 그 위치로 바로 간다(기본 QSlider는 한 칸씩만 움직여
+    원하는 곳을 눌러도 안 넘어갔다 - 검토 제보). 누른 채 끌면 그대로 드래그된다."""
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton and self.maximum() > self.minimum():
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+            pos = event.position().toPoint()
+            if not handle.contains(pos):
+                groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+                span = max(1, groove.width() - handle.width())
+                x = int(pos.x() - groove.x() - handle.width() / 2)
+                value = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                                       max(0, min(x, span)), span, opt.upsideDown)
+                self.setValue(value)   # tracking이 꺼져 있어도 setValue는 valueChanged를 낸다
+        super().mousePressEvent(event)
+
+
+class _KeyPanel(QWidget):
+    """Tracker 왼쪽(영상 쪽) 칸. 아무 곳이나 누르면 키보드 초점을 받아 ←/→(1초), 스페이스(재생/정지),
+    ,/.(<, > 한 프레임)로 조작한다. 버튼들은 초점을 받지 않게 해서, 버튼을 누른 뒤에도 키가 영상을
+    움직인다(예전엔 방향키가 재생 버튼 → -5초 → +5초 → 재생 막대 순으로 초점만 옮겼다)."""
+
+    def __init__(self, handler, parent=None):
+        super().__init__(parent)
+        self._handler = handler
+        self.setFocusPolicy(Qt.ClickFocus)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self.setFocus(Qt.MouseFocusReason)
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if self._handler(event):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 def _fmt_ms(ms: int) -> str:
     total = max(0, int(ms // 1000))
     h, rem = divmod(total, 3600)
@@ -205,18 +265,18 @@ class TrackerTab(QWidget):
         self._play_btn.setFixedWidth(40)
         self._play_btn.setToolTip("재생 / 일시정지")
         self._play_btn.clicked.connect(self._toggle_play)
-        self._back_btn = QPushButton("-5s")
+        self._back_btn = QPushButton(f"-{SKIP_MS // 1000}s")
         self._back_btn.setFixedWidth(48)
-        self._back_btn.setToolTip("5초 뒤로")
+        self._back_btn.setToolTip(f"{SKIP_MS // 1000}초 뒤로")
         self._back_btn.clicked.connect(lambda: self._skip(-SKIP_MS))
-        self._fwd_btn = QPushButton("+5s")
+        self._fwd_btn = QPushButton(f"+{SKIP_MS // 1000}s")
         self._fwd_btn.setFixedWidth(48)
-        self._fwd_btn.setToolTip("5초 앞으로")
+        self._fwd_btn.setToolTip(f"{SKIP_MS // 1000}초 앞으로")
         self._fwd_btn.clicked.connect(lambda: self._skip(SKIP_MS))
 
-        self._seek_slider = QSlider(Qt.Horizontal)
-        self._seek_slider.setSingleStep(1000)
-        self._seek_slider.setPageStep(5000)
+        self._seek_slider = _SeekSlider(Qt.Horizontal)
+        self._seek_slider.setSingleStep(ARROW_STEP_MS)
+        self._seek_slider.setPageStep(SKIP_MS)
         self._seek_slider.setTracking(False)
         self._seek_slider.valueChanged.connect(self._on_slider_moved)
         self._time_label = QLabel("00:00 / 00:00")
@@ -254,6 +314,15 @@ class TrackerTab(QWidget):
         # 파이프라인이 계산한 영상 길이. 재생기가 길이를 0으로 주는 경우(가끔 AVI에서
         # 첫 로드에 못 읽음)의 대비책이자, 두 값이 다르면 파이프라인 값을 믿는다.
         self._duration_hint_ms = 0
+        # 재생 목록. 영상 하나면 항목 하나. 재생 막대·시각·지도는 목록 전체를 잇는 시간축(전체
+        # 시각 = 구간 시작 + 재생기 위치)을 쓰고, 재생기는 지금 구간의 파일만 연다.
+        self._playlist: List[PlaylistItem] = []
+        self._seg = 0
+        self._durations_ms: List[int] = []
+        self._offsets_ms: List[int] = []
+        self._pending_seek_ms: Optional[int] = None   # 구간을 연 뒤 옮겨 갈 위치
+        self._play_after_load = False
+        self._prime_target_ms = 0                     # 첫 장면 띄우기 후 멈출 위치
 
         controls = QHBoxLayout()
         controls.addWidget(self._play_btn)
@@ -262,16 +331,21 @@ class TrackerTab(QWidget):
         controls.addWidget(self._seek_slider, 1)
         controls.addWidget(self._time_label)
         controls.addWidget(self._rate_combo)
+        # 음소거는 슬라이더를 0으로 내리고 실제 음량도 0으로 만든다. 예전엔 setMuted만 불러
+        # 슬라이더가 그대로라 눌렀는지 알 수 없었고(검토 제보: "음소거 눌러도 볼륨 안 줄어듦"),
+        # 재생 백엔드가 muted를 무시하는 환경에서도 소리가 나지 않게 음량까지 0으로 둔다.
+        # 해제하면 누르기 전 음량으로 돌아가고, 음소거 중 슬라이더를 올리면 해제된다.
         self._mute_btn = QPushButton("음소거")
         self._mute_btn.setCheckable(True)
-        self._mute_btn.toggled.connect(lambda checked: self._audio.setMuted(checked or self._priming))
+        self._mute_btn.toggled.connect(self._on_mute_toggled)
         controls.addWidget(self._mute_btn)
         self._volume = QSlider(Qt.Horizontal)
         self._volume.setRange(0, 100)
         self._volume.setValue(50)
         self._volume.setFixedWidth(60)
         self._volume.setToolTip("주 영상 음량 (후방 동시 출력 없음)")
-        self._volume.valueChanged.connect(lambda value: self._audio.setVolume(value / 100))
+        self._volume.valueChanged.connect(self._on_volume_changed)
+        self._volume_before_mute = 50
         controls.addWidget(self._volume)
         self._media_label = QLabel("")
         self._media_label.setWordWrap(True)
@@ -339,15 +413,29 @@ class TrackerTab(QWidget):
         self._video_split.setChildrenCollapsible(False)
         self._video_split.setSizes([1, 1])
 
+        # 이어보기에서 지금 재생 중인 영상(예: "영상 2/3 · video2"). 영상이 하나면 숨긴다.
+        self._segment_label = QLabel("")
+        self._segment_label.setStyleSheet("color: #666;")
+        self._segment_label.hide()
+        clock_row = QHBoxLayout()
+        clock_row.setContentsMargins(0, 0, 0, 0)
+        clock_row.addWidget(self._clock_label, 1)
+        clock_row.addWidget(self._segment_label)
+
+        # 버튼·막대는 초점을 받지 않는다 - 키보드는 영상 칸(_KeyPanel)이 받는다.
+        for widget in (self._play_btn, self._back_btn, self._fwd_btn, self._seek_slider,
+                       self._rate_combo, self._mute_btn, self._volume):
+            widget.setFocusPolicy(Qt.NoFocus)
+
         video_panel = QVBoxLayout()
         video_panel.setContentsMargins(0, 0, 0, 0)
         video_panel.setSpacing(2)
-        video_panel.addWidget(self._clock_label)
+        video_panel.addLayout(clock_row)
         video_panel.addWidget(self._video_split, 1)
         video_panel.addLayout(controls)
         video_panel.addWidget(self._media_label)
         video_panel.addWidget(self._info_bar)
-        video_container = QWidget()
+        video_container = _KeyPanel(self._on_key)
         video_container.setLayout(video_panel)
         self._video_container = video_container
 
@@ -382,6 +470,61 @@ class TrackerTab(QWidget):
     def load_video(self, path: str, rear_path: str = "", track_mode: str = "") -> None:
         """track_mode는 파일 하나에 전·후방 트랙이 든 영상의 보기 방식(both/front/rear). 빈 문자열이면
         both와 같다(트랙이 둘이면 같이 보여 준다)."""
+        hint = self._duration_hint_ms / 1000.0 if self._duration_hint_ms else None
+        self.load_playlist([PlaylistItem(path=path, rear_path=rear_path, track_mode=track_mode,
+                                         duration_sec=hint)])
+
+    def load_playlist(self, items: List[PlaylistItem]) -> None:
+        """영상 여러 개를 차례로 잇는다(연속 영상 이어보기). 한 영상이 끝나면 다음 영상을 바로 튼다."""
+        self._playlist = list(items)
+        self._durations_ms = [int((it.duration_sec or 0) * 1000) for it in self._playlist]
+        self._recompute_offsets()
+        many = len(self._playlist) > 1
+        self._segment_label.setVisible(many)
+        if not self._playlist:
+            self.release_media()
+            return
+        self._load_segment(0, 0, play=False, prime=True)
+
+    def _recompute_offsets(self) -> None:
+        self._offsets_ms = []
+        total = 0
+        for d in self._durations_ms:
+            self._offsets_ms.append(total)
+            total += max(0, d)
+
+    def total_duration_ms(self) -> int:
+        total = sum(max(0, d) for d in self._durations_ms)
+        if total <= 0:
+            total = self._player.duration() or self._duration_hint_ms
+        return max(0, total)
+
+    def current_segment(self) -> int:
+        return self._seg
+
+    def _global_ms(self, local_ms: int) -> int:
+        offset = self._offsets_ms[self._seg] if self._seg < len(self._offsets_ms) else 0
+        return offset + max(0, local_ms)
+
+    def global_position_ms(self) -> int:
+        return self._global_ms(self._player.position())
+
+    def _locate(self, global_ms: int) -> Tuple[int, int]:
+        """전체 시각 → (구간, 그 영상 안의 위치)."""
+        if len(self._playlist) <= 1:
+            return 0, max(0, global_ms)
+        global_ms = max(0, min(global_ms, self.total_duration_ms()))
+        for i in range(len(self._playlist) - 1, -1, -1):
+            if global_ms >= self._offsets_ms[i]:
+                local = global_ms - self._offsets_ms[i]
+                if self._durations_ms[i] > 0:
+                    local = min(local, self._durations_ms[i])
+                return i, local
+        return 0, 0
+
+    def _load_segment(self, index: int, local_ms: int = 0, play: bool = False, prime: bool = False) -> None:
+        item = self._playlist[index]
+        self._seg = index
         self._front_url = QUrl()
         self._rear_url = QUrl()
         self.stop()
@@ -389,26 +532,37 @@ class TrackerTab(QWidget):
         self._rear_player.setSource(QUrl())
         self._media_label.clear()
         self._set_controls_enabled(True)
-        self._prime_pending = True
+        # 멈춘 채로 다른 구간으로 가면 첫 장면 띄우기(잠깐 재생 후 멈춤)로 그 위치 화면을 보여 준다.
+        self._prime_pending = prime
+        self._prime_target_ms = max(0, local_ms)
+        self._pending_seek_ms = local_ms if (local_ms > 0 and not prime) else None
+        self._play_after_load = play
         self._rear_prime_pending = False
         self._rear_track_index = 0
-        self._track_mode = track_mode or TRACK_MODE_BOTH
+        self._track_mode = item.track_mode or TRACK_MODE_BOTH
         self._set_rear_active(False)
-        self._front_url = QUrl.fromLocalFile(path)
-        self._rear_url = QUrl.fromLocalFile(rear_path) if rear_path else QUrl()
-        self._rear_player.setSource(QUrl())
-        if not os.path.isfile(path):
-            self._player.setSource(QUrl())
+        if item.primary_is_rear:
+            self._front_pane.set_caption("후방", True)
+        if len(self._playlist) > 1:
+            self._segment_label.setText(
+                f"영상 {index + 1}/{len(self._playlist)}" + (f" · {item.label}" if item.label else "")
+                + (" (후방만)" if item.primary_is_rear else ""))
+        self._front_url = QUrl.fromLocalFile(item.path)
+        self._rear_url = QUrl.fromLocalFile(item.rear_path) if item.rear_path else QUrl()
+        if not os.path.isfile(item.path):
             self._on_media_error("영상 파일을 찾을 수 없습니다. 사건 사본 경로를 확인하세요.")
             return
         self._player.setSource(self._front_url)
-        if rear_path:
+        if item.rear_path:
             self._rear_prime_pending = True
             self._rear_player.setSource(self._rear_url)
             self._set_rear_active(True)
 
     def set_duration_hint(self, duration_sec: Optional[float]) -> None:
         self._duration_hint_ms = int(duration_sec * 1000) if duration_sec else 0
+        if len(self._playlist) == 1 and self._duration_hint_ms > 0:
+            self._durations_ms = [self._duration_hint_ms]
+            self._recompute_offsets()
         if self._player.duration() <= 0 and self._duration_hint_ms > 0:
             self._on_duration_changed(self._duration_hint_ms)
 
@@ -428,6 +582,7 @@ class TrackerTab(QWidget):
         return self._enlarged
 
     def _on_pane_clicked(self, which: int) -> None:
+        self._video_container.setFocus(Qt.MouseFocusReason)   # 영상을 눌러도 키보드 조작이 된다
         if not self._rear_active:
             return  # 영상이 하나뿐이면 키울 상대가 없다
         self._enlarged = None if self._enlarged == which else which
@@ -455,15 +610,15 @@ class TrackerTab(QWidget):
             return
         if status == QMediaPlayer.StalledMedia:
             self._media_label.setText("영상 버퍼링 지연: 파일 상태를 확인하세요.")
+        if status == QMediaPlayer.EndOfMedia and self._seg + 1 < len(self._playlist):
+            # 이어보기: 이 영상이 끝나면 다음 영상을 바로 튼다.
+            self._load_segment(self._seg + 1, 0, play=True)
+            return
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
             if self._media_label.text().startswith(("영상 버퍼링 지연", "아직 탐색할 수 없습니다")):
                 self._media_label.clear()
             # 재생기가 길이를 늦게/0으로 주는 경우 대비 - 로드된 시점에 한 번 더 맞춘다.
-            duration = self._player.duration()
-            if duration <= 0 and self._duration_hint_ms > 0:
-                duration = self._duration_hint_ms
-            if duration > 0:
-                self._on_duration_changed(duration)
+            self._on_duration_changed(self._player.duration())
             # 파일 하나에 전방·후방 트랙이 같이 든 경우(랜드로버 순정 블랙박스 등): 두 번째
             # 비디오 트랙을 후방으로 띄운다. 트랙 전환은 후방 재생기가 파일을 다 읽은 뒤에 한다 -
             # 로드 전에 setActiveVideoTrack을 부르면 무시돼서 후방 칸도 전방 트랙을 틀었다
@@ -488,12 +643,20 @@ class TrackerTab(QWidget):
                         self._rear_url = self._player.source()
                         self._rear_player.setSource(self._rear_url)
                         self._set_rear_active(True)
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            if self._pending_seek_ms is not None:
+                target, self._pending_seek_ms = self._pending_seek_ms, None
+                self._player.setPosition(target)
+            if self._play_after_load:
+                self._play_after_load = False
+                self._player.play()
+                self._sync_rear(self._player.position())
         if not self._prime_pending:
             return
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
             self._prime_pending = False
             self._priming = True
-            self._audio.setMuted(True)
+            self._apply_audio()
             self._player.play()
             self._prime_timer.start(150)
 
@@ -514,15 +677,45 @@ class TrackerTab(QWidget):
             self._rear_player.play()
             self._rear_prime_timer.start(150)
 
+    # ---------- 음량 ----------
+    def _apply_audio(self) -> None:
+        """첫 장면 준비(priming) 중이거나 음소거면 소리를 끄고, 아니면 슬라이더 음량."""
+        silent = self._mute_btn.isChecked() or self._priming
+        self._audio.setMuted(silent)
+        self._audio.setVolume(0.0 if silent else self._volume.value() / 100)
+
+    def _on_mute_toggled(self, checked: bool) -> None:
+        self._volume.blockSignals(True)
+        if checked:
+            if self._volume.value() > 0:
+                self._volume_before_mute = self._volume.value()
+            self._volume.setValue(0)
+        else:
+            self._volume.setValue(self._volume_before_mute or 50)
+        self._volume.blockSignals(False)
+        self._mute_btn.setText("음소거 해제" if checked else "음소거")
+        self._apply_audio()
+
+    def _on_volume_changed(self, value: int) -> None:
+        muted = value == 0
+        if muted != self._mute_btn.isChecked():
+            self._mute_btn.blockSignals(True)
+            self._mute_btn.setChecked(muted)
+            self._mute_btn.blockSignals(False)
+            self._mute_btn.setText("음소거 해제" if muted else "음소거")
+        if not muted:
+            self._volume_before_mute = value
+        self._apply_audio()
+
     def _finish_prime(self) -> None:
         if not self._priming:
             return
         self._player.pause()
-        self._player.setPosition(0)
+        self._player.setPosition(self._prime_target_ms)
         self._priming = False
-        self._audio.setMuted(self._mute_btn.isChecked())
+        self._apply_audio()
         self._play_btn.setText("▶")
-        self._update_info(0.0)
+        self._on_position_changed(self._prime_target_ms)
 
     def _finish_rear_prime(self) -> None:
         self._sync_rear(self._player.position())
@@ -659,10 +852,50 @@ class TrackerTab(QWidget):
             self._sync_rear(self._player.position())
 
     def _skip(self, delta_ms: int) -> None:
-        duration = self._player.duration() or self._duration_hint_ms
-        target = self._player.position() + delta_ms
-        target = max(0, min(target, duration) if duration > 0 else max(0, target))
+        total = self.total_duration_ms()
+        target = self.global_position_ms() + delta_ms
+        target = max(0, min(target, total) if total > 0 else max(0, target))
         self._on_slider_moved(target)
+
+    def _frame_ms(self) -> float:
+        rate = None
+        try:
+            rate = self._player.metaData().value(QMediaMetaData.VideoFrameRate)
+        except Exception:  # noqa: BLE001
+            rate = None
+        try:
+            rate = float(rate) if rate else None
+        except (TypeError, ValueError):
+            rate = None
+        return 1000.0 / rate if rate and 1.0 <= rate <= 240.0 else DEFAULT_FRAME_MS
+
+    def step_frame(self, direction: int) -> None:
+        """한 프레임 앞(+1)/뒤(-1). 재생 중이면 멈추고 옮긴다."""
+        self._cancel_priming()
+        if self._player.playbackState() == QMediaPlayer.PlayingState:
+            self._player.pause()
+            if self._rear_active:
+                self._rear_player.pause()
+        step = self._frame_ms()
+        target = self.global_position_ms() + int(round(direction * step))
+        self._on_slider_moved(max(0, min(target, self.total_duration_ms() or target)))
+
+    def _on_key(self, event) -> bool:
+        """영상 칸의 키보드 조작. 처리했으면 True."""
+        key = event.key()
+        if key == Qt.Key_Left:
+            self._skip(-ARROW_STEP_MS)
+        elif key == Qt.Key_Right:
+            self._skip(ARROW_STEP_MS)
+        elif key == Qt.Key_Space:
+            self._toggle_play()
+        elif key in (Qt.Key_Comma, Qt.Key_Less):
+            self.step_frame(-1)
+        elif key in (Qt.Key_Period, Qt.Key_Greater):
+            self.step_frame(1)
+        else:
+            return False
+        return True
 
     def _on_rate_changed(self, _index: int) -> None:
         rate = float(self._rate_combo.currentData())
@@ -675,12 +908,18 @@ class TrackerTab(QWidget):
         self._play_btn.setText("⏸" if state == QMediaPlayer.PlayingState else "▶")
         self._sync_rear(self._player.position())
 
-    def _on_slider_moved(self, position: int) -> None:
+    def _on_slider_moved(self, global_ms: int) -> None:
         self._cancel_priming()
+        seg, position = self._locate(global_ms)
+        if seg != self._seg and self._playlist:
+            # 다른 영상으로 넘어간다: 그 파일을 열고 위치를 옮긴다(재생 중이었으면 이어서 재생).
+            playing = self._player.playbackState() == QMediaPlayer.PlayingState
+            self._load_segment(seg, position, play=playing, prime=not playing)
+            return
         if self._player.source().isEmpty() or not self._player.isSeekable():
             self._media_label.setText("아직 탐색할 수 없습니다. 영상 로드 후 다시 시도하세요.")
             with QSignalBlocker(self._seek_slider):
-                self._seek_slider.setValue(self._player.position())
+                self._seek_slider.setValue(self.global_position_ms())
             return
         duration = self._player.duration()
         position = max(0, min(position, duration)) if duration > 0 else max(0, position)
@@ -689,22 +928,26 @@ class TrackerTab(QWidget):
         self._on_position_changed(self._player.position())
 
     def _on_duration_changed(self, duration: int) -> None:
+        """재생기가 알려 준 지금 영상의 길이. 파이프라인 값이 없을 때만 쓴다."""
         if not self._front_url.isEmpty() and self._player.source() != self._front_url:
             return  # 이전 미디어의 길이
-        if duration <= 0 and self._duration_hint_ms > 0:
-            duration = self._duration_hint_ms
+        if self._seg < len(self._durations_ms) and self._durations_ms[self._seg] <= 0 and duration > 0:
+            self._durations_ms[self._seg] = duration
+            self._recompute_offsets()
+        total = self.total_duration_ms()
         with QSignalBlocker(self._seek_slider):
-            self._seek_slider.setRange(0, max(0, duration))
-        self._time_label.setText(f"{_fmt_ms(self._player.position())} / {_fmt_ms(duration)}")
+            self._seek_slider.setRange(0, max(0, total))
+        self._time_label.setText(f"{_fmt_ms(self.global_position_ms())} / {_fmt_ms(total)}")
 
     def _on_position_changed(self, position: int) -> None:
+        """position은 재생기(지금 영상) 기준. 화면·지도는 전체 시각으로 바꿔 쓴다."""
+        now = self._global_ms(position)
         if not self._seek_slider.isSliderDown():
             with QSignalBlocker(self._seek_slider):
-                self._seek_slider.setValue(position)
-        duration = self._player.duration() or self._duration_hint_ms
-        self._time_label.setText(f"{_fmt_ms(position)} / {_fmt_ms(duration)}")
-        self._map.set_playback_time(position / 1000.0)
-        self._update_info(position / 1000.0)
+                self._seek_slider.setValue(now)
+        self._time_label.setText(f"{_fmt_ms(now)} / {_fmt_ms(self.total_duration_ms())}")
+        self._map.set_playback_time(now / 1000.0)
+        self._update_info(now / 1000.0)
         # 후방 영상이 전방과 어긋나면 맞춘다(디코더 차이로 조금씩 밀린다).
         if not self._priming:
             self._sync_rear(position)
@@ -756,7 +999,7 @@ class TrackerTab(QWidget):
         if self._priming:
             self._player.pause()
         self._priming = False
-        self._audio.setMuted(self._mute_btn.isChecked())
+        self._apply_audio()
         self._prime_pending = False
         self._rear_prime_pending = False
 
@@ -774,6 +1017,13 @@ class TrackerTab(QWidget):
         열어 둔 파일이 있으면 폴더 삭제가 실패한다."""
         self.stop()
         self._duration_hint_ms = 0
+        self._playlist = []
+        self._durations_ms = []
+        self._offsets_ms = []
+        self._seg = 0
+        self._pending_seek_ms = None
+        self._play_after_load = False
+        self._segment_label.hide()
         self._rear_track_index = 0
         self._front_url = QUrl()
         self._rear_url = QUrl()

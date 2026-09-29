@@ -15,7 +15,7 @@ from engine.engine_adapter import TrackPoint
 _BG = QColor("#0d1117")
 _LINE = QColor("#3ddc97")
 _DOT = QColor("#2f8f6c")
-_BAND_ALPHA = 95                         # 위험운전 구간 띠(색은 종류별 EVENT_COLORS)
+_BOUNDARY = QColor(255, 255, 255, 150)   # 이어보기 영상 경계선
 _AXIS = QColor("#9aa4ad")
 # 눈금선. 처음엔 알파 22로 그렸더니 검토에서 "선이 안 나온다"는 말이 나왔다 - 검은 배경 위에
 # 9% 흰색은 화면에서도 리포트 이미지에서도 사실상 보이지 않는다.
@@ -66,14 +66,17 @@ class SpeedChartWidget(QWidget):
         self.setMouseTracking(True)
         self._records: List[TrackPoint] = []
         self._events: List[DrivingEvent] = []
+        self._boundaries: List[Tuple[float, str]] = []   # 이어보기 영상 경계 (시각, 이름)
         self._accels: List[Optional[float]] = []
         # 마지막으로 화면에 그린 점들의 위치 (원본 인덱스, x, y). 마우스 위치와 맞춰 본다.
         self._screen_pts: List[Tuple[int, float, float]] = []
         self._hover: Optional[int] = None
 
-    def set_data(self, records: List[TrackPoint], events: List[DrivingEvent]) -> None:
+    def set_data(self, records: List[TrackPoint], events: List[DrivingEvent],
+                 boundaries: Optional[List[Tuple[float, str]]] = None) -> None:
         self._records = records
         self._events = events
+        self._boundaries = list(boundaries or [])
         self._accels = compute_point_accelerations(records)
         self._hover = None
         self._screen_pts = []
@@ -197,13 +200,6 @@ class SpeedChartWidget(QWidget):
         def x_for_time(t: float) -> float:
             return plot.left() + plot.width() * ((t - t0) / span_x)
 
-        def x_for_index(i: int) -> float:
-            r = self._records[i] if 0 <= i < len(self._records) else None
-            t = r.start_time_sec if r is not None else None
-            if t is None:
-                return plot.left()
-            return x_for_time(t)
-
         def y_for(v: float) -> float:
             return plot.bottom() - plot.height() * ((v - lo) / span_y)
 
@@ -232,21 +228,29 @@ class SpeedChartWidget(QWidget):
                 painter.drawLine(int(x), int(plot.top()), int(x), int(plot.bottom()))
             t += minor_step
 
-        painter.setPen(Qt.NoPen)
-        for ev in self._events:
-            band = QColor(ev.color)
-            band.setAlpha(_BAND_ALPHA)
-            painter.setBrush(band)
-            x0 = x_for_index(ev.start_index)
-            x1 = x_for_index(ev.end_index)
-            painter.drawRect(QRectF(x0, plot.top(), max(2.0, x1 - x0), plot.height()))
-
-        # drawPath는 현재 브러시로 경로 내부까지 칠한다. 위에서 위험운전 구간을 칠하려고
-        # 세워둔 브러시를 그대로 두면 속도 곡선 아래가 통째로 빨갛게 채워진다.
+        # 위험운전(급가속·급출발·급감속·급정지) 구간은 기둥으로 칠하지 않고 그 구간의 속도 선만
+        # 종류 색으로 바꾼다(검토 의견: 빨간 기둥이 그래프를 가린다).
         painter.setBrush(Qt.NoBrush)
-
+        base, colored = self._build_paths(pts, x_for_time, y_for)
         painter.setPen(QPen(_LINE, 2))
-        painter.drawPath(self._build_path(pts, x_for_time, y_for))
+        painter.drawPath(base)
+        for color, path in colored.items():
+            pen = QPen(QColor(color), 3.2)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawPath(path)
+
+        # 이어보기: 영상이 바뀌는 곳에 세로 점선과 영상 이름.
+        for t, label in self._boundaries:
+            if not (t0 - 1e-6 <= t <= t1 + 1e-6):
+                continue
+            x = x_for_time(t)
+            pen = QPen(_BOUNDARY, 1.2)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(int(x), int(plot.top()), int(x), int(plot.bottom()))
+            painter.setPen(_BOUNDARY)
+            painter.drawText(int(x) + 4, int(plot.top()) + 12, label)
 
         # 실측 지점을 점으로 남긴다. 곡선은 이 점들을 정확히 지나며 그 사이만 부드럽게
         # 이은 것이라, 점이 곧 실제 측정값이다.
@@ -302,46 +306,57 @@ class SpeedChartWidget(QWidget):
             painter.drawText(int(x + pad), int(ty), line)
             ty += fm.height() + gap
 
-    def _build_path(self, pts, x_for_time, y_for) -> QPainterPath:
-        """실측 지점들을 **정확히 지나는** 부드러운 곡선으로 잇는다.
-
-        단조 3차 보간(Fritsch-Carlson)을 쓴다. 곡선이 모든 측정점을 통과하고, 두 점
-        사이에서는 두 값의 범위를 벗어나지 않는다(오버슈트 없음) - 없는 값을 지어내지
-        않으면서 꺾임만 둥글게 만든다. 예전의 "구간 중점을 지나는 2차 베지에"는 점을
-        살짝 비켜 가서 "점과 선이 왜 다르냐"는 검토 의견이 나왔다.
-        GPS 수신이 끊긴 구간에서는 선을 끊는다(그 사이 속도를 모르므로).
-        """
-        path = QPainterPath()
-        segment: List[QPointF] = []
-        prev_index: Optional[int] = None
-
-        def flush(points: List[QPointF]) -> None:
-            if not points:
-                return
-            path.moveTo(points[0])
-            if len(points) == 1:
-                path.lineTo(points[0].x() + 0.1, points[0].y())
-                return
-            for p1, c1, c2, p2 in monotone_cubic_segments(points):
+    # 곡선: 실측 지점들을 **정확히 지나는** 단조 3차 보간(Fritsch-Carlson). 모든 측정점을 통과하고
+    # 두 점 사이에서 두 값의 범위를 벗어나지 않는다(오버슈트 없음) - 없는 값을 지어내지 않으면서
+    # 꺾임만 둥글게 만든다. 예전의 "구간 중점을 지나는 2차 베지에"는 점을 살짝 비켜 가서 "점과
+    # 선이 왜 다르냐"는 검토 의견이 나왔다.
+    def _build_paths(self, pts, x_for_time, y_for):
+        """(속도 곡선 전체, {위험운전 색: 그 구간 곡선}). 색 구간은 전체 곡선의 같은 조각을 다시 그린
+        것이라 모양이 똑같다. 조각 양 끝이 같은 위험운전 안에 있을 때만 그 색이다."""
+        base = QPainterPath()
+        colored = {}
+        for indices, qpts in self._curve_runs(pts, x_for_time, y_for):
+            base.moveTo(qpts[0])
+            if len(qpts) == 1:
+                base.lineTo(qpts[0].x() + 0.1, qpts[0].y())
+                continue
+            for k, (p1, c1, c2, p2) in enumerate(monotone_cubic_segments(qpts)):
+                if c1 is None:
+                    base.lineTo(p2)
+                else:
+                    base.cubicTo(c1, c2, p2)
+                a, b = indices[k], indices[k + 1]
+                ev = next((e for e in self._events if e.covers(a) and e.covers(b)), None)
+                if ev is None:
+                    continue
+                path = colored.setdefault(ev.color, QPainterPath())
+                path.moveTo(p1)
                 if c1 is None:
                     path.lineTo(p2)
                 else:
                     path.cubicTo(c1, c2, p2)
+        return base, colored
 
+    def _curve_runs(self, pts, x_for_time, y_for):
+        """선을 끊어 그릴 묶음들: [(원본 인덱스 목록, 화면 점 목록)]. GPS 끊김이 끼었거나(그 사이
+        속도를 모름) 이어보기에서 영상이 바뀌면 끊는다."""
+        runs = []
+        indices: List[int] = []
+        qpts: List[QPointF] = []
+        prev_index: Optional[int] = None
         for index, t, v in pts:
             if prev_index is not None:
-                gap_has_dropout = any(
-                    self._records[j].is_dropout
-                    for j in range(prev_index + 1, index)
-                )
-                if gap_has_dropout:
-                    flush(segment)
-                    segment = []
-            segment.append(QPointF(x_for_time(t), y_for(v)))
+                broken = (self._records[index].segment_index != self._records[prev_index].segment_index
+                          or any(self._records[j].is_dropout for j in range(prev_index + 1, index)))
+                if broken and qpts:
+                    runs.append((indices, qpts))
+                    indices, qpts = [], []
+            indices.append(index)
+            qpts.append(QPointF(x_for_time(t), y_for(v)))
             prev_index = index
-
-        flush(segment)
-        return path
+        if qpts:
+            runs.append((indices, qpts))
+        return runs
 
 
 def monotone_cubic_segments(points: List[QPointF]):

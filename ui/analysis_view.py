@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QGuiApplication
@@ -21,9 +21,10 @@ from PySide6.QtWidgets import (
 from core.appinfo import APP_NAME
 from core.video_tracks import view_tag
 from core.pipeline import PipelineResult
+from ui.dataset_view import COMPOSED_LABEL, DatasetView
 from ui.location_tab import LocationTab
 from ui.speed_tab import SpeedTab
-from ui.tracker_tab import TrackerTab
+from ui.tracker_tab import PlaylistItem, TrackerTab
 
 
 def _format_size(num_bytes: int) -> str:
@@ -96,7 +97,11 @@ class _HashPopup(QFrame):
 
 class _HashLabel(QLabel):
     """해시는 앞 16자만 보이고, 마우스를 올려도 아무것도 뜨지 않는다. 클릭하면 전체 값이
-    작은 상자로 뜨고(바깥 클릭으로 닫힘) 클립보드에도 복사된다."""
+    작은 상자로 뜨고(바깥 클릭으로 닫힘) 클립보드에도 복사된다.
+
+    전방·후방 같이 보기면 "전방 앞 12자… / 후방 앞 12자…"로 둘을 보인다. 이어보기(Composed)는
+    파일이 여럿이라 "N개 파일 모두 일치"처럼 요약만 보이고, 마우스를 올리면 파일별 해시 목록이
+    뜬다(클릭하면 목록 전체가 상자로 뜨고 복사된다)."""
 
     def __init__(self, parent=None):
         super().__init__("", parent)
@@ -106,8 +111,31 @@ class _HashLabel(QLabel):
         self.setCursor(Qt.PointingHandCursor)
 
     def set_hash(self, sha256: str) -> None:
-        self._full = sha256 or ""
-        self.setText(f"{self._full[:16]}…" if len(self._full) > 16 else (self._full or "-"))
+        self.set_hashes([("", sha256)] if sha256 else [])
+
+    def set_hashes(self, entries: List[Tuple[str, str]], summary: str = "") -> None:
+        """entries: (이름, 해시). summary를 주면 그 글을 보이고 목록은 툴팁으로."""
+        entries = [(label, sha) for label, sha in entries if sha]
+        if len(entries) == 1 and not summary:
+            self._full = entries[0][1]
+        else:
+            self._full = "\n".join(f"{label}: {sha}" if label else sha for label, sha in entries)
+        if summary:
+            self.setText(summary)
+            self.setToolTip(self._full)
+        elif not entries:
+            self.setText("-")
+            self.setToolTip("")
+        elif len(entries) == 1:
+            sha = entries[0][1]
+            self.setText(f"{sha[:16]}…" if len(sha) > 16 else sha)
+            self.setToolTip("")
+        else:
+            self.setText(" / ".join(f"{sha[:12]}…" for _label, sha in entries))
+            self.setToolTip("")
+
+    def full_text(self) -> str:
+        return self._full
 
     def mousePressEvent(self, event):  # noqa: N802
         if self._full:
@@ -116,6 +144,18 @@ class _HashLabel(QLabel):
                 self._popup = _HashPopup(self.window())
             self._popup.show_for(self, self._full)
         super().mousePressEvent(event)
+
+
+def dataset_views(result: PipelineResult) -> List[DatasetView]:
+    """Speed/Location 탭의 묶음. 이어보기면 Composed + 영상별, 아니면 하나."""
+    if not result.is_sequence:
+        return [DatasetView(COMPOSED_LABEL, result.points, result.driving_events)]
+    segs = result.segments
+    labels = [seg.label for seg in segs]
+    composed = DatasetView(COMPOSED_LABEL, result.points, result.driving_events,
+                           boundaries=[(seg.offset_sec, seg.label) for seg in segs[1:]],
+                           segment_labels=labels)
+    return [composed] + [DatasetView(seg.label, seg.points, seg.driving_events) for seg in segs]
 
 
 class AnalysisView(QWidget):
@@ -194,6 +234,12 @@ class AnalysisView(QWidget):
         self._location_tab = LocationTab()
         for tab in (self._tracker_tab, self._location_tab):
             tab.map_view().online_map_failed.connect(self.online_map_failed)
+        # Speed/Location에서 Composed ↔ video1… 을 바꾸면 파일 정보 줄도 그 영상으로 바꾼다.
+        self._speed_tab.view_changed.connect(lambda _i: self._refresh_header())
+        self._location_tab.view_changed.connect(lambda _i: self._refresh_header())
+        self._file_views: List[Dict] = []
+        self._integrity_results: Dict[str, Tuple[str, str]] = {}
+        self._integrity_queue: List[Tuple[str, str]] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -211,50 +257,152 @@ class AnalysisView(QWidget):
         self._result = result
         self._case_label.setText(f"Case Number : {case_number}")
         extraction = result.extraction
+        prefix = f"이어보기 {len(result.segments)}개 영상 · " if result.is_sequence else ""
         self._analysis_status.setText(
-            f"분석 상태: {extraction.status} · 경고 {len(extraction.warnings)}건 · "
+            f"{prefix}분석 상태: {extraction.status} · 경고 {len(extraction.warnings)}건 · "
             f"AVI 복구 {'적용' if extraction.avi_repaired else '없음'} · "
             f"슬랙 별도 좌표 {len(extraction.slack_points)}건")
         self._analysis_status.setToolTip(extraction.status_message + "\n" + "\n".join(extraction.warnings))
 
-        video_path = result.source_copy_path or result.extraction.used_input_path
-        filename = os.path.basename(video_path) if video_path else "-"
-        size_bytes = os.path.getsize(video_path) if video_path and os.path.isfile(video_path) else 0
-
-        container = (result.extraction.routing.container or "").upper()
-        self._file_badge.setText(container or "-")
-        tag = view_tag(result.track_mode, bool(result.rear_copy_path))
-        self._file_name_label.setText(f"{filename} - {tag}" if tag else filename)
-        self._file_name_label.setToolTip(
-            (video_path or "") + ({"F": "\n전방만 보기", "B": "\n후방만 보기", "F, B": "\n전방·후방 같이 보기"}.get(tag, "")))
-        self._file_size_label.setText(_format_size(size_bytes))
-        self._duration_label.setText(_format_duration(result.duration_sec))
-        self._hash_label.set_hash(result.sha256)
-
-        self._start_integrity_check(result)
+        self._file_views = self._build_file_views(result)
+        self._start_integrity_checks([f for view in self._file_views[:1] for f in view["files"]]
+                                     if not result.is_sequence else
+                                     [f for view in self._file_views[1:] for f in view["files"]])
 
         self._tabs.clear()
         if settings.get("tracker", True):
             self._tabs.addTab(self._tracker_tab, "Tracker")
             self._tracker_tab.stop()
-            self._tracker_tab.set_duration_hint(result.duration_sec)
-            if video_path and os.path.isfile(video_path):
-                rear = result.rear_copy_path if result.rear_copy_path and os.path.isfile(result.rear_copy_path) else ""
-                self._tracker_tab.load_video(video_path, rear, track_mode=result.track_mode)
+            if result.is_sequence:
+                # 이어보기: 영상을 차례로 튼다. 한 영상이 끝나면 다음 영상이 이어서 재생된다.
+                self._tracker_tab.load_playlist([
+                    PlaylistItem(path=seg.primary_copy_path,
+                                 rear_path=seg.rear_copy_path if seg.front_copy_path else "",
+                                 track_mode=seg.track_mode, duration_sec=seg.duration_sec,
+                                 label=seg.label, primary_is_rear=seg.primary_is_rear)
+                    for seg in result.segments])
             else:
-                self._tracker_tab._on_media_error("사건 영상 파일이 없습니다. 사본 경로를 확인하세요.")
+                video_path = result.source_copy_path or result.extraction.used_input_path
+                self._tracker_tab.set_duration_hint(result.duration_sec)
+                if video_path and os.path.isfile(video_path):
+                    rear = result.rear_copy_path if result.rear_copy_path and os.path.isfile(result.rear_copy_path) else ""
+                    self._tracker_tab.load_video(video_path, rear, track_mode=result.track_mode)
+                else:
+                    self._tracker_tab._on_media_error("사건 영상 파일이 없습니다. 사본 경로를 확인하세요.")
             self._tracker_tab.load_track(result.extraction.points, result.driving_events)
         else:
             self._tracker_tab.stop()
+        views = dataset_views(result)
         if settings.get("speed", True):
             self._tabs.addTab(self._speed_tab, "Speed Analysis")
-            self._speed_tab.load(result.extraction.points, result.driving_events,
-                                 result.vehicle_type)
+            self._speed_tab.load_views(views, result.vehicle_type)
         if settings.get("location", True):
             self._tabs.addTab(self._location_tab, "Location Analysis")
-            self._location_tab.load(result.extraction.points, result.driving_events)
+            self._location_tab.load_views(views)
 
         self._on_tab_changed(self._tabs.currentIndex())
+
+    # ---------- 파일 정보 줄 ----------
+    def _build_file_views(self, result: PipelineResult) -> List[Dict]:
+        """파일 정보 줄에 보일 내용. [0]은 사건 전체(이어보기면 Composed), [1:]은 영상별."""
+        container = (result.extraction.routing.container or "").upper() or "-"
+
+        def size_of(*paths: str) -> int:
+            return sum(os.path.getsize(p) for p in paths if p and os.path.isfile(p))
+
+        if not result.is_sequence:
+            video_path = result.source_copy_path or result.extraction.used_input_path
+            filename = os.path.basename(video_path) if video_path else "-"
+            tag = view_tag(result.track_mode, bool(result.rear_copy_path))
+            files = [("전방" if result.rear_copy_path else "", video_path, result.sha256)]
+            if result.rear_copy_path:
+                files.append(("후방", result.rear_copy_path, result.rear_sha256))
+            tip = (video_path or "") + ({"F": "\n전방만 보기", "B": "\n후방만 보기",
+                                          "F, B": "\n전방·후방 같이 보기"}.get(tag, ""))
+            if result.rear_copy_path:
+                tip += f"\n후방: {result.rear_copy_path}"
+            sizes = [size_of(video_path)] + ([size_of(result.rear_copy_path)] if result.rear_copy_path else [])
+            return [{"badge": container, "name": f"{filename} - {tag}" if tag else filename, "tip": tip,
+                     "size": " / ".join(_format_size(x) for x in sizes),
+                     "duration": _format_duration(result.duration_sec), "files": files, "summary": False}]
+
+        segs = result.segments
+        views: List[Dict] = []
+        all_files = []
+        per_segment = []
+        for seg in segs:
+            files = []
+            if seg.front_copy_path:
+                files.append((f"{seg.label} 전방", seg.front_copy_path, seg.front_sha256))
+            if seg.rear_copy_path:
+                files.append((f"{seg.label} 후방", seg.rear_copy_path, seg.rear_sha256))
+            all_files += files
+            names = " + ".join(os.path.basename(p) for _l, p, _s in files)
+            per_segment.append({
+                "badge": container, "name": f"{seg.label} · {names}",
+                "tip": "\n".join(p for _l, p, _s in files),
+                "size": " / ".join(_format_size(size_of(p)) for _l, p, _s in files),
+                "duration": _format_duration(seg.duration_sec),
+                "files": [(label.split(" ", 1)[1] if len(files) > 1 else "", p, sha)
+                          for label, p, sha in files],
+                "summary": False})
+        any_rear = any(seg.rear_copy_path or seg.track_mode for seg in segs)
+        first = os.path.basename(segs[0].primary_copy_path)
+        last = os.path.basename(segs[-1].primary_copy_path)
+        views.append({
+            "badge": container,
+            "name": f"{first} ~ {last} · 이어보기 {len(segs)}개" + (" - F, B" if any_rear else ""),
+            "tip": "\n".join(f"{v['name']}" for v in per_segment),
+            "size": _format_size(size_of(*[p for _l, p, _s in all_files])),
+            "duration": _format_duration(result.duration_sec),
+            "files": all_files, "summary": True})
+        return views + per_segment
+
+    def _current_file_view(self) -> int:
+        widget = self._tabs.currentWidget()
+        current = getattr(widget, "current_view", None)
+        return current() if callable(current) and widget is not self._tracker_tab else 0
+
+    def _refresh_header(self) -> None:
+        views = getattr(self, "_file_views", None)
+        if not views:
+            return
+        index = self._current_file_view()
+        view = views[index] if 0 <= index < len(views) else views[0]
+        self._file_badge.setText(view["badge"])
+        self._file_name_label.setText(view["name"])
+        self._file_name_label.setToolTip(view["tip"])
+        self._file_size_label.setText(view["size"])
+        self._duration_label.setText(view["duration"])
+        state, detail = self._integrity_of(view["files"])
+        entries = [(label, sha) for label, _p, sha in view["files"]]
+        if view["summary"]:
+            n = len(entries)
+            summary = {"ok": f"{n}개 파일 모두 일치", "bad": f"{n}개 중 불일치 있음!",
+                       "pending": f"{n}개 파일 확인 중…"}.get(state, f"{n}개 파일")
+            self._hash_label.set_hashes(entries, summary)
+        else:
+            self._hash_label.set_hashes(entries)
+        self._set_integrity(state, detail)
+
+    # ---------- 무결성 표시등 ----------
+    def _integrity_of(self, files) -> Tuple[str, str]:
+        """보이는 파일들의 대조 결과를 하나로: 하나라도 불일치면 bad, 확인 중이면 pending."""
+        results = getattr(self, "_integrity_results", {})
+        states = [results.get(path, ("pending", "")) for _label, path, _sha in files]
+        details = [f"{label or os.path.basename(path)}: {d}" if d else ""
+                   for (label, path, _sha), (_st, d) in zip(files, states)]
+        detail = "\n".join(d for d in details if d)
+        kinds = [st for st, _d in states]
+        if not kinds:
+            return "none", ""
+        if "bad" in kinds:
+            return "bad", detail
+        if "pending" in kinds:
+            return "pending", detail
+        if all(k == "ok" for k in kinds):
+            return "ok", detail
+        return "none", detail
 
     def release_media(self) -> None:
         """보고 있던 사건이 삭제될 때 영상 파일 잠금을 푼다."""
@@ -284,44 +432,53 @@ class AnalysisView(QWidget):
     def integrity_state(self) -> str:
         return getattr(self, "_integrity_state", "pending")
 
-    def _start_integrity_check(self, result: PipelineResult) -> None:
-        from ui.workers import HashWorker  # 순환 import 회피
-
+    def _start_integrity_checks(self, files) -> None:
+        """사본을 하나씩 다시 읽어 분석 때 기록한 원본 해시와 비교한다(전방·후방·이어보기 영상 모두)."""
         if self._integrity_worker is not None:
             self._integrity_worker.cancel()
             self._integrity_worker = None
-        copy_path = result.source_copy_path
-        if not result.sha256 or not copy_path or not os.path.isfile(copy_path):
-            self._set_integrity("none", copy_path or "")
-            return
-        self._set_integrity("pending", "")
-        expected = result.sha256
-        worker = HashWorker(copy_path, self)
+        self._integrity_results: Dict[str, Tuple[str, str]] = {}
+        queue = []
+        for _label, path, expected in files:
+            if not expected or not path or not os.path.isfile(path):
+                self._integrity_results[path] = ("none", "사본 파일 또는 기록된 해시가 없음")
+            else:
+                queue.append((path, expected))
+        self._integrity_queue = queue
+        self._run_next_integrity()
 
-        def on_done(sha: str, w=worker) -> None:
+    def _run_next_integrity(self) -> None:
+        from ui.workers import HashWorker  # 순환 import 회피
+
+        self._refresh_header()
+        if not self._integrity_queue:
+            return
+        path, expected = self._integrity_queue.pop(0)
+        worker = HashWorker(path, self)
+
+        def finish(state: str, detail: str, w=worker) -> None:
             if w is not self._integrity_worker:
                 return  # 새 사건이 열려 이미 다른 검사가 시작됨
             self._integrity_worker = None
             w.deleteLater()
-            if not sha:
-                self._set_integrity("none", "해시 계산이 취소됨")
-            elif sha == expected:
-                self._set_integrity("ok", f"SHA-256 {sha[:16]}…")
-            else:
-                self._set_integrity("bad", f"원본 {expected[:16]}… / 사본 {sha[:16]}…")
+            self._integrity_results[path] = (state, detail)
+            self._run_next_integrity()
 
-        def on_failed(message: str, w=worker) -> None:
-            if w is self._integrity_worker:
-                self._integrity_worker = None
-                w.deleteLater()
-                self._set_integrity("none", message)
+        def on_done(sha: str) -> None:
+            if not sha:
+                finish("none", "해시 계산이 취소됨")
+            elif sha == expected:
+                finish("ok", f"SHA-256 {sha[:16]}…")
+            else:
+                finish("bad", f"원본 {expected[:16]}… / 사본 {sha[:16]}…")
 
         worker.finished_hash.connect(on_done)
-        worker.failed.connect(on_failed)
+        worker.failed.connect(lambda message: finish("none", message))
         self._integrity_worker = worker
         worker.start()
 
     def _on_tab_changed(self, _index: int) -> None:
+        self._refresh_header()
         widget = self._tabs.currentWidget()
         loader = getattr(widget, "ensure_map_loaded", None)
         if callable(loader):

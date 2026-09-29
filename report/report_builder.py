@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import html
 import os
-from datetime import datetime, timezone
 from core.acceleration import _distinct_fix_indices
 from typing import List, Optional
 
@@ -11,7 +10,9 @@ from PySide6.QtCore import QMarginsF, QObject, QUrl
 from PySide6.QtGui import QPageLayout, QPageSize
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
+from core import gpstime
 from core.driving_events import DrivingEvent, criteria_lines, events_by_row, summarize_counts, vehicle_label
+from core.location_table import COL_EVENT, COL_G, COL_LAT, COL_LON, COL_SPEED, COL_TIME, row_texts
 from core.pipeline import PipelineResult
 from engine.engine_adapter import TrackPoint
 
@@ -69,42 +70,29 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     row_indices = _select_row_indices(records, events)
     row_events = events_by_row(events, len(records))
 
+    sequence = pipeline_result.is_sequence
+    seg_labels = [seg.label for seg in pipeline_result.segments]
     rows_html = []
     for idx in row_indices:
         rec = records[idx]
         here = row_events[idx]
         row_class = "outlier" if rec.is_outlier else ""
-        # 위험운전 행은 종류 색을 옅게 깐다(화면 Location 표와 같은 색).
+        # 위험운전 행은 종류 색을 옅게 깐다(화면 Location 표와 같은 색). 칸 글자도 화면 표와 같다.
         row_style = f' style="background: {here[0].color}33"' if here else ""
-        event_text = ", ".join(ev.label for ev in here)
-        time_text = f"{rec.start_time_sec:.2f}" if rec.start_time_sec is not None else "-"
-        speed_text = f"{rec.speed_kmh:.1f}" if rec.speed_kmh is not None else "-"
-        g_value = rec.g_magnitude
-        g_text = f"{g_value:.2f}" if g_value is not None else "-"
-        if rec.is_outlier:
-            lat_text = lon_text = "(이상치)"
-            speed_text = "(이상치)"
-        elif rec.gps_checksum_ok is False or rec.gps_trusted is False:
-            lat_text = lon_text = speed_text = "(검증 실패)"
-        elif rec.has_fix:
-            lat_text, lon_text = f"{rec.latitude:.6f}", f"{rec.longitude:.6f}"
-        elif rec.is_dropout:
-            lat_text = lon_text = "(GPS 끊김)"
-        else:
-            lat_text = lon_text = "(GPS 없음)"
+        cells = row_texts(rec, here)
+        seg_cell = ""
+        if sequence:
+            seg_label = seg_labels[rec.segment_index] if 0 <= rec.segment_index < len(seg_labels) else ""
+            seg_cell = f"<td>{_esc(seg_label)}</td>"
         rows_html.append(
             f'<tr class="{row_class}"{row_style}>'
-            f"<td>{idx + 1}</td>"
-            f"<td>{_esc(time_text)}</td>"
-            f"<td>{_esc(lat_text)}</td>"
-            f"<td>{_esc(lon_text)}</td>"
-            f"<td>{_esc(speed_text)}</td>"
-            f"<td>{_esc(event_text)}</td>"
-            f"<td>{_esc(g_text)}</td>"
-            "</tr>"
+            f"<td>{idx + 1}</td>{seg_cell}"
+            + "".join(f"<td>{_esc(cells[c])}</td>"
+                      for c in (COL_TIME, COL_LAT, COL_LON, COL_SPEED, COL_EVENT, COL_G))
+            + "</tr>"
         )
 
-    body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="7">추출된 좌표가 없습니다.</td></tr>'
+    body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="{8 if sequence else 7}">추출된 좌표가 없습니다.</td></tr>'
     extraction = pipeline_result.extraction
     routing = extraction.routing
     video_filename = os.path.basename(pipeline_result.source_copy_path or "")
@@ -115,7 +103,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     # 살려 그리면 타일 로딩 타이밍에 따라 결과가 달라져, 증거 문서로 쓰기 어렵다.
     visuals_html = (
         _image_section("속도 분석", chart_png,
-                        "색 띠는 급가속(빨강)·급출발(분홍)·급감속(주황)·급정지(보라) 구간입니다. "
+                        "속도 선의 색이 바뀐 곳은 급가속(빨강)·급출발(분홍)·급감속(주황)·급정지(보라) 구간입니다. "
+                        + ("세로 점선은 이어 붙인 영상의 경계입니다. " if pipeline_result.is_sequence else "") +
                         "점은 실제 GPS 측정값이고 선은 점을 지나는 보간선입니다.")
         + _image_section("이동 경로", map_png,
                           "초록 실선은 주행 경로, 색 선과 이름표는 위험운전 행동(범례 참고), "
@@ -128,7 +117,30 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     unknown_checks = len(records) - failed_checks - ok_checks
     speeds = [records[i].speed_kmh for i in _distinct_fix_indices(records)]
     speed_summary = f"평균 {sum(speeds)/len(speeds):.1f} / 최고 {max(speeds):.1f} km/h" if speeds else "-"
-    generated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # 일시는 한국 시간(UTC+9)으로 적는다. 분석 일시는 사건을 만든(엔진으로 추출한) 시각이다.
+    generated = gpstime.now_display()
+    analyzed = gpstime.format_local_iso(pipeline_result.analyzed_at) if pipeline_result.analyzed_at else "-"
+    if sequence:
+        file_rows = []
+        for seg in pipeline_result.segments:
+            for role, path, sha in (("전방", seg.front_copy_path, seg.front_sha256),
+                                    ("후방", seg.rear_copy_path, seg.rear_sha256)):
+                if path:
+                    file_rows.append(
+                        f"<tr><td>{_esc(seg.label)}</td><td>{role}</td><td>{_esc(os.path.basename(path))}</td>"
+                        f"<td>{_esc(_fmt_duration(seg.duration_sec))}</td><td>{_esc(sha)}</td></tr>")
+        files_html = (
+            f'<div class="kv"><b>원본 파일</b>연속 영상 이어보기 {len(pipeline_result.segments)}개 '
+            "(파일마다 원본·사본 SHA-256 대조, 이어 붙인 영상 파일은 만들지 않음)</div>\n"
+            '  <table class="files"><thead><tr><th>영상</th><th>구분</th><th>파일</th><th>길이</th>'
+            "<th>SHA-256</th></tr></thead><tbody>" + "".join(file_rows) + "</tbody></table>")
+    else:
+        files_html = (f'<div class="kv"><b>원본 파일</b>{_esc(video_filename)}</div>\n'
+                      f'  <div class="kv"><b>SHA-256</b>{_esc(pipeline_result.sha256)}</div>')
+        if pipeline_result.rear_copy_path:
+            files_html += (
+                f'\n  <div class="kv"><b>후방 파일</b>{_esc(os.path.basename(pipeline_result.rear_copy_path))}</div>'
+                f'\n  <div class="kv"><b>후방 SHA-256</b>{_esc(pipeline_result.rear_sha256 or "-")}</div>')
     vehicle_type = pipeline_result.vehicle_type
     criteria_html = "".join(f"<li>{_esc(line)}</li>" for line in criteria_lines(vehicle_type)[1:])
     event_rows = "".join(
@@ -154,6 +166,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
   th, td {{ border: 1px solid #ccc; padding: 4px 6px; text-align: left; }}
   th {{ background: #f2f2f2; }}
+  table.files {{ margin: 4px 0 6px; }}
+  table.files td {{ word-break: break-all; }}
   ul.criteria {{ font-size: 11px; color: #333; margin: 4px 0 6px; padding-left: 18px; }}
   tr.outlier td {{ color: #b36b00; }}
   tr.gap td {{ text-align: center; color: #999; border: none; }}
@@ -165,8 +179,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>사건번호</b>{_esc(case_number)}</div>
   <div class="kv"><b>담당자</b>{_esc(examiner)}</div>
   <div class="kv"><b>메모</b>{_esc(memo)}</div>
-  <div class="kv"><b>원본 파일</b>{_esc(video_filename)}</div>
-  <div class="kv"><b>SHA-256</b>{_esc(pipeline_result.sha256)}</div>
+  {files_html}
   <div class="kv"><b>재생시간</b>{_esc(_fmt_duration(pipeline_result.duration_sec))}</div>
   <div class="kv"><b>탐지 컨테이너</b>{_esc(routing.container.upper())}</div>
   <div class="kv"><b>시간축 근거</b>{_esc(extraction.time_source or "-")}</div>
@@ -182,7 +195,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <p>검증 실패·이상치·비유한 수치는 지도·속도 계산에서 제외합니다. 미제공은 검증 성공을 뜻하지 않습니다.</p>
   <div class="kv"><b>속도 통계</b>{speed_summary} (유효 GPS 측정 산술평균, 반복 기록 제외)</div>
   <div class="kv"><b>슬랙 별도 좌표</b>{len(extraction.slack_points)}개 (현재 영상 궤적에 합치지 않음)</div>
-  <div class="kv"><b>보고서 생성(UTC)</b>{generated}</div>
+  <div class="kv"><b>분석(추출) 일시</b>{_esc(analyzed)}</div>
+  <div class="kv"><b>보고서 생성 일시</b>{_esc(generated)}</div>
   <h2>분석 경고 ({len(extraction.warnings)}건)</h2><ul>{warning_html}</ul>
   <h2>위험운전 행동 ({_esc(vehicle_label(vehicle_type))} 기준, {len(events)}건)</h2>
   <ul class="criteria">{criteria_html}</ul>
@@ -195,7 +209,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 위험운전 구간 우선, 나머지 전체 구간 균등 표본)</h2>
   <p>전체 원자료 CSV: {_esc(extraction.primary_source_file or "없음")}</p>
   <table>
-    <thead><tr><th>#</th><th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th><th>위험운전</th><th>충격(g)</th></tr></thead>
+    <thead><tr><th>#</th>{"<th>영상</th>" if sequence else ""}<th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th><th>위험운전</th><th>충격(g)</th></tr></thead>
     <tbody>{body_rows}</tbody>
   </table>
 </body></html>

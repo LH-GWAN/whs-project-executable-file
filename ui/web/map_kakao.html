@@ -107,6 +107,7 @@ let fitting = false;
 // 따라가기 상자: 화면의 80% (가장자리에서 10%씩 안쪽)
 const FOLLOW_MARGIN = 0.10;
 let startOverlay = null, endOverlay = null, posOverlay = null;
+let segEndOverlays = [];
 
 function setStatus(text) {
   document.getElementById("status").textContent = text;
@@ -271,6 +272,11 @@ function buildRuns(points) {
       if (p.d) sawDropout = true;
       continue;
     }
+    if (prev !== null && (p.s || 0) !== (points[prev].s || 0)) {
+      // 이어보기: 영상이 바뀌는 곳은 잇지 않는다(앞 영상 끝의 검은 점에서 다음 영상이 시작한다).
+      current = null;
+      prev = null;
+    }
     if (prev !== null) {
       let kind;
       // 두 끝점이 같은 위험운전 색일 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
@@ -363,6 +369,15 @@ function renderTrack(payload) {
     startOverlay.setMap(map);
     endOverlay.setPosition(latLng(fixes[fixes.length - 1]));
     endOverlay.setMap(map);
+    // 이어보기: 영상마다 끝나는 곳에 검은 점(마지막 영상의 끝점은 위에서 찍었다).
+    segEndOverlays.forEach((o) => o.setMap(null));
+    segEndOverlays = [];
+    (payload.segEnds || []).slice(0, -1).forEach(([lat, lon]) => {
+      const o = makeDot("trk-end");
+      o.setPosition(new kakao.maps.LatLng(lat, lon));
+      o.setMap(map);
+      segEndOverlays.push(o);
+    });
     fitToTrack(payload);
     // 리포트 기준 지도: 화면을 맞춘 직후 타일까지 다 그려지면 Python이 캡처한다.
     window.__trackDrawn = (window.__trackDrawn || 0) + 1;

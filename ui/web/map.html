@@ -181,6 +181,10 @@ function buildFeatures(points) {
       if (p.d) sawDropout = true;
       continue;
     }
+    if (prev !== null && (p.s || 0) !== (points[prev].s || 0)) {
+      // 이어보기: 영상이 바뀌는 곳은 잇지 않는다(앞 영상 끝의 검은 점에서 다음 영상이 시작한다).
+      prev = null;
+    }
     if (prev !== null) {
       const seg = [[points[prev].lon, points[prev].lat], [p.lon, p.lat]];
       // 두 끝점이 같은 위험운전 색일 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
@@ -258,6 +262,11 @@ function renderTrack(payload) {
       geometry: { type: "Point", coordinates: [fixes[0].lon, fixes[0].lat] } });
     ends.features.push({ type: "Feature", properties: { kind: "end" },
       geometry: { type: "Point", coordinates: [fixes[fixes.length - 1].lon, fixes[fixes.length - 1].lat] } });
+    // 이어보기: 영상마다 끝나는 곳에 검은 점.
+    (payload.segEnds || []).slice(0, -1).forEach(([lat, lon]) => {
+      ends.features.push({ type: "Feature", properties: { kind: "end" },
+        geometry: { type: "Point", coordinates: [lon, lat] } });
+    });
   }
   setData("trk-ends", ends);
   setData("trk-pos", { type: "FeatureCollection", features: [] });

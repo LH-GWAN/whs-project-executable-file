@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
 
 from core.appinfo import APP_NAME
 from core.video_pairs import PairCheck, find_rear_sibling
+from core.video_sequence import (SequencePlan, check_pair_probes, probe_and_plan, probe_single,
+                                 slot_start_text)
 from core.video_tracks import TRACK_MODE_BOTH, TRACK_MODE_FRONT, TRACK_MODE_REAR, has_dual_video_tracks, view_tag
 from ui.pair_check_worker import PairCheckWorker
 from storage.history_store import CaseRecord
@@ -32,6 +34,7 @@ VIDEO_FILTER = "블랙박스 영상 (*.mp4 *.avi);;모든 파일 (*)"
 
 class HomeView(QWidget):
     video_selected = Signal(str, str, str)   # (전방 영상, 후방 영상 또는 "", 2트랙 보기 방식 또는 "")
+    sequence_selected = Signal(list)         # 연속 영상 이어보기: core/video_sequence.SequenceItem 목록(순서대로)
     history_item_opened = Signal(int)
     history_edit_requested = Signal(int)
     # 삭제는 확인 창과 실제 삭제를 MainWindow가 맡는다(사건 폴더·DB 경로를 아는 곳).
@@ -61,8 +64,15 @@ class HomeView(QWidget):
             "…_F / …_R 처럼 짝이 되는 파일이 있으면 자동으로 골라 둡니다.\n"
             "GPS 분석은 전방 영상으로 하고, 후방은 Tracker에서 나란히 재생만 합니다.\n"
             "파일 하나에 전방·후방 트랙이 같이 든 영상은 이 옵션과 무관하게 둘 다 보입니다.")
+        # 연속 영상 이어보기: 블랙박스가 1분씩 나눠 쓴 파일 여러 개를 골라 한 사건으로 잇는다.
+        self._seq_cb = QCheckBox("연속 영상 이어보기 (여러 파일을 골라 이어서 봅니다)")
+        self._seq_cb.setToolTip(
+            "블랙박스가 1분 단위로 나눠 저장한 영상 여러 개를 한 번에 고릅니다. 녹화 시각순으로\n"
+            "자동 정렬하고, 끊김 없이 이어진 녹화인지(기기·형식·시각·위치) 검사한 뒤 분석합니다.\n"
+            "전방/후방 같이 보기와 함께 켜면 전방 영상들 → 후방 영상들 순으로 고르고 자동으로 짝짓습니다.")
         upload_layout.addStretch(1)
         upload_layout.addWidget(self._dual_cb, 0, Qt.AlignHCenter)
+        upload_layout.addWidget(self._seq_cb, 0, Qt.AlignHCenter)
         upload_layout.addWidget(upload_btn)
         upload_layout.addStretch(1)
 
@@ -123,9 +133,15 @@ class HomeView(QWidget):
         self._settings_slot.addWidget(make_settings_button(menu, self))
 
     def _on_upload_clicked(self) -> None:
+        if self._seq_cb.isChecked():
+            self._upload_sequence()
+            return
         path, _ = QFileDialog.getOpenFileName(self, "블랙박스 영상 선택 (전방)", "", VIDEO_FILTER)
         if not path:
             return
+        self._start_single(path)
+
+    def _start_single(self, path: str) -> None:
         track_mode = ""
         if has_dual_video_tracks(path):
             # 전·후방이 한 파일에 든 영상: 어떻게 볼지 묻는다. 따로 고른 후방 파일은 받지 않는다
@@ -138,12 +154,17 @@ class HomeView(QWidget):
             rear = self._pick_rear(path) if self._dual_cb.isChecked() else ""
         self.video_selected.emit(path, rear, track_mode)
 
-    def _ask_dual_track_mode(self, path: str) -> Optional[str]:
-        """전·후방 트랙이 한 파일에 든 영상을 어떻게 볼지. both/front/rear, 취소면 None."""
+    def _ask_dual_track_mode(self, path: str, count: int = 1) -> Optional[str]:
+        """전·후방 트랙이 한 파일에 든 영상을 어떻게 볼지. both/front/rear, 취소면 None.
+        이어보기에서 그런 파일이 여러 개면(count) 한 번만 묻고 모두에 적용한다."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("전방/후방 영상이 붙어 있는 영상")
-        box.setText("해당 영상은 전방/후방 영상이 붙어 있는 영상입니다.\n전방/후방 영상을 동시에 보여드릴까요?")
+        if count > 1:
+            box.setText(f"선택한 영상 중 {count}개는 전방/후방 영상이 붙어 있는 영상입니다.\n"
+                        "전방/후방 영상을 동시에 보여드릴까요? (모두 같은 방식으로 봅니다)")
+        else:
+            box.setText("해당 영상은 전방/후방 영상이 붙어 있는 영상입니다.\n전방/후방 영상을 동시에 보여드릴까요?")
         box.setInformativeText(
             f"{os.path.basename(path)}\n\n같이 보기를 고르면 Tracker에서 왼쪽 전방·오른쪽 후방으로 재생하고, "
             "전방만/후방만을 고르면 그 영상 하나만 보여 줍니다. GPS 분석은 어느 쪽을 골라도 같습니다. "
@@ -246,6 +267,186 @@ class HomeView(QWidget):
         box.exec()
         return box.clickedButton() is repick
 
+    # ---------- 연속 영상 이어보기 ----------
+    def _run_task(self, title: str, first_text: str, fn):
+        """fn(cancel_event, progress)을 워커에서 돌리고 진행 창을 띄운다. (결과, 오류). 취소면 (None, "")."""
+        from ui.workers import TaskWorker
+
+        dialog = QProgressDialog(first_text, "취소", 0, 0, self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        worker = TaskWorker(fn, self)
+        result = {"value": None, "error": "", "done": False}
+
+        def on_done(value) -> None:
+            result["value"], result["done"] = value, True
+            dialog.close()
+
+        def on_failed(message: str) -> None:
+            result["error"], result["done"] = message, True
+            dialog.close()
+
+        def on_cancel() -> None:
+            if not result["done"]:
+                worker.cancel()
+                dialog.setLabelText("취소하는 중...")
+
+        worker.status.connect(dialog.setLabelText)
+        worker.finished_task.connect(on_done)
+        worker.failed.connect(on_failed)
+        dialog.canceled.connect(on_cancel)
+        worker.start()
+        dialog.exec()
+        if not result["done"]:
+            worker.cancel()
+        worker.wait()
+        worker.deleteLater()
+        if worker.is_cancelled() and not result["error"]:
+            return None, ""
+        return result["value"], result["error"]
+
+    def _upload_sequence(self) -> None:
+        dual = self._dual_cb.isChecked()
+        fronts, _ = QFileDialog.getOpenFileNames(
+            self, "전방 영상들을 선택해 주세요 (여러 개)" if dual else "이어볼 영상들을 선택해 주세요 (여러 개)",
+            "", VIDEO_FILTER)
+        if not fronts:
+            return
+        if len(fronts) == 1:
+            QMessageBox.information(self, "연속 영상 이어보기",
+                                    "영상을 하나만 골라 이어보기 없이 이 영상만 분석합니다.")
+            self._start_single(fronts[0])
+            return
+        dual_track = [f for f in fronts if has_dual_video_tracks(f)]
+        track_mode = ""
+        if dual_track:
+            track_mode = self._ask_dual_track_mode(dual_track[0], len(dual_track)) or ""
+            if not track_mode:
+                return
+        rears: List[str] = []
+        if dual and not (len(dual_track) == len(fronts) and track_mode == TRACK_MODE_BOTH):
+            rears, _ = QFileDialog.getOpenFileNames(
+                self, "후방 영상들을 선택해 주세요 (여러 개, 취소하면 전방만 이어봅니다)",
+                os.path.dirname(fronts[0]), VIDEO_FILTER)
+
+        plan, error = self._run_task(
+            "연속 영상 검사", "영상을 검사하는 중...",
+            lambda cancel, progress: probe_and_plan(fronts, rears, cancel, progress))
+        if error:
+            QMessageBox.critical(self, "연속 영상 검사", f"영상을 검사하다 오류가 났습니다:\n{error}")
+            return
+        if plan is None or plan.cancelled:
+            return
+        if not plan.ok:
+            if self._show_sequence_problems(plan):
+                self._upload_sequence()   # 다시 고르기
+            return
+        if rears and not self._fill_missing_pairs(plan):
+            return
+        items = plan.items()
+        for item in items:
+            item.track_mode = track_mode if item.primary in dual_track else ""
+        if not self._confirm_sequence(plan):
+            return
+        self.sequence_selected.emit(items)
+
+    def _slot_lines(self, plan: SequencePlan) -> List[str]:
+        lines = []
+        for n, slot in enumerate(plan.slots, start=1):
+            names = " + ".join(x.name for x in (slot.front, slot.rear) if x is not None)
+            only = "  (후방만)" if slot.front is None else ""
+            start = slot_start_text(slot, plan.basis) if plan.basis else ""
+            dur = slot.primary.duration
+            length = f", {int(dur // 60)}분 {int(round(dur % 60)):02d}초" if dur else ""
+            lines.append(f"{n}. {names}{only}" + (f"  - {start} 시작{length}" if start else ""))
+        return lines
+
+    def _show_sequence_problems(self, plan: SequencePlan) -> bool:
+        """이어볼 수 없는 이유를 알리고 막는다. [다시 고르기]면 True."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("이어볼 수 없는 영상")
+        box.setText("선택한 영상들은 끊김 없이 이어진 녹화로 볼 수 없어 이어보기를 할 수 없습니다.")
+        detail = [f"• {p}" for p in plan.problems]
+        if plan.slots:
+            detail = ["[시각순 정렬]"] + self._slot_lines(plan) + [""] + detail
+        box.setInformativeText("\n".join(detail))
+        repick = box.addButton("다시 고르기", QMessageBox.AcceptRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.setDefaultButton(repick)
+        box.exec()
+        return box.clickedButton() is repick
+
+    def _fill_missing_pairs(self, plan: SequencePlan) -> bool:
+        """짝이 없는 구간마다 묻는다: 빠진 쪽 영상을 고르거나, 그 구간은 한쪽만 띄운다. 취소면 False."""
+        used = {os.path.normcase(os.path.abspath(x.path))
+                for slot in plan.slots for x in (slot.front, slot.rear) if x is not None}
+        for n, slot in enumerate(plan.slots, start=1):
+            while slot.front is None or slot.rear is None:
+                missing = "후방" if slot.rear is None else "전방"
+                have = slot.primary
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle(f"{missing} 영상 없음")
+                box.setText(f"{n}번 영상의 {missing} 영상이 없습니다.")
+                box.setInformativeText(
+                    f"{n}번 영상: {have.name}\n\n해당 영상의 {missing} 영상을 선택해주세요. 없으시다면 "
+                    f"{n}번 영상은 {missing} 영상을 제외하고 띄웁니다"
+                    f"({'전방' if missing == '후방' else '후방'}만 재생).")
+                pick = box.addButton(f"{missing} 영상 선택", QMessageBox.AcceptRole)
+                skip = box.addButton(f"{missing} 제외하고 진행", QMessageBox.AcceptRole)
+                box.addButton("취소", QMessageBox.RejectRole)
+                box.setDefaultButton(pick)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked is skip:
+                    break
+                if clicked is not pick:
+                    return False
+                path, _ = QFileDialog.getOpenFileName(
+                    self, f"{n}번 영상의 {missing} 영상 선택", os.path.dirname(have.path), VIDEO_FILTER)
+                if not path:
+                    continue
+                if os.path.normcase(os.path.abspath(path)) in used:
+                    QMessageBox.warning(self, "이미 고른 영상", "이미 다른 자리에 쓰인 영상입니다.")
+                    continue
+                probe, error = self._run_task(
+                    f"{missing} 영상 대조", f"{os.path.basename(path)} 읽는 중...",
+                    lambda cancel, _progress, p=path: probe_single(p, cancel))
+                if error or probe is None:
+                    if error:
+                        QMessageBox.critical(self, f"{missing} 영상 대조", error)
+                    continue
+                front, rear = (probe, have) if missing == "전방" else (have, probe)
+                check = check_pair_probes(front, rear)
+                if check.ok:
+                    if missing == "전방":
+                        slot.front = probe
+                    else:
+                        slot.rear = probe
+                    used.add(os.path.normcase(os.path.abspath(path)))
+                    break
+                self._ask_repick_rear(front.path, rear.path, check.problems, check.notes)
+        return True
+
+    def _confirm_sequence(self, plan: SequencePlan) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("연속 영상 이어보기")
+        box.setText(f"영상 {len(plan.slots)}개를 녹화 시각순으로 이어서 분석합니다.")
+        detail = self._slot_lines(plan)
+        if plan.notes:
+            detail += [""] + [f"참고: {n}" for n in plan.notes]
+        box.setInformativeText("\n".join(detail))
+        start = box.addButton("분석 시작", QMessageBox.AcceptRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.setDefaultButton(start)
+        box.exec()
+        return box.clickedButton() is start
+
     def dual_view_enabled(self) -> bool:
         return self._dual_cb.isChecked()
 
@@ -309,8 +510,15 @@ class HomeView(QWidget):
     def set_history(self, cases: List[CaseRecord]) -> None:
         self._history_list.clear()
         for case in cases:
-            label = f"{case.case_number} - {case.source_video_filename} ({case.created_at})"
-            tag = view_tag(case.track_mode, bool(case.rear_video_filename))
+            if case.segments:
+                n = len(case.segments)
+                label = (f"{case.case_number} - {case.source_video_filename} 외 {n - 1}개 · 이어보기 "
+                         f"({case.created_at})")
+                has_rear = any(seg.get("rear_filename") for seg in case.segments)
+            else:
+                label = f"{case.case_number} - {case.source_video_filename} ({case.created_at})"
+                has_rear = bool(case.rear_video_filename)
+            tag = view_tag(case.track_mode, has_rear)
             if tag:
                 label += f" - {tag}"
             item = QListWidgetItem(label)

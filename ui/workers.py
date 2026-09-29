@@ -6,7 +6,7 @@ from typing import Dict, Optional
 from PySide6.QtCore import QThread, Signal
 
 from core import hashing
-from core.pipeline import PipelineResult, run_analysis_pipeline
+from core.pipeline import PipelineResult, run_analysis_pipeline, run_sequence_pipeline
 from engine.engine_adapter import CancelledError
 from storage.history_store import HistoryStore
 
@@ -46,8 +46,12 @@ class AnalysisWorker(QThread):
     def __init__(self, video_path: str, case_number: str, examiner: str, memo: str,
                  settings: Dict, cases_root_dir: str, history_db_path: Optional[str],
                  vehicle_type: str, carve_slack: bool = False,
-                 sha256: str = "", rear_video_path: str = "", track_mode: str = "", parent=None):
+                 sha256: str = "", rear_video_path: str = "", track_mode: str = "",
+                 sequence=None, sequence_sha256: Optional[Dict[str, str]] = None, parent=None):
         super().__init__(parent)
+        # 연속 영상 이어보기(core/video_sequence.SequenceItem 목록). 있으면 video_path 대신 쓴다.
+        self._sequence = sequence
+        self._sequence_sha256 = sequence_sha256 or {}
         self._video_path = video_path
         self._sha256 = sha256
         self._rear_video_path = rear_video_path
@@ -65,7 +69,16 @@ class AnalysisWorker(QThread):
     def run(self) -> None:
         try:
             with HistoryStore(self._history_db_path) as store:
-                result: PipelineResult = run_analysis_pipeline(
+                if self._sequence:
+                    result: PipelineResult = run_sequence_pipeline(
+                        self._sequence, self._case_number, self._examiner, self._memo,
+                        self._settings, self._cases_root_dir, store,
+                        vehicle_type=self._vehicle_type, carve_slack=self._carve_slack,
+                        progress_cb=self.progress.emit, cancel_event=self._cancel_event,
+                        precomputed_sha256=self._sequence_sha256)
+                    self.finished_ok.emit(result)
+                    return
+                result = run_analysis_pipeline(
                     video_path=self._video_path,
                     case_number=self._case_number,
                     examiner=self._examiner,
@@ -89,3 +102,31 @@ class AnalysisWorker(QThread):
 
     def cancel(self) -> None:
         self._cancel_event.set()
+
+
+class TaskWorker(QThread):
+    """오래 걸리는 함수 하나를 화면 밖에서 돌린다. fn(cancel_event, progress) 형태로 부르고,
+    진행 문구는 status, 결과는 finished_task로 낸다(연속 영상 검사 등)."""
+
+    status = Signal(str)
+    finished_task = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def is_cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def run(self) -> None:
+        try:
+            result = self._fn(self._cancel, self.status.emit)
+        except Exception as exc:  # noqa: BLE001 - 어떤 예외든 화면에 알린다
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.finished_task.emit(result)

@@ -79,3 +79,16 @@ def format_point(point: Optional[TrackPoint]) -> str:
     if point is None:
         return ""
     return format_display(point.gps_date, point.gps_utc_time)
+
+
+def format_local_iso(text: str) -> str:
+    """이 PC의 현지 시각으로 기록된 ISO 문자열(분석 시각 등)을 한국 시간 표시로. 못 읽으면 원문."""
+    try:
+        value = _dt.datetime.fromisoformat((text or "").strip())
+    except ValueError:
+        return text or "-"
+    return value.astimezone(_TZ).strftime("%Y-%m-%d %H:%M:%S") + f" ({DISPLAY_TZ_LABEL})"
+
+
+def now_display() -> str:
+    return _dt.datetime.now(_TZ).strftime("%Y-%m-%d %H:%M:%S") + f" ({DISPLAY_TZ_LABEL})"

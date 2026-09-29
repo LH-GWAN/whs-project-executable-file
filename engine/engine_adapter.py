@@ -63,6 +63,8 @@ class TrackPoint:
     # 앱 판정(core/outliers.py). 좌표는 남아 있지만 화면·지도·그래프·급가감속 계산에서 뺀다.
     is_outlier: bool = False
     outlier_reason: str = ""
+    # 연속 영상 이어보기에서 이 행이 속한 영상(0부터). 하나짜리 사건은 늘 0이다.
+    segment_index: int = 0
 
     @property
     def has_coords(self) -> bool:

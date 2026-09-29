@@ -79,6 +79,15 @@ def _event_markers(points: List[TrackPoint], events: List[DrivingEvent]) -> List
     return out
 
 
+def _segment_ends(points: List[TrackPoint]) -> List[List[float]]:
+    """이어보기에서 영상마다 마지막 좌표(검은 점). 영상이 하나면 빈 목록 - 지도가 알아서 끝점을 찍는다."""
+    last = {}
+    for p in points:
+        if p.has_fix:
+            last[p.segment_index] = [p.latitude, p.longitude]
+    return [last[k] for k in sorted(last)] if len(last) > 1 else []
+
+
 def _event_legend(events: List[DrivingEvent]) -> List[List[str]]:
     """이 궤적에 나온 위험운전 종류만 범례에 올린다([이름, 색])."""
     present = {ev.kind: ev for ev in events}
@@ -218,9 +227,12 @@ class MapView(QWidget):
                     "h": headings[i],
                     # 위험운전 구간이면 그 종류의 선 색. 선분 양 끝이 같은 색일 때만 칠한다.
                     "e": line_colors[i],
+                    # 이어보기의 영상 번호. 영상이 바뀌는 곳은 선을 잇지 않는다.
+                    "s": p.segment_index,
                 }
                 for i, p in enumerate(points)
             ],
+            "segEnds": _segment_ends(points),
             "events": _event_markers(points, events),
             "legend": _event_legend(events),
         }

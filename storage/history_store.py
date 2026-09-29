@@ -67,6 +67,8 @@ class CaseRecord:
     rear_video_filename: str = ""   # 후방 영상 사본 이름(source/ 안). 없으면 빈 문자열
     # 파일 하나에 전·후방 트랙이 든 영상을 어떻게 볼지(core/video_tracks.TRACK_MODES). 빈 문자열이면 해당 없음
     track_mode: str = ""
+    # 연속 영상 이어보기의 구간 목록(core/pipeline.segment_record 형식). 하나짜리 사건은 빈 목록
+    segments: List[Dict] = field(default_factory=list)
 
 
 class HistoryStore:
@@ -87,6 +89,8 @@ class HistoryStore:
             self._conn.execute("ALTER TABLE cases ADD COLUMN rear_video_filename TEXT")
         if "track_mode" not in existing:
             self._conn.execute("ALTER TABLE cases ADD COLUMN track_mode TEXT")
+        if "segments_json" not in existing:
+            self._conn.execute("ALTER TABLE cases ADD COLUMN segments_json TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -192,6 +196,11 @@ class HistoryStore:
         self._conn.execute("UPDATE cases SET track_mode = ? WHERE id = ?", (mode, case_id))
         self._conn.commit()
 
+    def set_segments(self, case_id: int, segments: List[Dict]) -> None:
+        self._conn.execute("UPDATE cases SET segments_json = ? WHERE id = ?",
+                           (json.dumps(segments, ensure_ascii=False), case_id))
+        self._conn.commit()
+
     def set_report_path(self, case_id: int, report_pdf_path: str) -> None:
         self._conn.execute(
             "UPDATE cases SET report_pdf_path = ? WHERE id = ?", (report_pdf_path, case_id),
@@ -219,4 +228,15 @@ def _row_to_case(row: sqlite3.Row) -> CaseRecord:
         report_pdf_path=row["report_pdf_path"],
         rear_video_filename=(row["rear_video_filename"] or "") if "rear_video_filename" in row.keys() else "",
         track_mode=(row["track_mode"] or "") if "track_mode" in row.keys() else "",
+        segments=_load_segments(row),
     )
+
+
+def _load_segments(row: sqlite3.Row) -> List[Dict]:
+    if "segments_json" not in row.keys() or not row["segments_json"]:
+        return []
+    try:
+        value = json.loads(row["segments_json"])
+    except ValueError:
+        return []
+    return value if isinstance(value, list) else []
