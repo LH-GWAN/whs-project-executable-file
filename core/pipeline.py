@@ -16,6 +16,9 @@ from engine.engine_adapter import (
     ExtractionResult,
     TrackPoint,
     load_existing_results,
+    load_slack_points,
+    _collect_warnings,
+    STATUS_GPS_UNTRUSTED,
     run_full_extraction,
 )
 from storage.history_store import CaseRecord, HistoryStore
@@ -43,7 +46,7 @@ class PipelineResult:
 
 def _safe_case_folder_name(case_number: str, case_id: int) -> str:
     safe = "".join(c for c in case_number if c.isalnum() or c in "-_") or "case"
-    return f"{safe}_{case_id}"
+    return f"{safe[:48]}_{case_id}"
 
 
 def run_analysis_pipeline(
@@ -82,6 +85,11 @@ def run_analysis_pipeline(
     report("파일 형식 확인 중...")
     routing = format_sniffer.sniff(video_path)
 
+    if not routing.supported:
+        raise ValueError(routing.reason)
+    if not any(settings.get(key, True) for key in ("tracker", "speed", "location")):
+        raise ValueError("분석 항목을 최소 한 개 선택하세요.")
+
     provisional = CaseRecord(
         id=None,
         case_number=case_number,
@@ -99,18 +107,30 @@ def run_analysis_pipeline(
     case_folder = os.path.join(cases_root_dir, _safe_case_folder_name(case_number, case_id))
     source_dir = os.path.join(case_folder, "source")
     output_dir = os.path.join(case_folder, "engine_output")
-    os.makedirs(source_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
-
-    check_cancelled()
-    report("원본 영상을 사건 폴더로 복사 중 (무결성 보존)...")
-    source_copy_path = os.path.join(source_dir, os.path.basename(video_path))
-    rear_copy_path = ""
     try:
+        os.makedirs(case_folder, exist_ok=False)
+    except BaseException:
+        history_store.delete_case(case_id)
+        raise  # 기존 폴더는 이 실행의 소유물이 아니므로 삭제하지 않는다.
+    try:
+        os.makedirs(source_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+
+        check_cancelled()
+        report("원본 영상을 사건 폴더로 복사 중 (무결성 보존)...")
+        source_copy_path = os.path.join(source_dir, os.path.basename(video_path))
+        rear_copy_path = ""
         shutil.copy2(video_path, source_copy_path)
+        report("분석 사본 SHA-256 검증 중...")
+        if hashing.sha256_file(source_copy_path) != sha256:
+            raise ValueError("원본 해시와 분석 사본 SHA-256이 다릅니다. 분석을 중단했습니다.")
+        check_cancelled()
         # 후방 영상은 분석하지 않고 같이 보기용으로만 보존한다. 이름이 전방과 같으면
         # (드물지만) 덮어쓰지 않도록 접두어를 붙인다.
-        if rear_video_path and os.path.isfile(rear_video_path):
+        if rear_video_path:
+            if not os.path.isfile(rear_video_path):
+                raise FileNotFoundError("후방 원본 영상을 찾을 수 없습니다.")
+            rear_sha256 = hashing.sha256_file(rear_video_path)
             check_cancelled()
             report("후방 영상을 사건 폴더로 복사 중...")
             rear_name = os.path.basename(rear_video_path)
@@ -118,76 +138,77 @@ def run_analysis_pipeline(
                 rear_name = "rear_" + rear_name
             rear_copy_path = os.path.join(source_dir, rear_name)
             shutil.copy2(rear_video_path, rear_copy_path)
-    except BaseException:
-        history_store.delete_case(case_id)
-        shutil.rmtree(case_folder, ignore_errors=True)
-        raise
+            if hashing.sha256_file(rear_copy_path) != rear_sha256:
+                raise ValueError("후방 사본 SHA-256이 다릅니다. 분석을 중단했습니다.")
 
-    report("GPS/센서 메타데이터 추출 중..." + (" (슬랙 카빙 포함)" if carve_slack else ""))
-    # 여기서부터 실패하거나 취소되면 방금 만든 사건 레코드를 되돌린다 -
-    # 안 그러면 output_folder가 빈 고아 레코드가 History에 그대로 쌓인다.
-    try:
+        report("GPS/센서 메타데이터 추출 중..." + (" (슬랙 카빙 포함)" if carve_slack else ""))
+        # 여기서부터 실패하거나 취소되면 방금 만든 사건 레코드를 되돌린다 -
+        # 안 그러면 output_folder가 빈 고아 레코드가 History에 그대로 쌓인다.
         extraction = run_full_extraction(source_copy_path, output_dir, slack=carve_slack,
                                          cancel_event=cancel_event)
+
+        report("영상 길이 계산 중...")
+        dur = duration_mod.get_duration_sec(source_copy_path, routing.container,
+                                            engine_output_dir=output_dir)
+
+        report("이상치 확인 중...")
+        outliers.mark_outliers(extraction.points)
+        extraction.avi_repaired = _avi_was_repaired(output_dir)
+        if extraction.status == "ok" and not extraction.fix_count:
+            extraction.status = STATUS_GPS_UNTRUSTED
+            extraction.status_detail = "모든 GPS 좌표가 검증 기준에서 제외됐습니다."
+
+        report("급가·감속 구간 분석 중...")
+        flagged = acceleration.compute_flagged_segments(extraction.points, accel_threshold_mps2)
+
+        _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
+                          routing, extraction, dur, settings, flagged, carve_slack,
+                          rear_copy_path=rear_copy_path, track_mode=track_mode)
+
+        for run in extraction.engine_runs:
+            log_path = os.path.join(
+                output_dir, f"_run_{run.started_at.strftime('%H%M%S%f')}.log",
+            )
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "ARGV: " + " ".join(run.argv) + "\n"
+                    + (f"NOTE: {run.note}\n" if run.note else "")
+                    + f"EXIT: {run.exit_code}\n\n"
+                    "--- stdout ---\n" + run.stdout + "\n"
+                    "--- stderr ---\n" + run.stderr
+                )
+            history_store.add_engine_run(
+                case_id, "integration_blackbox", run.argv, run.exit_code, log_path,
+                run.started_at.isoformat(timespec="seconds"),
+                run.finished_at.isoformat(timespec="seconds"),
+            )
+
+        history_store.update_case_extraction(
+            case_id, duration_sec=dur, avi_repaired=_avi_was_repaired(output_dir),
+            output_folder=output_dir,
+        )
+        if rear_copy_path:
+            history_store.set_rear_video(case_id, os.path.basename(rear_copy_path))
+        if track_mode:
+            history_store.set_track_mode(case_id, track_mode)
+
+        report("완료")
+        return PipelineResult(
+            case_id=case_id,
+            case_folder=case_folder,
+            source_copy_path=source_copy_path,
+            extraction=extraction,
+            duration_sec=dur,
+            flagged_segments=flagged,
+            sha256=sha256,
+            accel_threshold_mps2=accel_threshold_mps2,
+            rear_copy_path=rear_copy_path,
+            track_mode=track_mode,
+        )
     except BaseException:
         history_store.delete_case(case_id)
         shutil.rmtree(case_folder, ignore_errors=True)
         raise
-
-    report("영상 길이 계산 중...")
-    dur = duration_mod.get_duration_sec(source_copy_path, routing.container,
-                                        engine_output_dir=output_dir)
-
-    report("이상치 확인 중...")
-    outliers.mark_outliers(extraction.points)
-
-    report("급가·감속 구간 분석 중...")
-    flagged = acceleration.compute_flagged_segments(extraction.points, accel_threshold_mps2)
-
-    _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
-                      routing, extraction, dur, settings, flagged, carve_slack,
-                      rear_copy_path=rear_copy_path, track_mode=track_mode)
-
-    for run in extraction.engine_runs:
-        log_path = os.path.join(
-            output_dir, f"_run_{run.started_at.strftime('%H%M%S%f')}.log",
-        )
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write(
-                "ARGV: " + " ".join(run.argv) + "\n"
-                + (f"NOTE: {run.note}\n" if run.note else "")
-                + f"EXIT: {run.exit_code}\n\n"
-                "--- stdout ---\n" + run.stdout + "\n"
-                "--- stderr ---\n" + run.stderr
-            )
-        history_store.add_engine_run(
-            case_id, "integration_blackbox", run.argv, run.exit_code, log_path,
-            run.started_at.isoformat(timespec="seconds"),
-            run.finished_at.isoformat(timespec="seconds"),
-        )
-
-    history_store.update_case_extraction(
-        case_id, duration_sec=dur, avi_repaired=_avi_was_repaired(output_dir),
-        output_folder=output_dir,
-    )
-    if rear_copy_path:
-        history_store.set_rear_video(case_id, os.path.basename(rear_copy_path))
-    if track_mode:
-        history_store.set_track_mode(case_id, track_mode)
-
-    report("완료")
-    return PipelineResult(
-        case_id=case_id,
-        case_folder=case_folder,
-        source_copy_path=source_copy_path,
-        extraction=extraction,
-        duration_sec=dur,
-        flagged_segments=flagged,
-        sha256=sha256,
-        accel_threshold_mps2=accel_threshold_mps2,
-        rear_copy_path=rear_copy_path,
-        track_mode=track_mode,
-    )
 
 
 def reopen_case(case: CaseRecord) -> PipelineResult:
@@ -204,8 +225,24 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
         container=case.detected_format, supported=True,
         reason="저장된 사건을 다시 열었습니다 (재추출 없이 기존 결과 표시).",
     )
+    case_folder = os.path.dirname(case.output_folder) if case.output_folder else ""
+    metadata = {}
+    try:
+        with open(os.path.join(case_folder, "case.json"), encoding="utf-8") as f:
+            metadata = json.load(f)
+        if not isinstance(metadata, dict):
+            metadata = {}
+    except (OSError, ValueError):
+        pass
+    # Legacy cases have no reliable success marker: never silently promote failures to OK.
+    fallback_status = "ok" if any(p.has_fix for p in points) else "unknown"
     extraction = ExtractionResult(
         routing=routing, points=points, engine_runs=[],
+        status=metadata.get("status", fallback_status),
+        status_detail=metadata.get("status_detail", "저장된 분석 상태를 확인할 수 없습니다." if fallback_status == "unknown" else ""),
+        warnings=_collect_warnings(case.output_folder) if case.output_folder else [],
+        avi_repaired=case.avi_repaired,
+        slack_points=load_slack_points(case.output_folder) if case.output_folder else [],
         used_input_path=case.source_video_path, primary_source_file=primary,
         time_source=time_source,
     )
@@ -268,6 +305,12 @@ def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_pa
             "avi_repaired": _avi_was_repaired(os.path.join(case_folder, "engine_output")),
             "status": extraction.status,
             "status_detail": extraction.status_detail,
+            "warnings": extraction.warnings,
+            "copy_sha256_verified": True,
+            "rear_sha256": hashing.sha256_file(rear_copy_path) if rear_copy_path else "",
+            "engine_runs": [{"argv": r.argv, "exit_code": r.exit_code,
+                "started_at": r.started_at.isoformat(), "finished_at": r.finished_at.isoformat()}
+                for r in extraction.engine_runs],
             "slack_point_count": len(extraction.slack_points),
             "extension_mismatch": routing.extension_mismatch,
             "engine": "integration_blackbox",

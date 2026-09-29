@@ -199,11 +199,23 @@ class AnalysisView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(header)
         layout.addWidget(file_info)
+        self._analysis_status = QLabel("")
+        self._analysis_status.setWordWrap(True)
+        self._analysis_status.setTextFormat(Qt.PlainText)
+        self._analysis_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self._analysis_status)
         layout.addWidget(self._tabs, 1)
 
     def load_result(self, result: PipelineResult, case_number: str, settings: dict) -> None:
+        self._tracker_tab.release_media()
         self._result = result
         self._case_label.setText(f"Case Number : {case_number}")
+        extraction = result.extraction
+        self._analysis_status.setText(
+            f"분석 상태: {extraction.status} · 경고 {len(extraction.warnings)}건 · "
+            f"AVI 복구 {'적용' if extraction.avi_repaired else '없음'} · "
+            f"슬랙 별도 좌표 {len(extraction.slack_points)}건")
+        self._analysis_status.setToolTip(extraction.status_message + "\n" + "\n".join(extraction.warnings))
 
         video_path = result.source_copy_path or result.extraction.used_input_path
         filename = os.path.basename(video_path) if video_path else "-"
@@ -229,6 +241,8 @@ class AnalysisView(QWidget):
             if video_path and os.path.isfile(video_path):
                 rear = result.rear_copy_path if result.rear_copy_path and os.path.isfile(result.rear_copy_path) else ""
                 self._tracker_tab.load_video(video_path, rear, track_mode=result.track_mode)
+            else:
+                self._tracker_tab._on_media_error("사건 영상 파일이 없습니다. 사본 경로를 확인하세요.")
             self._tracker_tab.load_track(result.extraction.points, result.flagged_segments)
         else:
             self._tracker_tab.stop()

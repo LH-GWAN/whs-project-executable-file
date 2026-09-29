@@ -27,7 +27,9 @@ from core.appconfig import (
     set_map_mode,
 )
 from core.pipeline import PipelineResult, reopen_case, update_case_json
+from core.impact import find_first_impact
 from report.report_builder import ReportExporter, render_report_html
+from report.impact_capture import capture_frame_evidence, choose_capture_source
 from storage.history_store import HistoryStore, default_app_data_dir
 from ui.address_resolver import AddressResolver
 from ui.analysis_view import AnalysisView
@@ -244,6 +246,7 @@ class MainWindow(QMainWindow):
             self._home.set_history(store.list_cases())
 
     def _show_home(self) -> None:
+        self._analysis_view._tracker_tab.stop()
         self._refresh_history()
         self._stack.setCurrentWidget(self._home)
 
@@ -538,9 +541,25 @@ class MainWindow(QMainWindow):
             return
 
         chart_png, map_png = self._analysis_view.capture_visuals()
+        # 기존 일반 보고서 기준(2.00배)을 보존한다.
+        # 1.30배 시험은 별도 호출에서 threshold=1.30으로 지정한다.
+        impact_event = find_first_impact(result.extraction.points)
+        impact_png, impact_error = None, ""
+        frame_time_sec, capture_method = None, ""
+        if impact_event is not None:
+            video_path, track_index = choose_capture_source(result)
+            try:
+                evidence = capture_frame_evidence(video_path, impact_event.time_sec, track_index)
+                impact_png, impact_error = evidence.png, evidence.error
+                frame_time_sec, capture_method = evidence.frame_time_sec, evidence.method
+            except Exception as exc:
+                # 영상 코덱/프레임 추출에 실패해도 기존 보고서 저장은 유지한다.
+                impact_error = f"캡처 모듈 오류: {type(exc).__name__}: {exc}"
         html_str = render_report_html(
             result, self._current_case_number, self._current_examiner, self._current_memo,
             chart_png=chart_png, map_png=map_png,
+            impact_event=impact_event, impact_png=impact_png, impact_error=impact_error,
+            impact_frame_time_sec=frame_time_sec, impact_capture_method=capture_method,
         )
 
         def on_done(success: bool, error_message: str) -> None:

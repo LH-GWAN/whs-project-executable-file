@@ -21,6 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 # (전방 표기 정규식, 후방 표기 후보들) - 확장자 앞 끝부분만 본다.
 _PAIR_RULES = (
+    (re.compile(r"([_\-])F(?P<suffix>[_\-]\d+)$", re.IGNORECASE), ["{sep}R{suffix}"]),
     (re.compile(r"([_\-])F$", re.IGNORECASE), ["{sep}R"]),
     (re.compile(r"([_\-])N$", re.IGNORECASE), ["{sep}R"]),
     (re.compile(r"([_\-])(front|fr)$", re.IGNORECASE), ["{sep}rear", "{sep}Rear", "{sep}REAR", "{sep}R", "{sep}back"]),
@@ -39,7 +40,7 @@ def rear_candidates(front_path: str) -> List[str]:
             continue
         sep = m.group(1) if m.groups() else ""
         for rep in replacements:
-            new_stem = stem[:m.start()] + rep.format(sep=sep)
+            new_stem = stem[:m.start()] + rep.format(sep=sep, suffix=m.groupdict().get("suffix", ""))
             for e in (ext, ext.lower(), ext.upper()):
                 candidate = os.path.join(folder, new_stem + e)
                 if candidate not in out and candidate != front_path:

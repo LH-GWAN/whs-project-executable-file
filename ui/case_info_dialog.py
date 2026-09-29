@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QLineEdit,
     QPushButton,
     QTextEdit,
@@ -104,6 +105,9 @@ class CaseInfoDialog(QDialog):
     def _on_start(self) -> None:
         if not self._case_number.text().strip():
             self._case_number.setStyleSheet("border: 1px solid red;")
+            return
+        if not any(cb.isChecked() for cb in (self._tracker_cb, self._speed_cb, self._location_cb)):
+            QMessageBox.warning(self, "분석 항목", "분석 항목을 최소 한 개 선택하세요.")
             return
         self.result_input = CaseInfoInput(
             case_number=self._case_number.text().strip(),

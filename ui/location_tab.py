@@ -36,9 +36,9 @@ class LocationTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._map = MapView()
-        self._table = QTableWidget(0, 6)
+        self._table = QTableWidget(0, 7)
         self._table.setHorizontalHeaderLabels(
-            ["시각(초)", "위도", "경도", "속도(km/h)", "충격(g)", "지도"])
+            ["시각(초)", "위도", "경도", "속도(km/h)", "충격(g)", "지도", "GPS 검증"])
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -150,6 +150,9 @@ class LocationTab(QWidget):
                 for it in (lat_item, lon_item):
                     it.setForeground(_OUTLIER_COLOR)
                     it.setToolTip(tip)
+            elif rec.gps_checksum_ok is False or rec.gps_trusted is False:
+                lat_item = QTableWidgetItem("(검증 실패)")
+                lon_item = QTableWidgetItem("-")
             elif rec.has_fix:
                 lat_item = QTableWidgetItem(f"{rec.latitude:.6f}")
                 lon_item = QTableWidgetItem(f"{rec.longitude:.6f}")
@@ -165,6 +168,8 @@ class LocationTab(QWidget):
                 lon_item.setForeground(_NOGPS_COLOR)
             speed_item = QTableWidgetItem(
                 "(이상치)" if rec.is_outlier else (f"{rec.speed_kmh:.1f}" if rec.speed_kmh is not None else "-"))
+            if rec.gps_checksum_ok is False or rec.gps_trusted is False:
+                speed_item.setText("(검증 실패)")
             if rec.is_outlier:
                 speed_item.setForeground(_OUTLIER_COLOR)
             g = rec.g_magnitude
@@ -179,7 +184,11 @@ class LocationTab(QWidget):
                 link_item.setToolTip("클릭하면 브라우저에서 이 좌표를 엽니다")
             else:
                 link_item = QTableWidgetItem("-")
-            items = (time_item, lat_item, lon_item, speed_item, g_item, link_item)
+            validation = ("실패" if rec.gps_checksum_ok is False or rec.gps_trusted is False
+                          else "정상" if rec.gps_checksum_ok is True else "미제공")
+            check_item = QTableWidgetItem(validation)
+            check_item.setToolTip("실패 레코드는 지도·속도 통계·급가감속 계산에서 제외합니다. 원본 CSV는 보존합니다.")
+            items = (time_item, lat_item, lon_item, speed_item, g_item, link_item, check_item)
             if row in flagged_indices:
                 color = _FLAG_DECEL_COLOR if row in decel_indices else _FLAG_COLOR
                 for item in items:
