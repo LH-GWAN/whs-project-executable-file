@@ -15,17 +15,17 @@ from PySide6.QtWidgets import (
 )
 
 from core import geocode
-from core.acceleration import FlaggedSegment
+from core.driving_events import DrivingEvent, events_by_row
 from core.geocode import external_map_url
 from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
 from ui.map_view import MapView
 
-_FLAG_COLOR = QColor(255, 200, 200)        # 급가속
-_FLAG_DECEL_COLOR = QColor(255, 226, 190)  # 급감속
+_EVENT_ROW_ALPHA = 60   # 위험운전 행 배경(종류별 색을 옅게)
 _OUTLIER_COLOR = QColor(200, 110, 0)
 _LINK_COLOR = QColor(30, 100, 200)
-_MAP_LINK_COLUMN = 5
+_EVENT_COLUMN = 4
+_MAP_LINK_COLUMN = 6
 _DROPOUT_COLOR = QColor(190, 110, 40)
 _NOGPS_COLOR = QColor(170, 170, 170)
 _IMPACT_COLOR = QColor(200, 60, 60)
@@ -36,9 +36,12 @@ class LocationTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._map = MapView()
-        self._table = QTableWidget(0, 7)
+        self._table = QTableWidget(0, 8)
         self._table.setHorizontalHeaderLabels(
-            ["시각(초)", "위도", "경도", "속도(km/h)", "충격(g)", "지도", "GPS 검증"])
+            ["시각(초)", "위도", "경도", "속도(km/h)", "위험운전", "충격(g)", "지도", "GPS 검증"])
+        self._table.horizontalHeaderItem(_EVENT_COLUMN).setToolTip(
+            "선택한 차종 기준(국토부 DTG 위험운전행동 판별 기준)으로 판정한 급가속·급출발·급감속·"
+            "급정지·급진로변경·급좌/우회전·급U턴.\n판정에 쓰인 측정 구간의 모든 행에 표시합니다.")
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -122,19 +125,13 @@ class LocationTab(QWidget):
         text = self._selected_label.text().split("  (", 1)[0]
         self._selected_label.setText(f"{text}  ({address})" if address else text)
 
-    def load(self, records: List[TrackPoint], segments: List[FlaggedSegment]) -> None:
+    def load(self, records: List[TrackPoint], events: List[DrivingEvent]) -> None:
         self._points = records
-        self._map.set_track(records, segments)
+        self._map.set_track(records, events)
         self._selected_label.setText("")
         self._selected_key = None
 
-        flagged_indices = set()
-        decel_indices = set()
-        for seg in segments:
-            rng = range(seg.start_index, seg.end_index + 1)
-            flagged_indices.update(rng)
-            if getattr(seg, "is_decel", False):
-                decel_indices.update(rng)
+        row_events = events_by_row(events, len(records))
 
         self._table.setRowCount(len(records))
         for row, rec in enumerate(records):
@@ -188,9 +185,19 @@ class LocationTab(QWidget):
                           else "정상" if rec.gps_checksum_ok is True else "미제공")
             check_item = QTableWidgetItem(validation)
             check_item.setToolTip("실패 레코드는 지도·속도 통계·급가감속 계산에서 제외합니다. 원본 CSV는 보존합니다.")
-            items = (time_item, lat_item, lon_item, speed_item, g_item, link_item, check_item)
-            if row in flagged_indices:
-                color = _FLAG_DECEL_COLOR if row in decel_indices else _FLAG_COLOR
+            here = row_events[row]
+            event_item = QTableWidgetItem(", ".join(ev.label for ev in here) if here else "")
+            if here:
+                font = event_item.font()
+                font.setBold(True)
+                event_item.setFont(font)
+                event_item.setToolTip("\n".join(
+                    f"{ev.label}: {ev.detail} "
+                    f"({ev.start_time_sec:.1f}~{ev.end_time_sec:.1f}초)" for ev in here))
+            items = (time_item, lat_item, lon_item, speed_item, event_item, g_item, link_item, check_item)
+            if here:
+                color = QColor(here[0].color)
+                color.setAlpha(_EVENT_ROW_ALPHA)
                 for item in items:
                     item.setBackground(color)
             for col, item in enumerate(items):

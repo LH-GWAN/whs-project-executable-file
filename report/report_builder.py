@@ -11,7 +11,7 @@ from PySide6.QtCore import QMarginsF, QObject, QUrl
 from PySide6.QtGui import QPageLayout, QPageSize
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-from core.acceleration import KIND_DECEL, FlaggedSegment, count_by_kind
+from core.driving_events import DrivingEvent, criteria_lines, events_by_row, summarize_counts, vehicle_label
 from core.pipeline import PipelineResult
 from engine.engine_adapter import TrackPoint
 
@@ -31,7 +31,7 @@ def _esc(value) -> str:
     return html.escape(str(value)) if value is not None else ""
 
 
-def _select_row_indices(records: List[TrackPoint], segments: List[FlaggedSegment],
+def _select_row_indices(records: List[TrackPoint], events: List[DrivingEvent],
                           max_rows: int = MAX_TABLE_ROWS) -> List[int]:
     if max_rows <= 0 or not records:
         return []
@@ -43,8 +43,8 @@ def _select_row_indices(records: List[TrackPoint], segments: List[FlaggedSegment
         if count == 1:
             return values[:1]
         return [values[round(i * (len(values) - 1) / (count - 1))] for i in range(count)]
-    flagged = sorted({i for seg in segments for i in range(max(0, seg.start_index),
-                       min(len(records), seg.end_index + 1))})
+    flagged = sorted({i for ev in events for i in range(max(0, ev.start_index),
+                       min(len(records), ev.end_index + 1))})
     if len(flagged) >= max_rows:
         return sample(flagged, max_rows)
     flagged_set = set(flagged)
@@ -65,25 +65,18 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
                         memo: str, chart_png: Optional[bytes] = None,
                         map_png: Optional[bytes] = None) -> str:
     records = pipeline_result.extraction.points
-    segments = pipeline_result.flagged_segments
-    row_indices = _select_row_indices(records, segments)
-
-    flagged_indices = set()
-    row_kind = {}
-    for seg in segments:
-        for i in range(seg.start_index, seg.end_index + 1):
-            flagged_indices.add(i)
-            row_kind[i] = seg.kind
-    accel_count, decel_count = count_by_kind(segments)
+    events = pipeline_result.driving_events
+    row_indices = _select_row_indices(records, events)
+    row_events = events_by_row(events, len(records))
 
     rows_html = []
     for idx in row_indices:
         rec = records[idx]
-        row_class = ""
-        if idx in flagged_indices:
-            row_class = "flagged-decel" if row_kind.get(idx) == KIND_DECEL else "flagged"
-        if rec.is_outlier:
-            row_class = (row_class + " outlier").strip()
+        here = row_events[idx]
+        row_class = "outlier" if rec.is_outlier else ""
+        # 위험운전 행은 종류 색을 옅게 깐다(화면 Location 표와 같은 색).
+        row_style = f' style="background: {here[0].color}33"' if here else ""
+        event_text = ", ".join(ev.label for ev in here)
         time_text = f"{rec.start_time_sec:.2f}" if rec.start_time_sec is not None else "-"
         speed_text = f"{rec.speed_kmh:.1f}" if rec.speed_kmh is not None else "-"
         g_value = rec.g_magnitude
@@ -100,17 +93,18 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
         else:
             lat_text = lon_text = "(GPS 없음)"
         rows_html.append(
-            f'<tr class="{row_class}">'
+            f'<tr class="{row_class}"{row_style}>'
             f"<td>{idx + 1}</td>"
             f"<td>{_esc(time_text)}</td>"
             f"<td>{_esc(lat_text)}</td>"
             f"<td>{_esc(lon_text)}</td>"
             f"<td>{_esc(speed_text)}</td>"
+            f"<td>{_esc(event_text)}</td>"
             f"<td>{_esc(g_text)}</td>"
             "</tr>"
         )
 
-    body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="6">추출된 좌표가 없습니다.</td></tr>'
+    body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="7">추출된 좌표가 없습니다.</td></tr>'
     extraction = pipeline_result.extraction
     routing = extraction.routing
     video_filename = os.path.basename(pipeline_result.source_copy_path or "")
@@ -121,10 +115,10 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     # 살려 그리면 타일 로딩 타이밍에 따라 결과가 달라져, 증거 문서로 쓰기 어렵다.
     visuals_html = (
         _image_section("속도 분석", chart_png,
-                        "붉은 구간은 급가속, 주황 구간은 급감속 의심 구간입니다. "
+                        "색 띠는 급가속(빨강)·급출발(분홍)·급감속(주황)·급정지(보라) 구간입니다. "
                         "점은 실제 GPS 측정값이고 선은 점을 지나는 보간선입니다.")
         + _image_section("이동 경로", map_png,
-                          "초록 실선은 주행 경로, 붉은 구간은 급가속, 주황 구간은 급감속 의심 구간, "
+                          "초록 실선은 주행 경로, 색 선과 이름표는 위험운전 행동(범례 참고), "
                           "회색 점선은 GPS 수신이 끊긴 구간입니다. 분석 완료 시점의 전체 경로입니다.")
     )
     outlier_count = extraction.outlier_count
@@ -135,6 +129,13 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     speeds = [records[i].speed_kmh for i in _distinct_fix_indices(records)]
     speed_summary = f"평균 {sum(speeds)/len(speeds):.1f} / 최고 {max(speeds):.1f} km/h" if speeds else "-"
     generated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    vehicle_type = pipeline_result.vehicle_type
+    criteria_html = "".join(f"<li>{_esc(line)}</li>" for line in criteria_lines(vehicle_type)[1:])
+    event_rows = "".join(
+        f'<tr style="background: {ev.color}33"><td>{_esc(ev.label)}</td>'
+        f"<td>{_esc(f'{ev.start_time_sec:.1f} ~ {ev.end_time_sec:.1f}')}</td>"
+        f"<td>{_esc(ev.detail)}</td></tr>" for ev in events
+    ) or '<tr><td colspan="3">해당 기준에 걸린 위험운전 행동이 없습니다.</td></tr>'
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -153,8 +154,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
   th, td {{ border: 1px solid #ccc; padding: 4px 6px; text-align: left; }}
   th {{ background: #f2f2f2; }}
-  tr.flagged {{ background: #ffd9d9; }}
-  tr.flagged-decel {{ background: #ffe8cc; }}
+  ul.criteria {{ font-size: 11px; color: #333; margin: 4px 0 6px; padding-left: 18px; }}
   tr.outlier td {{ color: #b36b00; }}
   tr.gap td {{ text-align: center; color: #999; border: none; }}
   .kv {{ font-size: 12px; margin: 2px 0; }}
@@ -172,8 +172,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>시간축 근거</b>{_esc(extraction.time_source or "-")}</div>
   <div class="kv"><b>추출 지점</b>{_esc(len(records))}개 (GPS 수신 {_esc(fix_count)}개 /
       수신 끊김 {_esc(dropout_count)}개 / GPS 미기록 {_esc(len(records) - fix_count - dropout_count)}개)</div>
-  <div class="kv"><b>급가·감속 임계값</b>{_esc(pipeline_result.accel_threshold_mps2)} m/s&sup2;</div>
-  <div class="kv"><b>급가·감속 의심 구간</b>{_esc(len(segments))}개 (급가속 {accel_count} · 급감속 {decel_count})</div>
+  <div class="kv"><b>차종 기준</b>{_esc(vehicle_label(vehicle_type))} (국토교통부 DTG 위험운전행동 판별 기준, 2022)</div>
+  <div class="kv"><b>위험운전 행동</b>{_esc(len(events))}건 ({_esc(summarize_counts(events))})</div>
   <div class="kv"><b>이상치 제외</b>{_esc(outlier_count)}개 지점 (좌표 급변·비정상 속도, 원본 CSV에는 보존)</div>
 
   <div class="kv"><b>분석 상태</b>{_esc(extraction.status)} — {_esc(extraction.status_detail)}</div>
@@ -184,11 +184,18 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>슬랙 별도 좌표</b>{len(extraction.slack_points)}개 (현재 영상 궤적에 합치지 않음)</div>
   <div class="kv"><b>보고서 생성(UTC)</b>{generated}</div>
   <h2>분석 경고 ({len(extraction.warnings)}건)</h2><ul>{warning_html}</ul>
+  <h2>위험운전 행동 ({_esc(vehicle_label(vehicle_type))} 기준, {len(events)}건)</h2>
+  <ul class="criteria">{criteria_html}</ul>
+  <p>과속·장기과속(도로 제한속도 필요)과 급앞지르기는 판정하지 않습니다. 승용차는 택시 기준을 적용합니다.</p>
+  <table>
+    <thead><tr><th>종류</th><th>영상 시각(초)</th><th>판정 근거</th></tr></thead>
+    <tbody>{event_rows}</tbody>
+  </table>
   {visuals_html}
-  <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 급가·감속 구간 우선, 나머지 전체 구간 균등 표본)</h2>
+  <h2>추출 목록 (전체 {len(records)}개 지점 중 {len(row_indices)}개 표시 - 위험운전 구간 우선, 나머지 전체 구간 균등 표본)</h2>
   <p>전체 원자료 CSV: {_esc(extraction.primary_source_file or "없음")}</p>
   <table>
-    <thead><tr><th>#</th><th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th><th>충격(g)</th></tr></thead>
+    <thead><tr><th>#</th><th>시각(초)</th><th>위도</th><th>경도</th><th>속도(km/h)</th><th>위험운전</th><th>충격(g)</th></tr></thead>
     <tbody>{body_rows}</tbody>
   </table>
 </body></html>

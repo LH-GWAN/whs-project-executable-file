@@ -4,7 +4,9 @@ from typing import List
 
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from core.acceleration import FlaggedSegment, count_by_kind, _distinct_fix_indices
+from core.acceleration import _distinct_fix_indices
+from core.driving_events import (DEFAULT_VEHICLE, EVENT_COLORS, EVENT_LABELS, SPEED_EVENT_KINDS,
+                                 DrivingEvent, criteria_lines, summarize_counts, vehicle_label)
 from engine.engine_adapter import TrackPoint
 from ui.speed_chart_widget import SpeedChartWidget
 
@@ -16,27 +18,29 @@ class SpeedTab(QWidget):
 
         self._avg_label = QLabel("평균 속도: -")
         self._max_label = QLabel("최고 속도: -")
-        self._flag_label = QLabel("급가·감속 의심 구간: 0개")
-        legend = QLabel("■ 급가속 의심 구간")
-        legend.setStyleSheet("color: #cc3333;")
-        legend_decel = QLabel("■ 급감속 의심 구간")
-        legend_decel.setStyleSheet("color: #e08a00;")
+        self._flag_label = QLabel("위험운전: -")
 
         stats_row = QHBoxLayout()
         stats_row.addWidget(self._avg_label)
         stats_row.addWidget(self._max_label)
         stats_row.addWidget(self._flag_label)
         stats_row.addStretch(1)
-        stats_row.addWidget(legend)
-        stats_row.addSpacing(10)
-        stats_row.addWidget(legend_decel)
+        # 이 탭은 속도 변화로 정해지는 넷(급가속·급출발·급감속·급정지)만 그린다.
+        # 방향 계열(급진로변경·급회전·급U턴)은 지도와 Location 표에서 본다.
+        for kind in SPEED_EVENT_KINDS:
+            legend = QLabel(f"■ {EVENT_LABELS[kind]}")
+            legend.setStyleSheet(f"color: {EVENT_COLORS[kind]};")
+            stats_row.addSpacing(8)
+            stats_row.addWidget(legend)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._chart, 1)
         layout.addLayout(stats_row)
 
-    def load(self, records: List[TrackPoint], segments: List[FlaggedSegment]) -> None:
-        self._chart.set_data(records, segments)
+    def load(self, records: List[TrackPoint], events: List[DrivingEvent],
+             vehicle_type: str = DEFAULT_VEHICLE) -> None:
+        speed_events = [ev for ev in events if ev.is_speed_event]
+        self._chart.set_data(records, speed_events)
         indices = _distinct_fix_indices(records)
         speeds = [records[i].speed_kmh for i in indices]
         excluded = sum(r.speed_kmh is not None for r in records) - len(indices)
@@ -48,8 +52,10 @@ class SpeedTab(QWidget):
         else:
             self._avg_label.setText("평균 속도: -")
             self._max_label.setText("최고 속도: -")
-        accel_n, decel_n = count_by_kind(segments)
-        self._flag_label.setText(f"급가·감속 의심 구간: {len(segments)}개 (급가속 {accel_n} · 급감속 {decel_n})")
+        self._flag_label.setText(
+            f"위험운전({vehicle_label(vehicle_type)} 기준): "
+            f"{summarize_counts(speed_events, SPEED_EVENT_KINDS)}")
+        self._flag_label.setToolTip("\n".join(criteria_lines(vehicle_type)[:5]))
 
     def grab_chart_png(self):
         return self._chart.grab_png()

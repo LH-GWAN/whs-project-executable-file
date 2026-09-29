@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
-from core import acceleration, duration as duration_mod, format_sniffer, hashing, outliers
-from core.acceleration import FlaggedSegment
+from core import driving_events, duration as duration_mod, format_sniffer, hashing, outliers
+from core.driving_events import DrivingEvent
 from core.format_sniffer import RoutingResult
 from engine.engine_adapter import (
     CancelledError,
@@ -33,9 +33,9 @@ class PipelineResult:
     source_copy_path: str
     extraction: ExtractionResult
     duration_sec: Optional[float]
-    flagged_segments: List[FlaggedSegment]
+    driving_events: List[DrivingEvent]
     sha256: str
-    accel_threshold_mps2: float
+    vehicle_type: str   # 위험운전 판별 기준 차종(core/driving_events.VEHICLE_*)
     rear_copy_path: str = ""   # 후방 영상 사본(같이 보기로 올린 경우). 없으면 빈 문자열
     track_mode: str = ""       # 파일 하나에 전·후방 트랙이 든 영상의 보기 방식(both/front/rear)
 
@@ -57,7 +57,7 @@ def run_analysis_pipeline(
     settings: Dict,
     cases_root_dir: str,
     history_store: HistoryStore,
-    accel_threshold_mps2: float = acceleration.DEFAULT_THRESHOLD_MPS2,
+    vehicle_type: str = driving_events.DEFAULT_VEHICLE,
     carve_slack: bool = False,
     progress_cb: ProgressCallback = None,
     cancel_event=None,
@@ -158,12 +158,13 @@ def run_analysis_pipeline(
             extraction.status = STATUS_GPS_UNTRUSTED
             extraction.status_detail = "모든 GPS 좌표가 검증 기준에서 제외됐습니다."
 
-        report("급가·감속 구간 분석 중...")
-        flagged = acceleration.compute_flagged_segments(extraction.points, accel_threshold_mps2)
+        report("위험운전 행동 분석 중...")
+        vehicle_type = driving_events.normalize_vehicle(vehicle_type)
+        events = driving_events.detect_driving_events(extraction.points, vehicle_type)
 
         _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
-                          routing, extraction, dur, settings, flagged, carve_slack,
-                          rear_copy_path=rear_copy_path, track_mode=track_mode)
+                          routing, extraction, dur, settings, events, carve_slack,
+                          vehicle_type, rear_copy_path=rear_copy_path, track_mode=track_mode)
 
         for run in extraction.engine_runs:
             log_path = os.path.join(
@@ -199,9 +200,9 @@ def run_analysis_pipeline(
             source_copy_path=source_copy_path,
             extraction=extraction,
             duration_sec=dur,
-            flagged_segments=flagged,
+            driving_events=events,
             sha256=sha256,
-            accel_threshold_mps2=accel_threshold_mps2,
+            vehicle_type=vehicle_type,
             rear_copy_path=rear_copy_path,
             track_mode=track_mode,
         )
@@ -217,9 +218,9 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
     )
     outliers.mark_outliers(points)
 
-    threshold = float(case.analysis_settings.get("accel_threshold_mps2",
-                                                  acceleration.DEFAULT_THRESHOLD_MPS2))
-    flagged = acceleration.compute_flagged_segments(points, threshold)
+    # 차종 선택이 생기기 전 사건(임계값 m/s²만 저장)은 승용차 기준으로 다시 판정한다.
+    vehicle_type = driving_events.normalize_vehicle(case.analysis_settings.get("vehicle_type"))
+    events = driving_events.detect_driving_events(points, vehicle_type)
 
     routing = RoutingResult(
         container=case.detected_format, supported=True,
@@ -256,9 +257,9 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
                           if case_folder else ""),
         extraction=extraction,
         duration_sec=case.duration_sec,
-        flagged_segments=flagged,
+        driving_events=events,
         sha256=case.source_video_sha256,
-        accel_threshold_mps2=threshold,
+        vehicle_type=vehicle_type,
         rear_copy_path=rear_copy if rear_copy and os.path.isfile(rear_copy) else "",
         track_mode=case.track_mode or "",
     )
@@ -290,8 +291,8 @@ def _avi_was_repaired(output_dir: str) -> bool:
 
 
 def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
-                      routing, extraction: ExtractionResult, dur, settings, flagged,
-                      carve_slack, rear_copy_path: str = "", track_mode: str = "") -> None:
+                      routing, extraction: ExtractionResult, dur, settings, events,
+                      carve_slack, vehicle_type: str, rear_copy_path: str = "", track_mode: str = "") -> None:
     case_json_path = os.path.join(case_folder, "case.json")
     with open(case_json_path, "w", encoding="utf-8") as f:
         json.dump({
@@ -322,9 +323,9 @@ def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_pa
             "point_count": len(extraction.points),
             "gps_fix_count": extraction.fix_count,
             "outlier_count": extraction.outlier_count,
-            "flagged_segment_count": len(flagged),
-            "flagged_accel_count": acceleration.count_by_kind(flagged)[0],
-            "flagged_decel_count": acceleration.count_by_kind(flagged)[1],
+            "vehicle_type": vehicle_type,
+            "driving_event_count": len(events),
+            "driving_event_counts": driving_events.count_events(events),
             "rear_video_filename": os.path.basename(rear_copy_path) if rear_copy_path else "",
             "track_mode": track_mode,
         }, f, ensure_ascii=False, indent=2)

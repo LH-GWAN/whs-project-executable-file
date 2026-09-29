@@ -243,15 +243,16 @@ class AnalysisView(QWidget):
                 self._tracker_tab.load_video(video_path, rear, track_mode=result.track_mode)
             else:
                 self._tracker_tab._on_media_error("사건 영상 파일이 없습니다. 사본 경로를 확인하세요.")
-            self._tracker_tab.load_track(result.extraction.points, result.flagged_segments)
+            self._tracker_tab.load_track(result.extraction.points, result.driving_events)
         else:
             self._tracker_tab.stop()
         if settings.get("speed", True):
             self._tabs.addTab(self._speed_tab, "Speed Analysis")
-            self._speed_tab.load(result.extraction.points, result.flagged_segments)
+            self._speed_tab.load(result.extraction.points, result.driving_events,
+                                 result.vehicle_type)
         if settings.get("location", True):
             self._tabs.addTab(self._location_tab, "Location Analysis")
-            self._location_tab.load(result.extraction.points, result.flagged_segments)
+            self._location_tab.load(result.extraction.points, result.driving_events)
 
         self._on_tab_changed(self._tabs.currentIndex())
 

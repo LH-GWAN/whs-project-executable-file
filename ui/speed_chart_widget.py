@@ -8,14 +8,14 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
 from core import gpstime
-from core.acceleration import FlaggedSegment, _distinct_fix_indices, compute_point_accelerations
+from core.acceleration import _distinct_fix_indices, compute_point_accelerations
+from core.driving_events import DrivingEvent
 from engine.engine_adapter import TrackPoint
 
 _BG = QColor("#0d1117")
 _LINE = QColor("#3ddc97")
 _DOT = QColor("#2f8f6c")
-_BAND = QColor(255, 60, 60, 90)          # 급가속
-_BAND_DECEL = QColor(255, 150, 30, 95)   # 급감속
+_BAND_ALPHA = 95                         # 위험운전 구간 띠(색은 종류별 EVENT_COLORS)
 _AXIS = QColor("#9aa4ad")
 # 눈금선. 처음엔 알파 22로 그렸더니 검토에서 "선이 안 나온다"는 말이 나왔다 - 검은 배경 위에
 # 9% 흰색은 화면에서도 리포트 이미지에서도 사실상 보이지 않는다.
@@ -65,15 +65,15 @@ class SpeedChartWidget(QWidget):
         self.setMinimumHeight(260)
         self.setMouseTracking(True)
         self._records: List[TrackPoint] = []
-        self._segments: List[FlaggedSegment] = []
+        self._events: List[DrivingEvent] = []
         self._accels: List[Optional[float]] = []
         # 마지막으로 화면에 그린 점들의 위치 (원본 인덱스, x, y). 마우스 위치와 맞춰 본다.
         self._screen_pts: List[Tuple[int, float, float]] = []
         self._hover: Optional[int] = None
 
-    def set_data(self, records: List[TrackPoint], segments: List[FlaggedSegment]) -> None:
+    def set_data(self, records: List[TrackPoint], events: List[DrivingEvent]) -> None:
         self._records = records
-        self._segments = segments
+        self._events = events
         self._accels = compute_point_accelerations(records)
         self._hover = None
         self._screen_pts = []
@@ -84,7 +84,7 @@ class SpeedChartWidget(QWidget):
         return self._hover
 
     def hover_lines(self, index: int) -> List[str]:
-        """말풍선에 들어갈 줄들. 영상 시각·GPS 시각·속도·가속도·좌표·급가감속 구간."""
+        """말풍선에 들어갈 줄들. 영상 시각·GPS 시각·속도·가속도·좌표·위험운전 구간."""
         if not (0 <= index < len(self._records)):
             return []
         r = self._records[index]
@@ -98,13 +98,13 @@ class SpeedChartWidget(QWidget):
             lines.append(f"GPS 시각 {clock}")
         lines.append(f"속도 {r.speed_kmh:.1f} km/h" if r.speed_kmh is not None else "속도 -")
         accel = self._accels[index] if index < len(self._accels) else None
-        lines.append(f"가속도 {accel:+.2f} m/s²" if accel is not None else "가속도 - (직전 측정 없음)")
+        lines.append(f"가속도 {accel:+.2f} m/s² (초당 {accel * 3.6:+.1f} km/h)" if accel is not None
+                     else "가속도 - (1초 앞 측정 없음)")
         if r.latitude is not None and r.longitude is not None:
             lines.append(f"위치 {r.latitude:.6f}, {r.longitude:.6f}")
-        for seg in self._segments:
-            if seg.start_index <= index <= seg.end_index:
-                lines.append(f"{seg.label} 의심 구간 (최대 {seg.max_acceleration_mps2:+.2f} m/s²)")
-                break
+        for ev in self._events:
+            if ev.covers(index):
+                lines.append(f"{ev.label} 구간 ({ev.detail})")
         return lines
 
     def _nearest_index(self, x: float, y: float) -> Optional[int]:
@@ -233,13 +233,15 @@ class SpeedChartWidget(QWidget):
             t += minor_step
 
         painter.setPen(Qt.NoPen)
-        for seg in self._segments:
-            painter.setBrush(_BAND_DECEL if getattr(seg, "is_decel", False) else _BAND)
-            x0 = x_for_index(seg.start_index)
-            x1 = x_for_index(seg.end_index)
+        for ev in self._events:
+            band = QColor(ev.color)
+            band.setAlpha(_BAND_ALPHA)
+            painter.setBrush(band)
+            x0 = x_for_index(ev.start_index)
+            x1 = x_for_index(ev.end_index)
             painter.drawRect(QRectF(x0, plot.top(), max(2.0, x1 - x0), plot.height()))
 
-        # drawPath는 현재 브러시로 경로 내부까지 칠한다. 위에서 급가속 구간을 칠하려고
+        # drawPath는 현재 브러시로 경로 내부까지 칠한다. 위에서 위험운전 구간을 칠하려고
         # 세워둔 브러시를 그대로 두면 속도 곡선 아래가 통째로 빨갛게 채워진다.
         painter.setBrush(Qt.NoBrush)
 

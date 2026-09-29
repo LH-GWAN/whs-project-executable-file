@@ -45,7 +45,7 @@ class AnalysisWorker(QThread):
 
     def __init__(self, video_path: str, case_number: str, examiner: str, memo: str,
                  settings: Dict, cases_root_dir: str, history_db_path: Optional[str],
-                 accel_threshold_mps2: float, carve_slack: bool = False,
+                 vehicle_type: str, carve_slack: bool = False,
                  sha256: str = "", rear_video_path: str = "", track_mode: str = "", parent=None):
         super().__init__(parent)
         self._video_path = video_path
@@ -58,7 +58,7 @@ class AnalysisWorker(QThread):
         self._settings = settings
         self._cases_root_dir = cases_root_dir
         self._history_db_path = history_db_path
-        self._accel_threshold_mps2 = accel_threshold_mps2
+        self._vehicle_type = vehicle_type
         self._carve_slack = carve_slack
         self._cancel_event = threading.Event()
 
@@ -73,7 +73,7 @@ class AnalysisWorker(QThread):
                     settings=self._settings,
                     cases_root_dir=self._cases_root_dir,
                     history_store=store,
-                    accel_threshold_mps2=self._accel_threshold_mps2,
+                    vehicle_type=self._vehicle_type,
                     carve_slack=self._carve_slack,
                     cancel_event=self._cancel_event,
                     progress_cb=self.progress.emit,

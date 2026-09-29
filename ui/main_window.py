@@ -367,7 +367,7 @@ class MainWindow(QMainWindow):
             settings=info.settings,
             cases_root_dir=self._cases_root_dir,
             history_db_path=self._history_db_path,
-            accel_threshold_mps2=info.accel_threshold_mps2,
+            vehicle_type=info.vehicle_type,
             carve_slack=info.carve_slack,
             sha256=sha256,
             rear_video_path=rear_path or "",

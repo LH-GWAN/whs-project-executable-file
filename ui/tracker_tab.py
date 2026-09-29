@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from core import geocode, gpstime
 from core.video_tracks import TRACK_MODE_BOTH, TRACK_MODE_FRONT, TRACK_MODE_REAR
-from core.acceleration import FlaggedSegment
+from core.driving_events import DrivingEvent
 from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
 from ui.map_view import MapView
@@ -529,9 +529,9 @@ class TrackerTab(QWidget):
 
     # ---------- 궤적/정보 ----------
     def load_track(self, points: List[TrackPoint],
-                    segments: Optional[List[FlaggedSegment]] = None) -> None:
+                    events: Optional[List[DrivingEvent]] = None) -> None:
         self._points = points
-        self._map.set_track(points, segments)
+        self._map.set_track(points, events)
         self._addr_key = None
         self._last_valid: Optional[TrackPoint] = None
         self._last_clock = ""

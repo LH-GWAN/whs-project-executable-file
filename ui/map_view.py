@@ -8,7 +8,7 @@ from PySide6.QtCore import QBuffer, QIODevice, QTimer, QUrl, Signal
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
-from core.acceleration import FlaggedSegment
+from core.driving_events import DISPLAY_ORDER, EVENT_KINDS, DrivingEvent
 from engine.engine_adapter import TrackPoint
 from ui.map_server import ONLINE_PAGE, MapServer
 
@@ -52,6 +52,37 @@ def compute_headings(points: List[TrackPoint]) -> List[Optional[float]]:
         out[i] = last
         previous = p
     return out
+
+
+def _event_line_colors(points: List[TrackPoint], events: List[DrivingEvent]) -> List[Optional[str]]:
+    """행마다 지도 선 색. 여러 위험운전이 겹치면 EVENT_KINDS 앞쪽(급정지·급출발…)이 이긴다."""
+    rank = {k: n for n, k in enumerate(EVENT_KINDS)}
+    best: List[Optional[DrivingEvent]] = [None] * len(points)
+    for ev in events:
+        for i in range(max(0, ev.start_index), min(len(points), ev.end_index + 1)):
+            if best[i] is None or rank.get(ev.kind, 99) < rank.get(best[i].kind, 99):
+                best[i] = ev
+    return [ev.color if ev is not None else None for ev in best]
+
+
+def _event_markers(points: List[TrackPoint], events: List[DrivingEvent]) -> List[dict]:
+    """위험운전마다 지도에 붙일 이름표. 구간 안 좌표 중 가운데 지점에 단다."""
+    out = []
+    for ev in events:
+        fixes = [i for i in range(max(0, ev.start_index), min(len(points), ev.end_index + 1))
+                 if points[i].has_fix]
+        if not fixes:
+            continue
+        p = points[fixes[len(fixes) // 2]]
+        out.append({"label": ev.label, "color": ev.color, "lat": p.latitude, "lon": p.longitude,
+                    "detail": f"{ev.label} · {ev.start_time_sec:.1f}~{ev.end_time_sec:.1f}초 · {ev.detail}"})
+    return out
+
+
+def _event_legend(events: List[DrivingEvent]) -> List[List[str]]:
+    """이 궤적에 나온 위험운전 종류만 범례에 올린다([이름, 색])."""
+    present = {ev.kind: ev for ev in events}
+    return [[present[k].label, present[k].color] for k in DISPLAY_ORDER if k in present]
 
 
 class MapView(QWidget):
@@ -169,9 +200,11 @@ class MapView(QWidget):
             self._pending_js = [s for s in (self._last_track_js, self._last_time_js) if s]
 
     def set_track(self, points: List[TrackPoint],
-                   segments: Optional[List[FlaggedSegment]] = None) -> None:
+                   events: Optional[List[DrivingEvent]] = None) -> None:
         self._pending_js = []
         headings = compute_headings(points)
+        events = events or []
+        line_colors = _event_line_colors(points, events)
         payload = {
             "points": [
                 {
@@ -183,11 +216,13 @@ class MapView(QWidget):
                     "d": 1 if p.is_dropout else 0,
                     "o": 1 if p.is_outlier else 0,
                     "h": headings[i],
+                    # 위험운전 구간이면 그 종류의 선 색. 선분 양 끝이 같은 색일 때만 칠한다.
+                    "e": line_colors[i],
                 }
                 for i, p in enumerate(points)
             ],
-            "flagged": [[s.start_index, s.end_index, getattr(s, "kind", "accel")]
-                        for s in (segments or [])],
+            "events": _event_markers(points, events),
+            "legend": _event_legend(events),
         }
         self._last_track_js = f"renderTrack({json.dumps(payload, ensure_ascii=False)});"
         self._last_time_js = None
