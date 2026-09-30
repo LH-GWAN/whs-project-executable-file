@@ -27,7 +27,9 @@ from core.appconfig import (
     set_map_mode,
 )
 from core.pipeline import PipelineResult, reopen_case, update_case_json
+from core.impact import find_first_impact
 from report.report_builder import ReportExporter, render_report_html
+from report.impact_capture import capture_frame_evidence, capture_source_for_event
 from storage.history_store import HistoryStore, default_app_data_dir
 from ui.address_resolver import AddressResolver
 from ui.analysis_view import AnalysisView
@@ -609,9 +611,27 @@ class MainWindow(QMainWindow):
             csv_path = self._save_location_csv(result, os.path.splitext(out_path)[0] + "_location.csv")
 
         chart_png, map_png = self._analysis_view.capture_visuals()
+        # 직전 2초 평균에서 1.0g 이상 벗어난 최초 지점만 캡처한다.
+        impact_event = find_first_impact(result.extraction.points)
+        impact_png, impact_error = None, ""
+        frame_time_sec, capture_method = None, ""
+        timeline_offset_sec = 0.0
+        if impact_event is not None:
+            try:
+                video_path, track_index, local_time = capture_source_for_event(result, impact_event)
+                evidence = capture_frame_evidence(video_path, local_time, track_index)
+                impact_png, impact_error = evidence.png, evidence.error
+                frame_time_sec, capture_method = evidence.frame_time_sec, evidence.method
+                timeline_offset_sec = impact_event.time_sec - local_time
+            except Exception as exc:
+                # 영상 코덱/프레임 추출에 실패해도 기존 보고서 저장은 유지한다.
+                impact_error = f"캡처 모듈 오류: {type(exc).__name__}: {exc}"
         html_str = render_report_html(
             result, self._current_case_number, self._current_examiner, self._current_memo,
             chart_png=chart_png, map_png=map_png,
+            impact_event=impact_event, impact_png=impact_png, impact_error=impact_error,
+            impact_frame_time_sec=frame_time_sec, impact_capture_method=capture_method,
+            impact_timeline_offset_sec=timeline_offset_sec,
         )
 
         def on_done(success: bool, error_message: str) -> None:

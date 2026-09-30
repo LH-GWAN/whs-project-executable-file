@@ -13,6 +13,8 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from core import gpstime
 from core.driving_events import DrivingEvent, criteria_lines, events_by_row, summarize_counts, vehicle_label
 from core.location_table import COL_EVENT, COL_G, COL_LAT, COL_LON, COL_SPEED, COL_TIME, row_texts
+from core.impact import ImpactEvent, DEFAULT_IMPACT_THRESHOLD_G
+from report.report_html_snapshot import ReportHtmlSnapshot
 from core.pipeline import PipelineResult
 from engine.engine_adapter import TrackPoint
 
@@ -64,7 +66,13 @@ def _image_section(title: str, png_bytes: Optional[bytes], caption: str) -> str:
 
 def render_report_html(pipeline_result: PipelineResult, case_number: str, examiner: str,
                         memo: str, chart_png: Optional[bytes] = None,
-                        map_png: Optional[bytes] = None) -> str:
+                        map_png: Optional[bytes] = None,
+                        impact_event: Optional[ImpactEvent] = None,
+                        impact_png: Optional[bytes] = None,
+                        impact_error: str = "",
+                        impact_frame_time_sec: Optional[float] = None,
+                        impact_capture_method: str = "",
+                        impact_timeline_offset_sec: float = 0.0) -> str:
     records = pipeline_result.extraction.points
     events = pipeline_result.driving_events
     row_indices = _select_row_indices(records, events)
@@ -110,6 +118,35 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
                           "초록 실선은 주행 경로, 색 선과 이름표는 위험운전 행동(범례 참고), "
                           "회색 점선은 GPS 수신이 끊긴 구간입니다. 분석 완료 시점의 전체 경로입니다.")
     )
+    # G센서 합력의 최근 평균 대비 절대 편차만 표시한다. 차량 충돌의 확정 판정이나
+    # 물리학적 충격량(impulse, N·s)으로 표현하지 않는다.
+    if impact_event is None:
+        impact_html = ("<h2>충격값 편차 감지</h2>"
+                       f"<p>직전 2초 평균 대비 절대 편차 {DEFAULT_IMPACT_THRESHOLD_G:.2f}g 이상인 구간이 없거나 "
+                       "판단할 연속 센서 데이터가 부족합니다(최소 1초 관측·이전 2개 샘플).</p>")
+    else:
+        ev = impact_event
+        details = (f"영상 {ev.time_sec:.3f}초 / 최근 2초 내 평균 {ev.baseline_g:.3f}g → "
+                   f"현재 {ev.current_g:.3f}g / 절대 편차 {ev.deviation_g:.3f}g "
+                   f"(탐지 기준 {ev.threshold_g:.2f}g, 기준 샘플 {ev.baseline_samples}개)")
+        impact_html = ("<h2>충격값 편차 감지</h2>"
+                       f"<p>{_esc(details)}</p>"
+                       "<p>G센서 합력의 최근 평균 대비 절대 편차를 나타내는 참고 지표입니다. "
+                       "차량 충돌 확정 또는 물리적 충격량(N·s) 산출 결과가 아닙니다.</p>")
+        if impact_png and impact_frame_time_sec is not None:
+            offset_sec = impact_frame_time_sec + impact_timeline_offset_sec - ev.time_sec
+            frame_caption = (
+                f"{details} / 캡처 영상 프레임 실제 PTS {impact_frame_time_sec:.3f}초 "
+                f"(감지 시각과 차이 {offset_sec:+.3f}초, 추출 방식 {impact_capture_method or '미지정'})"
+            )
+            if impact_timeline_offset_sec:
+                frame_caption += (f" / 이어보기 프레임 시각 "
+                                  f"{impact_frame_time_sec + impact_timeline_offset_sec:.3f}초")
+            impact_html += _image_section("최초 감지 시점 인근 영상 프레임", impact_png, frame_caption)
+        else:
+            impact_html += ("<p>프레임 캡처 불가: "
+                            + _esc(impact_error or "영상 프레임을 확인하지 못했습니다.") + "</p>")
+    visuals_html += impact_html
     outlier_count = extraction.outlier_count
     warning_html = "".join(f"<li>{_esc(w)}</li>" for w in extraction.warnings)
     failed_checks = sum(p.gps_checksum_ok is False or p.gps_trusted is False for p in records)
@@ -223,19 +260,32 @@ class ReportExporter(QObject):
         self._out_path = out_path
         self._on_done = on_done
         self._view = QWebEngineView()
+        self._html_snapshot = ReportHtmlSnapshot(html_str)
+        self._completed = False
         self._view.loadFinished.connect(self._on_load_finished)
         self._view.page().pdfPrintingFinished.connect(self._on_pdf_finished)
-        self._view.setHtml(html_str, QUrl("about:blank"))
+        # Avoid the 2 MB data URL limit when charts and impact PNGs are embedded.
+        # Keep the report HTML in a private, short-lived temporary directory.
+        self._view.load(QUrl.fromLocalFile(self._html_snapshot.path))
 
     # A4에 글 쓸 때처럼 양쪽에 여백을 둔다. printToPdf의 기본 레이아웃은 여백 0이다.
     PAGE_LAYOUT = QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait,
                               QMarginsF(20, 18, 20, 18), QPageLayout.Millimeter)
 
+    def _finish(self, success: bool, message: str) -> None:
+        if self._completed:
+            return
+        self._completed = True
+        self._html_snapshot.close()
+        self._on_done(success, message)
+
     def _on_load_finished(self, ok: bool) -> None:
+        if self._completed:
+            return
         if not ok:
-            self._on_done(False, "리포트 HTML 로드 실패")
+            self._finish(False, "리포트 HTML 로드 실패")
             return
         self._view.page().printToPdf(self._out_path, self.PAGE_LAYOUT)
 
     def _on_pdf_finished(self, file_path: str, success: bool) -> None:
-        self._on_done(success, "" if success else "PDF 저장 실패")
+        self._finish(success, "" if success else "PDF 저장 실패")
