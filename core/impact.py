@@ -1,4 +1,3 @@
-"""최근 합력 평균으로부터의 절대 편차(g). 충돌 확정/충격량(N·s)이 아니다."""
 from __future__ import annotations
 
 import math
@@ -6,7 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-DEFAULT_IMPACT_THRESHOLD_G = 1.0
+DEFAULT_IMPACT_THRESHOLD_G = 3.0 #현재 합력과 직전 2초 평균의 절대 차이가 3.0g 이상일 때 감지, 추후 수정 가능성 있음
 BASELINE_WINDOW_SEC = 2.0
 MIN_BASELINE_SEC = 1.0
 MAX_SAMPLE_GAP_SEC = 1.0
