@@ -611,7 +611,7 @@ class MainWindow(QMainWindow):
             csv_path = self._save_location_csv(result, os.path.splitext(out_path)[0] + "_location.csv")
 
         chart_png, map_png = self._analysis_view.capture_visuals()
-        # 직전 2초 평균에서 1.0g 이상 벗어난 최초 지점만 캡처한다.
+        # 직전 2초 평균에서 기본 3.0g 이상 벗어난 최초 지점만 캡처한다.
         impact_event = find_first_impact(result.extraction.points)
         impact_png, impact_error = None, ""
         frame_time_sec, capture_method = None, ""

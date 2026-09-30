@@ -37,9 +37,9 @@ def test_g_sensor_threshold_and_first_event():
     class P:
         def __init__(self, t, g):
             self.start_time_sec, self.g_magnitude = t, g
-    points = [P(i / 10, .2) for i in range(20)] + [P(2, 1.31), P(2.1, 9)]
+    points = [P(i / 10, .2) for i in range(20)] + [P(2, 3.31), P(2.1, 9)]
     assert find_first_impact(points).index == 20
-    assert find_first_impact(points, threshold_g=2).index == 21
+    assert find_first_impact(points, threshold_g=4).index == 21
     assert find_first_impact([P(0, 1), P(1, math.nan), P(2, 20)]) is None
 
 
@@ -119,7 +119,7 @@ def test_report_renders_requested_and_actual_pts(video):
     actual = capture_frame_evidence(str(video), 1.731)
     assert actual.png, actual.error
     pts = [TrackPoint(start_time_sec=i / 10, x_g=1, y_g=0, z_g=0)
-           for i in range(17)] + [TrackPoint(start_time_sec=1.731, x_g=2.1, y_g=0, z_g=0)]
+           for i in range(17)] + [TrackPoint(start_time_sec=1.731, x_g=4.1, y_g=0, z_g=0)]
     event = find_first_impact(pts)
     extraction = ExtractionResult(RoutingResult("mp4", True, ""), pts, [], str(video))
     result = PipelineResult(1, "", str(video), extraction, 3, [], "sha256", "car")
@@ -129,6 +129,9 @@ def test_report_renders_requested_and_actual_pts(video):
         impact_capture_method=actual.method)
     assert "캡처 영상 프레임 실제 PTS 1.760초" in html
     assert "감지 시각과 차이 +0.029초" in html
+    assert "탐지 기준 3.00g" in html
+    no_event_html = render_report_html(result, "CASE", "EXAMINER", "")
+    assert "절대 편차 3.00g 이상" in no_event_html
 
 
 def test_ffmpeg6_multiple_showinfo_lines_use_encoded_first_frame(video, monkeypatch):
@@ -215,7 +218,7 @@ def test_sequence_report_preserves_local_pts_and_global_time(video):
     from engine.engine_adapter import ExtractionResult, TrackPoint
     from report.report_builder import render_report_html
     points = [TrackPoint(start_time_sec=i / 10, x_g=.2, y_g=0, z_g=0)
-              for i in range(20)] + [TrackPoint(start_time_sec=2, x_g=1.4, y_g=0, z_g=0)]
+              for i in range(20)] + [TrackPoint(start_time_sec=2, x_g=3.4, y_g=0, z_g=0)]
     ev = replace(find_first_impact(points), time_sec=62, segment_index=1)
     result = PipelineResult(1, "", str(video),
                             ExtractionResult(RoutingResult("mp4", True, ""), points, [], str(video)),
@@ -227,7 +230,7 @@ def test_sequence_report_preserves_local_pts_and_global_time(video):
     assert "실제 PTS 2.000초" in html
     assert "이어보기 프레임 시각 62.000초" in html
     assert "감지 시각과 차이 +0.000초" in html
-    assert "절대 편차 1.200g" in html
+    assert "절대 편차 3.200g" in html
     assert "배)" not in html
 
 
@@ -237,7 +240,7 @@ def test_report_button_routes_event_and_keeps_pdf_on_capture_failure(monkeypatch
     from engine.engine_adapter import ExtractionResult, TrackPoint
     from ui import main_window as mw
     points = [TrackPoint(start_time_sec=i / 10, x_g=.2, y_g=0, z_g=0)
-              for i in range(20)] + [TrackPoint(start_time_sec=2, x_g=1.4, y_g=0, z_g=0)]
+              for i in range(20)] + [TrackPoint(start_time_sec=2, x_g=3.4, y_g=0, z_g=0)]
     result = PipelineResult(1, "", str(video),
                             ExtractionResult(RoutingResult("mp4", True, ""), points, [], str(video)),
                             3, [], "sha", "car")
@@ -252,4 +255,4 @@ def test_report_button_routes_event_and_keeps_pdf_on_capture_failure(monkeypatch
     monkeypatch.setattr(mw, "ReportExporter", lambda html, *a, **kw: saved.append(html))
     mw.MainWindow._on_report_requested(owner, result)
     assert len(saved) == 1
-    assert "캡처 모듈 오류" in saved[0] and "절대 편차 1.200g" in saved[0]
+    assert "캡처 모듈 오류" in saved[0] and "절대 편차 3.200g" in saved[0]
