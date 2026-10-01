@@ -29,7 +29,7 @@ from core.appconfig import (
 from core.pipeline import PipelineResult, reopen_case, update_case_json
 from core.impact import find_first_impact
 from report.report_builder import ReportExporter, render_report_html
-from report.impact_capture import capture_frame_evidence, choose_capture_source
+from report.impact_capture import capture_frame_evidence, capture_source_for_event
 from storage.history_store import HistoryStore, default_app_data_dir
 from ui.address_resolver import AddressResolver
 from ui.analysis_view import AnalysisView
@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
 
         self._home = HomeView()
         self._home.video_selected.connect(self._on_video_selected)
+        self._home.sequence_selected.connect(self._on_sequence_selected)
         self._home.history_item_opened.connect(self._on_history_item_opened)
         self._home.history_delete_requested.connect(self._on_history_delete_requested)
         self._home.history_clear_requested.connect(self._on_history_clear_requested)
@@ -250,9 +251,9 @@ class MainWindow(QMainWindow):
         self._refresh_history()
         self._stack.setCurrentWidget(self._home)
 
-    def _compute_hash_with_progress(self, video_path: str) -> tuple:
+    def _compute_hash_with_progress(self, video_path: str, label: str = "") -> tuple:
         """영상 해시를 진행률 창과 함께 계산한다. (해시, 오류) - 취소하면 ("", ""), 실패하면 ("", 사유)."""
-        progress = QProgressDialog("파일 확인 중 (SHA-256)...", "취소", 0, 100, self)
+        progress = QProgressDialog(f"파일 확인 중 (SHA-256)...{label}", "취소", 0, 100, self)
         progress.setWindowTitle(APP_NAME)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(300)
@@ -339,10 +340,36 @@ class MainWindow(QMainWindow):
         with HistoryStore(self._history_db_path) as store:
             previous = store.find_cases_by_sha256(sha256)
         # 같은 파일이라도 보기 방식(전방만/후방만/같이)이 다르면 다른 분석이다 - 경고하지 않는다.
-        previous = [c for c in previous if same_view(c.track_mode, track_mode)]
+        previous = [c for c in previous if same_view(c.track_mode, track_mode) and not c.segments]
         if previous and not self._confirm_reanalysis(previous):
             return
 
+        self._start_analysis(video_path=video_path, sha256=sha256,
+                             rear_video_path=rear_path or "", track_mode=track_mode or "")
+
+    def _on_sequence_selected(self, items: list) -> None:
+        """연속 영상 이어보기: 영상마다 해시를 내고 사건 정보를 받아 분석한다."""
+        paths = []
+        for item in items:
+            for path in (item.front, item.rear):
+                if path and path not in paths:
+                    paths.append(path)
+        hashes = {}
+        for n, path in enumerate(paths, start=1):
+            sha256, error = self._compute_hash_with_progress(
+                path, f"\n{n}/{len(paths)} {os.path.basename(path)}")
+            if error:
+                QMessageBox.critical(
+                    self, "파일 읽기 실패",
+                    f"영상 파일을 읽을 수 없습니다:\n{path}\n\n{error}")
+                return
+            if not sha256:
+                return  # 취소
+            hashes[path] = sha256
+        self._start_analysis(video_path=items[0].primary, sha256=hashes[items[0].primary],
+                             sequence=items, sequence_sha256=hashes)
+
+    def _start_analysis(self, video_path: str, sha256: str, **worker_kwargs) -> None:
         dialog = CaseInfoDialog(self)
         if dialog.exec() != CaseInfoDialog.Accepted or dialog.result_input is None:
             return
@@ -369,11 +396,10 @@ class MainWindow(QMainWindow):
             settings=info.settings,
             cases_root_dir=self._cases_root_dir,
             history_db_path=self._history_db_path,
-            accel_threshold_mps2=info.accel_threshold_mps2,
+            vehicle_type=info.vehicle_type,
             carve_slack=info.carve_slack,
             sha256=sha256,
-            rear_video_path=rear_path or "",
-            track_mode=track_mode or "",
+            **worker_kwargs,
         )
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_ok.connect(self._on_worker_finished)
@@ -534,24 +560,69 @@ class MainWindow(QMainWindow):
                 summary += f"\n목록에 남은 {len(kept)}건은 원인을 해결한 뒤 다시 지우면 됩니다."
             QMessageBox.warning(self, "일부 삭제 실패", f"{summary}\n\n{detail}")
 
+    def _ask_report_format(self) -> str:
+        """리포트를 무엇으로 뽑을지: pdf / csv / both. 취소면 빈 문자열."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Report")
+        box.setText("리포트를 어떤 형식으로 저장할까요?")
+        box.setInformativeText(
+            "PDF: 사건 정보·위험운전·그래프·지도·좌표 표가 든 보고서\n"
+            "CSV: Location Analysis 표 전체(모든 행)를 그대로 - 엑셀에서 열 수 있습니다")
+        pdf = box.addButton("PDF", QMessageBox.AcceptRole)
+        csv = box.addButton("CSV", QMessageBox.AcceptRole)
+        both = box.addButton("PDF + CSV", QMessageBox.AcceptRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.setDefaultButton(pdf)
+        box.exec()
+        return {pdf: "pdf", csv: "csv", both: "both"}.get(box.clickedButton(), "")
+
+    def _save_location_csv(self, result: PipelineResult, suggested: str) -> str:
+        """Location Analysis 표를 CSV로. 저장한 경로(취소·실패면 빈 문자열)."""
+        from core.location_table import write_csv
+
+        out_path, _ = QFileDialog.getSaveFileName(self, "Location Analysis CSV 저장", suggested, "CSV (*.csv)")
+        if not out_path:
+            return ""
+        labels = [seg.label for seg in result.segments] if result.is_sequence else None
+        try:
+            write_csv(out_path, result.points, result.driving_events, labels)
+        except OSError as exc:
+            QMessageBox.critical(self, "Report", f"CSV를 저장하지 못했습니다: {exc}")
+            return ""
+        return out_path
+
     def _on_report_requested(self, result: PipelineResult) -> None:
-        default_name = f"{self._current_case_number or 'case'}_report.pdf"
+        fmt = self._ask_report_format()
+        if not fmt:
+            return
+        base = self._current_case_number or "case"
+        if fmt == "csv":
+            saved = self._save_location_csv(result, f"{base}_location.csv")
+            if saved:
+                QMessageBox.information(self, "Report", f"CSV를 저장했습니다:\n{saved}")
+            return
+        default_name = f"{base}_report.pdf"
         out_path, _ = QFileDialog.getSaveFileName(self, "리포트 저장", default_name, "PDF (*.pdf)")
         if not out_path:
             return
+        csv_path = ""
+        if fmt == "both":
+            csv_path = self._save_location_csv(result, os.path.splitext(out_path)[0] + "_location.csv")
 
         chart_png, map_png = self._analysis_view.capture_visuals()
-        # 기존 일반 보고서 기준(2.00배)을 보존한다.
-        # 1.30배 시험은 별도 호출에서 threshold=1.30으로 지정한다.
+        # 직전 2초 평균에서 기본 3.0g 이상 벗어난 최초 지점만 캡처한다.
         impact_event = find_first_impact(result.extraction.points)
         impact_png, impact_error = None, ""
         frame_time_sec, capture_method = None, ""
+        timeline_offset_sec = 0.0
         if impact_event is not None:
-            video_path, track_index = choose_capture_source(result)
             try:
-                evidence = capture_frame_evidence(video_path, impact_event.time_sec, track_index)
+                video_path, track_index, local_time = capture_source_for_event(result, impact_event)
+                evidence = capture_frame_evidence(video_path, local_time, track_index)
                 impact_png, impact_error = evidence.png, evidence.error
                 frame_time_sec, capture_method = evidence.frame_time_sec, evidence.method
+                timeline_offset_sec = impact_event.time_sec - local_time
             except Exception as exc:
                 # 영상 코덱/프레임 추출에 실패해도 기존 보고서 저장은 유지한다.
                 impact_error = f"캡처 모듈 오류: {type(exc).__name__}: {exc}"
@@ -560,6 +631,7 @@ class MainWindow(QMainWindow):
             chart_png=chart_png, map_png=map_png,
             impact_event=impact_event, impact_png=impact_png, impact_error=impact_error,
             impact_frame_time_sec=frame_time_sec, impact_capture_method=capture_method,
+            impact_timeline_offset_sec=timeline_offset_sec,
         )
 
         def on_done(success: bool, error_message: str) -> None:
@@ -572,7 +644,8 @@ class MainWindow(QMainWindow):
             if self._current_case_id is not None:
                 with HistoryStore(self._history_db_path) as store:
                     store.set_report_path(self._current_case_id, out_path)
-            QMessageBox.information(self, "Report", f"리포트를 저장했습니다:\n{out_path}")
+            QMessageBox.information(self, "Report", f"리포트를 저장했습니다:\n{out_path}"
+                                    + (f"\n{csv_path}" if csv_path else ""))
 
         self._report_exporter = ReportExporter(html_str, out_path, on_done, parent=self)
 

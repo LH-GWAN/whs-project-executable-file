@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.impact import find_first_impact
+from core.impact import DEFAULT_IMPACT_THRESHOLD_G, find_first_impact
 from report.impact_capture import choose_capture_source, capture_frame_png
 
 
@@ -14,33 +14,63 @@ class Sample:
     g_magnitude: float
 
 
-def test_default_threshold_and_first_only():
-    data = [Sample(0, 1.0), Sample(.1, 1.31), Sample(.2, 2.7), Sample(.3, 9.0)]
-    ev = find_first_impact(data)
-    assert ev.index == 2 and ev.time_sec == pytest.approx(.2)
-    assert ev.previous_g == pytest.approx(1.31)
+def baseline(g=.2):
+    return [Sample(i / 10, g) for i in range(20)]
 
 
-def test_131_demo_only_with_explicit_threshold():
-    data = [Sample(45.9, 1.064), Sample(46.0, 1.391)]
-    assert find_first_impact(data) is None
-    ev = find_first_impact(data, threshold=1.30)
-    assert ev.time_sec == 46.0 and ev.ratio == pytest.approx(1.391 / 1.064)
+@pytest.mark.parametrize("g", [0, .15, .4, 1.4])
+def test_same_absolute_deviation_across_device_baselines(g):
+    ev = find_first_impact(baseline(g) + [Sample(2, g + 3.1), Sample(2.1, 9)])
+    assert ev.index == 20 and ev.time_sec == 2
+    assert ev.baseline_g == pytest.approx(g)
+    assert ev.deviation_g == pytest.approx(3.1)
 
 
-def test_bad_values_break_chain():
-    from math import nan, inf
-    data = [Sample(0, 0), Sample(.1, 100), Sample(.2, nan), Sample(.3, 1),
-            Sample(.4, inf), Sample(.5, 1), Sample(.6, 0), Sample(.7, 100)]
-    assert find_first_impact(data) is None
-    assert find_first_impact([Sample(1, 1), Sample(1, 10), Sample(2, 1)]) is None
-    assert find_first_impact([Sample(2, 1), Sample(1, 9)]) is None
+def test_small_denominator_and_large_ratio_do_not_trigger():
+    assert find_first_impact(baseline(.15) + [Sample(2, .45)]) is None
+    assert find_first_impact(baseline(1.064) + [Sample(2, 1.391)]) is None
 
 
-def test_invalid_thresholds():
-    for threshold in (1, 0, -2, float("nan"), float("inf")):
-        with pytest.raises(ValueError):
-            find_first_impact([], threshold=threshold)
+def test_current_excluded_and_inclusive_boundary():
+    ev = find_first_impact(baseline(0) + [Sample(2, 3)])
+    assert ev.baseline_g == 0 and ev.deviation_g == 3
+    assert find_first_impact(baseline(0) + [Sample(2, 2.999)]) is None
+    assert find_first_impact(baseline(3.5) + [Sample(2, .5)]).deviation_g == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("bad", [None, -1, float("nan"), float("inf"), "1", True])
+def test_bad_values_reset_history(bad):
+    assert find_first_impact(baseline() + [Sample(2, bad), Sample(2.1, 5)]) is None
+    assert find_first_impact(baseline() + [Sample(bad, .2), Sample(2.1, 5)]) is None
+
+
+@pytest.mark.parametrize("time", [1.9, 1.8, 4])
+def test_nonmonotonic_and_gap_reset(time):
+    assert find_first_impact(baseline() + [Sample(time, 9)]) is None
+
+
+def test_warmup_and_window_expiration():
+    assert find_first_impact([Sample(0, .2), Sample(.5, 5)]) is None
+    points = [Sample(0, .8)] + [Sample(i / 10, .2) for i in range(1, 22)]
+    ev = find_first_impact(points + [Sample(2.2, 3.2)])
+    assert ev and ev.baseline_g == pytest.approx(.2)
+
+
+def test_segment_boundary_resets_baseline():
+    points = [SimpleNamespace(start_time_sec=i / 10, g_magnitude=.2, segment_index=0)
+              for i in range(20)]
+    points.append(SimpleNamespace(start_time_sec=2, g_magnitude=5, segment_index=1))
+    assert find_first_impact(points) is None
+
+
+@pytest.mark.parametrize("threshold", [0, -2, float("nan"), float("inf"), None, True])
+def test_invalid_thresholds(threshold):
+    with pytest.raises(ValueError):
+        find_first_impact([], threshold_g=threshold)
+
+
+def test_explicit_threshold_is_g_not_ratio():
+    assert find_first_impact(baseline(.2) + [Sample(2, .6)], threshold_g=.3)
 
 
 def test_selected_source_and_rear_track():
@@ -56,3 +86,15 @@ def test_selected_source_and_rear_track():
 def test_missing_video_has_visible_reason(tmp_path):
     png, reason = capture_frame_png(str(tmp_path / "missing.mp4"), 46.0)
     assert png is None and "없습니다" in reason
+
+
+@pytest.mark.parametrize("delta, detected", [(1.0, False), (2.99, False), (3.0, True), (3.01, True)])
+@pytest.mark.parametrize("g", [0.0, .15, .4, 1.4])
+def test_default_three_g_boundary(g, delta, detected):
+    # Pin the product default independently of the implementation constant.
+    assert DEFAULT_IMPACT_THRESHOLD_G == 3.0
+    event = find_first_impact(baseline(g) + [Sample(2, g + delta)])
+    assert (event is not None) == detected
+    if event:
+        assert event.threshold_g == 3.0
+        assert event.deviation_g == pytest.approx(delta)

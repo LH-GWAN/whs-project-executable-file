@@ -1,54 +1,68 @@
-"""G-sensor 합력의 직전 유효 샘플 대비 증가를 탐지한다.
-
-이 값은 충돌 확정이나 물리적 충격량(impulse, N·s)이 아니다.
-일반 보고서 임계값은 2.0배이다.
-"""
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-DEFAULT_IMPACT_THRESHOLD = 2.0
+DEFAULT_IMPACT_THRESHOLD_G = 3.0 #현재 합력과 직전 2초 평균의 절대 차이가 3.0g 이상일 때 감지, 추후 수정 가능성 있음
+BASELINE_WINDOW_SEC = 2.0
+MIN_BASELINE_SEC = 1.0
+MAX_SAMPLE_GAP_SEC = 1.0
 
 
 @dataclass(frozen=True)
 class ImpactEvent:
     index: int
     time_sec: float
-    previous_g: float
+    baseline_g: float
     current_g: float
-    ratio: float
-    threshold: float
+    deviation_g: float
+    threshold_g: float
+    baseline_samples: int
+    baseline_span_sec: float
+    segment_index: int = 0
 
 
-def find_first_impact(points: Iterable, threshold: float = DEFAULT_IMPACT_THRESHOLD
+def find_first_impact(points: Iterable, threshold_g: float = DEFAULT_IMPACT_THRESHOLD_G
                       ) -> Optional[ImpactEvent]:
-    """연속된 두 유효·시각 증가 센서행의 합력 비율에서 최초 기준 충족 행을 찾는다.
+    """[t-2초, t)의 유효 합력 산술평균과 현재 값의 절대 차이를 비교한다.
 
-    0/음수/NaN/Inf/시각 누락, 비단조 시각은 비교 사슬을 끊어 손상 행을
-    가로질러 허위 급증을 만들지 않는다. GPS 유무와 독립적이다.
+    현재 값은 평균에서 제외한다. 최소 1초의 관측 기간과 2개 이전 샘플이
+    필요하다. 1초 초과 공백, 손상 행, 역행/중복 시각, 영상 경계에서 초기화한다.
+    중력 제거 기기의 0g는 유효하다. GPS 유무와 독립적이다.
     """
-    if not math.isfinite(threshold) or threshold <= 1.0:
-        raise ValueError("threshold must be finite and greater than 1.0")
-    previous = None
+    if (isinstance(threshold_g, bool) or not isinstance(threshold_g, (int, float))
+            or not math.isfinite(threshold_g) or threshold_g <= 0):
+        raise ValueError("threshold_g must be finite and positive")
+    history = deque()
+    previous_time = None
+    previous_segment = None
     for index, point in enumerate(points):
-        timestamp = getattr(point, "start_time_sec", None)
-        magnitude = getattr(point, "g_magnitude", None)
-        if (not isinstance(timestamp, (float, int))
-                or not isinstance(magnitude, (float, int))
-                or not math.isfinite(timestamp) or timestamp < 0
-                or not math.isfinite(magnitude) or magnitude <= 0):
-            previous = None
+        t = getattr(point, "start_time_sec", None)
+        g = getattr(point, "g_magnitude", None)
+        segment = getattr(point, "segment_index", 0)
+        if any(isinstance(v, bool) or not isinstance(v, (int, float))
+               or not math.isfinite(v) or v < 0 for v in (t, g)):
+            history.clear()
+            previous_time = None
             continue
-        t, g = float(timestamp), float(magnitude)
-        if previous is not None:
-            prev_time, prev_g = previous
-            if t <= prev_time:
-                previous = None
+        if previous_time is not None:
+            if segment != previous_segment or t - previous_time > MAX_SAMPLE_GAP_SEC:
+                history.clear()
+            elif t <= previous_time:
+                history.clear()
+                previous_time = None
                 continue
-            ratio = g / prev_g
-            if ratio >= threshold:
-                return ImpactEvent(index, t, prev_g, g, ratio, threshold)
-        previous = (t, g)
+        previous_time, previous_segment = t, segment
+        while history and history[0][0] < t - BASELINE_WINDOW_SEC:
+            history.popleft()
+        if len(history) >= 2 and t - history[0][0] >= MIN_BASELINE_SEC:
+            # Divide before summing so finite large input cannot overflow the mean.
+            baseline = math.fsum(value / len(history) for _, value in history)
+            deviation = abs(g - baseline)
+            if deviation >= threshold_g:
+                return ImpactEvent(index, t, baseline, g, deviation, threshold_g,
+                                   len(history), t - history[0][0], segment)
+        history.append((t, g))
     return None

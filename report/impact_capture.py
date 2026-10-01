@@ -44,6 +44,25 @@ def choose_capture_source(result) -> Tuple[str, int]:
     return result.source_copy_path, 0
 
 
+def capture_source_for_event(result, event) -> Tuple[str, int, float]:
+    """Composed event time -> preserved segment file and local decoder time."""
+    segments = getattr(result, "segments", None) or []
+    if not segments:
+        path, track = choose_capture_source(result)
+        return path, track, event.time_sec
+    segment = next((s for s in segments if s.index == event.segment_index), None)
+    if segment is None:
+        raise ValueError("감지 지점의 영상 구간이 없습니다.")
+    local_time = event.time_sec - segment.offset_sec
+    if local_time < 0 or (segment.duration_sec is not None and local_time >= segment.duration_sec):
+        raise ValueError("감지 시각이 영상 구간 범위를 벗어납니다.")
+    if segment.track_mode == "rear":
+        if segment.rear_copy_path:
+            return segment.rear_copy_path, 0, local_time
+        return segment.primary_copy_path, 1, local_time
+    return segment.primary_copy_path, 0, local_time
+
+
 def _verified(png: Optional[bytes], requested: float, actual: Optional[float],
               method: str, error: str = "", allow_preceding: bool = False) -> FrameEvidence:
     if png is None:

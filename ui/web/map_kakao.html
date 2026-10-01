@@ -44,6 +44,19 @@
   .trk-arrow svg { display: block; width: 26px; height: 26px; }
   #legend .lg-arrow { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent;
     border-bottom: 12px solid #1c7ed6; display: inline-block; margin: 0 2px; }
+  /* 위험운전 이름표: 지점 위에 말풍선처럼 단다. 마우스를 올리면 시각·판정 근거가 뜬다. */
+  #legend #legend-events { display: block; margin: 0; }
+  .ev-tag {
+    display: inline-block; position: relative; padding: 2px 6px; border-radius: 3px; white-space: nowrap;
+    font: bold 11px -apple-system, "Malgun Gothic", sans-serif; color: #fff;
+    border: 1px solid rgba(255,255,255,.9); box-shadow: 0 1px 3px rgba(0,0,0,.35);
+    margin-bottom: 6px; cursor: default;
+  }
+  .ev-tag::after {
+    content: ""; position: absolute; left: 50%; bottom: -6px; margin-left: -5px;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 6px solid var(--ev-color);
+  }
   /* 리포트용 캡처 중에는 조작 요소를 숨긴다(범례는 남긴다) */
   body.capture #followBtn, body.capture #status { display: none !important; }
 </style>
@@ -52,8 +65,7 @@
 <div id="map"></div>
 <div id="legend">
   <div><i style="border-color:#1a9e5c"></i> 주행 경로</div>
-  <div><i style="border-color:#e03131"></i> 급가속 의심 구간</div>
-  <div><i style="border-color:#f08c00"></i> 급감속 의심 구간</div>
+  <div id="legend-events"></div>
   <div><i style="border-color:#9aa4ad; border-top-style:dashed"></i> GPS 끊김 구간</div>
   <div><span class="lg-arrow"></span> 현재 위치 (진행 방향)</div>
 </div>
@@ -86,6 +98,7 @@ let trackData = null;
 let pendingTrack = null;
 let followEnabled = true;
 let polylines = [];
+let eventOverlays = [];
 // 사용자가 확대/축소하거나 끈 뒤(true)에는 컨테이너 크기가 바뀌어도 궤적 전체로 다시
 // 맞추지 않는다. 예전엔 옆 패널 글자가 바뀌어 지도 칸이 조금만 커져도 fitToTrack이 불려
 // 확대가 풀렸다(검토 제보: "(미기록) 구간에서 확대가 꺼진다").
@@ -94,6 +107,7 @@ let fitting = false;
 // 따라가기 상자: 화면의 80% (가장자리에서 10%씩 안쪽)
 const FOLLOW_MARGIN = 0.10;
 let startOverlay = null, endOverlay = null, posOverlay = null;
+let segEndOverlays = [];
 
 function setStatus(text) {
   document.getElementById("status").textContent = text;
@@ -245,11 +259,9 @@ function latLng(p) {
 
 // 연속된 같은 종류의 구간을 하나의 선으로 묶는다. 지점이 수천 개라 구간마다 객체를
 // 만들면 무겁다. 종류가 바뀌는 지점은 양쪽 선이 공유해 끊김이 없게 한다.
-function buildRuns(points, flagged) {
-  const flaggedKind = new Map();
-  (flagged || []).forEach(([s, e, kind]) => { for (let i = s; i <= e; i++) flaggedKind.set(i, kind || "accel"); });
-
-  const runs = { solid: [], dashed: [], flagged: [], decel: [] };
+// 종류: "solid" / "dashed" / 위험운전 선 색("#e03131" 등, 점마다 Python이 정해 준 p.e).
+function buildRuns(points) {
+  const runs = { solid: [], dashed: [] };
   let current = null, currentKind = null;
   let prev = null;
   let sawDropout = false;
@@ -260,16 +272,20 @@ function buildRuns(points, flagged) {
       if (p.d) sawDropout = true;
       continue;
     }
+    if (prev !== null && (p.s || 0) !== (points[prev].s || 0)) {
+      // 이어보기: 영상이 바뀌는 곳은 잇지 않는다(앞 영상 끝의 검은 점에서 다음 영상이 시작한다).
+      current = null;
+      prev = null;
+    }
     if (prev !== null) {
       let kind;
-      // 두 끝점이 같은 종류의 구간에 있을 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
-      const k1 = flaggedKind.get(i), k0 = flaggedKind.get(prev);
-      if (k1 && k0 && k1 === k0) kind = (k1 === "decel" ? "decel" : "flagged");
+      // 두 끝점이 같은 위험운전 색일 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
+      if (p.e && p.e === points[prev].e) kind = p.e;
       else if (sawDropout) kind = "dashed";
       else kind = "solid";
       if (current === null || kind !== currentKind) {
         current = [latLng(points[prev]), latLng(p)];
-        runs[kind].push(current);
+        (runs[kind] = runs[kind] || []).push(current);
         currentKind = kind;
       } else {
         current.push(latLng(p));
@@ -284,9 +300,47 @@ function buildRuns(points, flagged) {
 const LINE_STYLES = {
   dashed: { strokeWeight: 3, strokeColor: "#9aa4ad", strokeOpacity: 0.9, strokeStyle: "dashed", zIndex: 1 },
   solid: { strokeWeight: 5, strokeColor: "#1a9e5c", strokeOpacity: 0.9, strokeStyle: "solid", zIndex: 2 },
-  flagged: { strokeWeight: 7, strokeColor: "#e03131", strokeOpacity: 0.95, strokeStyle: "solid", zIndex: 3 },
-  decel: { strokeWeight: 7, strokeColor: "#f08c00", strokeOpacity: 0.95, strokeStyle: "solid", zIndex: 3 },
 };
+function lineStyle(kind) {
+  return LINE_STYLES[kind] ||
+    { strokeWeight: 7, strokeColor: kind, strokeOpacity: 0.95, strokeStyle: "solid", zIndex: 3 };
+}
+
+function renderLegend(legend) {
+  const box = document.getElementById("legend-events");
+  box.innerHTML = "";
+  (legend || []).forEach(([label, color]) => {
+    const row = document.createElement("div");
+    const line = document.createElement("i");
+    line.style.borderColor = color;
+    row.appendChild(line);
+    row.appendChild(document.createTextNode(" " + label));
+    box.appendChild(row);
+  });
+}
+
+function renderEvents(events) {
+  eventOverlays.forEach((o) => o.setMap(null));
+  eventOverlays = [];
+  (events || []).forEach((ev) => {
+    // 바깥 상자는 지도 라이브러리가 위치를 잡는 데 쓰고, 이름표 모양은 안쪽에만 준다
+    // (바깥에 position을 주면 라이브러리의 absolute 배치를 덮어써 폭이 화면 끝까지 늘어난다).
+    const el = document.createElement("div");
+    const tag = document.createElement("div");
+    tag.className = "ev-tag";
+    tag.textContent = ev.label;
+    tag.title = ev.detail;
+    tag.style.background = ev.color;
+    tag.style.setProperty("--ev-color", ev.color);
+    el.appendChild(tag);
+    const overlay = new kakao.maps.CustomOverlay({
+      position: new kakao.maps.LatLng(ev.lat, ev.lon),
+      content: el, xAnchor: 0.5, yAnchor: 1, zIndex: 15,
+    });
+    overlay.setMap(map);
+    eventOverlays.push(overlay);
+  });
+}
 
 function renderTrack(payload) {
   if (!window.__mapReady) { pendingTrack = payload; trackData = payload; return; }
@@ -296,14 +350,18 @@ function renderTrack(payload) {
 
   polylines.forEach((l) => l.setMap(null));
   polylines = [];
-  const runs = buildRuns(pts, payload.flagged);
-  for (const kind of ["dashed", "solid", "flagged", "decel"]) {
+  const runs = buildRuns(pts);
+  // 일반 경로를 먼저 깔고 위험운전 색 선을 위에 그린다.
+  const kinds = ["dashed", "solid"].concat(Object.keys(runs).filter((k) => k !== "dashed" && k !== "solid"));
+  for (const kind of kinds) {
     for (const path of runs[kind]) {
-      const line = new kakao.maps.Polyline(Object.assign({ path: path }, LINE_STYLES[kind]));
+      const line = new kakao.maps.Polyline(Object.assign({ path: path }, lineStyle(kind)));
       line.setMap(map);
       polylines.push(line);
     }
   }
+  renderLegend(payload.legend);
+  renderEvents(payload.events);
 
   posOverlay.setMap(null);
   if (fixes.length) {
@@ -311,6 +369,15 @@ function renderTrack(payload) {
     startOverlay.setMap(map);
     endOverlay.setPosition(latLng(fixes[fixes.length - 1]));
     endOverlay.setMap(map);
+    // 이어보기: 영상마다 끝나는 곳에 검은 점(마지막 영상의 끝점은 위에서 찍었다).
+    segEndOverlays.forEach((o) => o.setMap(null));
+    segEndOverlays = [];
+    (payload.segEnds || []).slice(0, -1).forEach(([lat, lon]) => {
+      const o = makeDot("trk-end");
+      o.setPosition(new kakao.maps.LatLng(lat, lon));
+      o.setMap(map);
+      segEndOverlays.push(o);
+    });
     fitToTrack(payload);
     // 리포트 기준 지도: 화면을 맞춘 직후 타일까지 다 그려지면 Python이 캡처한다.
     window.__trackDrawn = (window.__trackDrawn || 0) + 1;

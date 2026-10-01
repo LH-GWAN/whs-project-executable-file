@@ -199,10 +199,10 @@ def test_report_sampling_and_escaped_warnings():
     indices = _select_row_indices(records, [])
     assert len(indices) == 200 and indices[0] == 0 and indices[-1] == 599
     extraction = ExtractionResult(RoutingResult('mp4', True, ''), records, [], '', warnings=['<script>bad</script>'])
-    result = pipeline.PipelineResult(1, '', '', extraction, 600, [], 'abc', 3)
+    result = pipeline.PipelineResult(1, '', '', extraction, 600, [], 'abc', 'car')
     html = render_report_html(result, 'case', 'examiner', '')
     assert 'class="gap"' not in html and '&lt;script&gt;' in html
-    assert 'GPS 검증' in html and '분석 상태' in html
+    assert 'GPS 검증' in html and '분석 상태' in html and '차종 기준' in html
 
 
 def test_existing_case_folder_is_never_deleted(case_env):
@@ -246,7 +246,21 @@ def test_location_verification_labels(qapp, monkeypatch):
     monkeypatch.setattr(location_tab, 'MapView', MapStub)
     tab = location_tab.LocationTab()
     tab.load([point(0, gps_checksum_ok=True), point(1, gps_checksum_ok=False), point(2)], [])
-    assert [tab._table.item(i, 6).text() for i in range(3)] == ['정상', '실패', '미제공']
+    assert [tab._table.item(i, 7).text() for i in range(3)] == ['정상', '실패', '미제공']
     assert tab._table.item(1, 3).text() == '(검증 실패)'
-    assert tab._table.item(1, 5).text() == '-'
+    assert tab._table.item(1, 6).text() == '-'
     tab.deleteLater()
+
+
+def test_mute_lowers_volume_and_restores(tracker):
+    tracker._volume.setValue(70)
+    tracker._mute_btn.click()
+    assert tracker._volume.value() == 0 and tracker._audio.volume() == 0 and tracker._audio.isMuted()
+    tracker._mute_btn.click()
+    assert tracker._volume.value() == 70 and abs(tracker._audio.volume() - 0.7) < 1e-6
+    assert not tracker._audio.isMuted()
+    tracker._mute_btn.click()
+    tracker._volume.setValue(30)   # 음소거 중 슬라이더를 올리면 해제
+    assert not tracker._mute_btn.isChecked() and abs(tracker._audio.volume() - 0.3) < 1e-6
+    tracker._volume.setValue(0)    # 0으로 내리면 음소거
+    assert tracker._mute_btn.isChecked() and tracker._audio.isMuted()

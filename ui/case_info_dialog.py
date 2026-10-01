@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
-    QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from core.acceleration import DEFAULT_THRESHOLD_MPS2
+from core.driving_events import DEFAULT_VEHICLE, VEHICLE_LABELS, VEHICLE_TYPES, criteria_lines
 
 
 @dataclass
@@ -26,7 +27,7 @@ class CaseInfoInput:
     examiner: str
     memo: str
     settings: Dict
-    accel_threshold_mps2: float
+    vehicle_type: str
     carve_slack: bool
 
 
@@ -47,11 +48,15 @@ class CaseInfoDialog(QDialog):
         self._examiner = QLineEdit()
         self._memo = QTextEdit()
         self._memo.setFixedHeight(70)
-        self._threshold = QDoubleSpinBox()
-        self._threshold.setRange(0.5, 20.0)
-        self._threshold.setSingleStep(0.5)
-        self._threshold.setValue(DEFAULT_THRESHOLD_MPS2)
-        self._threshold.setSuffix(" m/s²")
+        # 위험운전 판별 기준(국토부 DTG 기준표)이 차종마다 다르다. 승용차는 택시 기준을 쓴다.
+        self._vehicle = QComboBox()
+        for code in VEHICLE_TYPES:
+            self._vehicle.addItem(VEHICLE_LABELS[code], code)
+            self._vehicle.setItemData(self._vehicle.count() - 1,
+                                      "\n".join(criteria_lines(code)), Qt.ToolTipRole)
+        self._vehicle.setCurrentIndex(VEHICLE_TYPES.index(DEFAULT_VEHICLE))
+        self._vehicle.setToolTip("위험운전 행동(급가속·급감속·급회전 등)을 이 차종의 기준으로 판정합니다.\n"
+                                 "국토교통부 DTG 위험운전행동 판별 기준(2022), 승용차는 택시 기준")
 
         self._slack_cb = QCheckBox("MP4 슬랙 카빙 (과거 주행 이력 추가 추출, 느림)")
         self._slack_cb.setChecked(False)
@@ -75,7 +80,7 @@ class CaseInfoDialog(QDialog):
 
         form.addRow("Examiner", self._examiner)
         form.addRow("memo", self._memo)
-        form.addRow("급가·감속 임계값", self._threshold)
+        form.addRow("차종", self._vehicle)
         form.addRow("", self._slack_cb)
 
         start_btn = QPushButton("Start")
@@ -117,10 +122,10 @@ class CaseInfoDialog(QDialog):
                 "tracker": self._tracker_cb.isChecked(),
                 "speed": self._speed_cb.isChecked(),
                 "location": self._location_cb.isChecked(),
-                "accel_threshold_mps2": self._threshold.value(),
+                "vehicle_type": self._vehicle.currentData(),
                 "carve_slack": self._slack_cb.isChecked(),
             },
-            accel_threshold_mps2=self._threshold.value(),
+            vehicle_type=self._vehicle.currentData(),
             carve_slack=self._slack_cb.isChecked(),
         )
         self.accept()

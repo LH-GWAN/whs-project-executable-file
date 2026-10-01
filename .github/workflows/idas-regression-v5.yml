@@ -1,10 +1,10 @@
-name: IDAS regression (V4)
+name: IDAS regression (V5)
 
 on:
   push:
     branches:
-      - ci-verify-image-upload-v4
-      - image-upload-v4
+      - main
+      - image-upload-v5
   pull_request:
   workflow_dispatch:
 

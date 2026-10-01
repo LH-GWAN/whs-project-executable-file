@@ -34,6 +34,20 @@
   #legend i { width: 16px; height: 0; border-top-width: 3px; border-top-style: solid; }
   #legend .lg-arrow { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent;
     border-bottom: 12px solid #1c7ed6; display: inline-block; margin: 0 2px; }
+  /* 위험운전 이름표: 지점 위에 말풍선처럼 단다(HTML 마커 - 오프라인 지도엔 글꼴 타일이 없다).
+     마우스를 올리면 시각·판정 근거가 뜬다. */
+  #legend #legend-events { display: block; margin: 0; }
+  .ev-tag {
+    display: inline-block; position: relative; padding: 2px 6px; border-radius: 3px; white-space: nowrap;
+    font: bold 11px -apple-system, "Malgun Gothic", sans-serif; color: #fff;
+    border: 1px solid rgba(255,255,255,.9); box-shadow: 0 1px 3px rgba(0,0,0,.35);
+    margin-bottom: 6px; cursor: default;
+  }
+  .ev-tag::after {
+    content: ""; position: absolute; left: 50%; bottom: -6px; margin-left: -5px;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 6px solid var(--ev-color);
+  }
   /* 리포트용 캡처 중에는 조작 요소를 숨긴다(범례는 남긴다) */
   body.capture #followBtn, body.capture #status, body.capture .maplibregl-ctrl-top-left,
   body.capture .maplibregl-ctrl-bottom-left { display: none !important; }
@@ -43,8 +57,7 @@
 <div id="map"></div>
 <div id="legend">
   <div><i style="border-color:#1a9e5c"></i> 주행 경로</div>
-  <div><i style="border-color:#e03131"></i> 급가속 의심 구간</div>
-  <div><i style="border-color:#f08c00"></i> 급감속 의심 구간</div>
+  <div id="legend-events"></div>
   <div><i style="border-color:#9aa4ad; border-top-style:dashed"></i> GPS 끊김 구간</div>
   <div><span class="lg-arrow"></span> 현재 위치 (진행 방향)</div>
 </div>
@@ -67,6 +80,7 @@ let pendingTrack = null;
 let followEnabled = true;
 let selfMove = false;
 let fallbackNote = "";
+let eventMarkers = [];
 // 따라가기 상자: 화면의 80% (가장자리에서 10%씩 안쪽)
 const FOLLOW_MARGIN = 0.10;
 
@@ -154,11 +168,9 @@ async function addBasemapIfAvailable() {
   }
 }
 
-function buildFeatures(points, flagged) {
-  const solid = [], dashed = [], flaggedLines = [], decelLines = [];
-  // 구간 종류: 급가속(accel) / 급감속(decel). 같은 구간의 두 점이 모두 표시돼야 그 선이 칠해진다.
-  const flaggedKind = new Map();
-  (flagged || []).forEach(([s, e, kind]) => { for (let i = s; i <= e; i++) flaggedKind.set(i, kind || "accel"); });
+function buildFeatures(points) {
+  // 위험운전 선 색은 점마다 Python이 정해 준다(p.e). 선분 양 끝이 같은 색일 때만 칠한다.
+  const solid = [], dashed = [], eventLines = [];
 
   let prev = null;
   let sawDropout = false;
@@ -169,11 +181,14 @@ function buildFeatures(points, flagged) {
       if (p.d) sawDropout = true;
       continue;
     }
+    if (prev !== null && (p.s || 0) !== (points[prev].s || 0)) {
+      // 이어보기: 영상이 바뀌는 곳은 잇지 않는다(앞 영상 끝의 검은 점에서 다음 영상이 시작한다).
+      prev = null;
+    }
     if (prev !== null) {
       const seg = [[points[prev].lon, points[prev].lat], [p.lon, p.lat]];
-      // 두 끝점이 같은 종류의 구간에 있을 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
-      const k1 = flaggedKind.get(i), k0 = flaggedKind.get(prev);
-      if (k1 && k0 && k1 === k0) (k1 === "decel" ? decelLines : flaggedLines).push(seg);
+      // 두 끝점이 같은 위험운전 색일 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
+      if (p.e && p.e === points[prev].e) eventLines.push({ coords: seg, color: p.e });
       else if (sawDropout) dashed.push(seg);
       else solid.push(seg);
     }
@@ -184,7 +199,44 @@ function buildFeatures(points, flagged) {
     type: "FeatureCollection",
     features: coords.map((c) => ({ type: "Feature", geometry: { type: "LineString", coordinates: c }, properties: {} })),
   });
-  return { solid: fc(solid), dashed: fc(dashed), flagged: fc(flaggedLines), decel: fc(decelLines) };
+  const events = {
+    type: "FeatureCollection",
+    features: eventLines.map((l) => ({ type: "Feature", properties: { color: l.color },
+      geometry: { type: "LineString", coordinates: l.coords } })),
+  };
+  return { solid: fc(solid), dashed: fc(dashed), events: events };
+}
+
+function renderLegend(legend) {
+  const box = document.getElementById("legend-events");
+  box.innerHTML = "";
+  (legend || []).forEach(([label, color]) => {
+    const row = document.createElement("div");
+    const line = document.createElement("i");
+    line.style.borderColor = color;
+    row.appendChild(line);
+    row.appendChild(document.createTextNode(" " + label));
+    box.appendChild(row);
+  });
+}
+
+function renderEvents(events) {
+  eventMarkers.forEach((m) => m.remove());
+  eventMarkers = [];
+  (events || []).forEach((ev) => {
+    // 바깥 상자는 지도 라이브러리가 위치를 잡는 데 쓰고, 이름표 모양은 안쪽에만 준다
+    // (바깥에 position을 주면 라이브러리의 absolute 배치를 덮어써 폭이 화면 끝까지 늘어난다).
+    const el = document.createElement("div");
+    const tag = document.createElement("div");
+    tag.className = "ev-tag";
+    tag.textContent = ev.label;
+    tag.title = ev.detail;
+    tag.style.background = ev.color;
+    tag.style.setProperty("--ev-color", ev.color);
+    el.appendChild(tag);
+    eventMarkers.push(new maplibregl.Marker({ element: el, anchor: "bottom" })
+      .setLngLat([ev.lon, ev.lat]).addTo(map));
+  });
 }
 
 function renderTrack(payload) {
@@ -194,14 +246,15 @@ function renderTrack(payload) {
   const pts = payload.points || [];
   const fixes = pts.filter((p) => p.lat !== null && p.lon !== null);
 
-  const f = buildFeatures(pts, payload.flagged);
+  const f = buildFeatures(pts);
   const setData = (id, data) => {
     if (map.getSource(id)) map.getSource(id).setData(data);
   };
   setData("trk-solid", f.solid);
   setData("trk-dashed", f.dashed);
-  setData("trk-flagged", f.flagged);
-  setData("trk-decel", f.decel);
+  setData("trk-events", f.events);
+  renderLegend(payload.legend);
+  renderEvents(payload.events);
 
   const ends = { type: "FeatureCollection", features: [] };
   if (fixes.length) {
@@ -209,6 +262,11 @@ function renderTrack(payload) {
       geometry: { type: "Point", coordinates: [fixes[0].lon, fixes[0].lat] } });
     ends.features.push({ type: "Feature", properties: { kind: "end" },
       geometry: { type: "Point", coordinates: [fixes[fixes.length - 1].lon, fixes[fixes.length - 1].lat] } });
+    // 이어보기: 영상마다 끝나는 곳에 검은 점.
+    (payload.segEnds || []).slice(0, -1).forEach(([lat, lon]) => {
+      ends.features.push({ type: "Feature", properties: { kind: "end" },
+        geometry: { type: "Point", coordinates: [lon, lat] } });
+    });
   }
   setData("trk-ends", ends);
   setData("trk-pos", { type: "FeatureCollection", features: [] });
@@ -308,7 +366,7 @@ function makeArrowImage(size) {
 
 function addTrackLayers() {
   const empty = { type: "FeatureCollection", features: [] };
-  for (const id of ["trk-solid", "trk-dashed", "trk-flagged", "trk-decel", "trk-ends", "trk-pos"]) {
+  for (const id of ["trk-solid", "trk-dashed", "trk-events", "trk-ends", "trk-pos"]) {
     map.addSource(id, { type: "geojson", data: empty });
   }
   if (!map.hasImage("pos-arrow")) map.addImage("pos-arrow", makeArrowImage(64), { pixelRatio: 2 });
@@ -317,12 +375,9 @@ function addTrackLayers() {
   map.addLayer({ id: "l-solid", type: "line", source: "trk-solid",
     layout: { "line-cap": "round", "line-join": "round" },
     paint: { "line-color": "#1a9e5c", "line-width": 4 } });
-  map.addLayer({ id: "l-flagged", type: "line", source: "trk-flagged",
+  map.addLayer({ id: "l-events", type: "line", source: "trk-events",
     layout: { "line-cap": "round", "line-join": "round" },
-    paint: { "line-color": "#e03131", "line-width": 6 } });
-  map.addLayer({ id: "l-decel", type: "line", source: "trk-decel",
-    layout: { "line-cap": "round", "line-join": "round" },
-    paint: { "line-color": "#f08c00", "line-width": 6 } });
+    paint: { "line-color": ["get", "color"], "line-width": 6 } });
   map.addLayer({ id: "l-ends", type: "circle", source: "trk-ends",
     paint: {
       "circle-radius": 7,
