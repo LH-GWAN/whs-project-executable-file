@@ -229,3 +229,28 @@ def test_undersized_movi_does_not_hide_later_frames(media, tmp_path):
     result = recover_avi(source, tmp_path/'out')
     assert result['videos'][0]['decode_check']['decoded_frames'] == 60
     assert 'untrusted' in result['video_scan_range']['basis']
+
+
+def test_zero_exit_with_decoder_errors_is_not_success(tmp_path, monkeypatch):
+    from core.avi_recovery import _decode_check
+    monkeypatch.setattr('core.avi_recovery.shutil.which', lambda _: 'ffmpeg')
+    class DecoderWithError:
+        returncode = 0
+        def __init__(self, args, stdout, stderr):
+            stdout.write(b'frame=562\nprogress=end\n')
+            stderr.write(b'Error processing packet in decoder: Invalid data found\n')
+        def poll(self):
+            return self.returncode
+    monkeypatch.setattr('core.avi_recovery.subprocess.Popen', DecoderWithError)
+    result = _decode_check(tmp_path/'candidate.avi', None)
+    assert result['status'] == 'failed'
+    assert result['decoded_frames'] == 562
+
+
+def test_missing_decoded_frames_is_not_full_recovery(media, tmp_path, monkeypatch):
+    monkeypatch.setattr('core.avi_recovery._decode_check',
+        lambda *args: {'status': 'passed', 'decoded_frames': 53, 'error': ''})
+    result = recover_avi(media['mjpeg'], tmp_path/'out')
+    assert result['videos'][0]['candidate_frames'] == 60
+    assert result['videos'][0]['decode_check']['status'] == 'incomplete'
+    assert result['status'] == 'video_candidates_unverified'

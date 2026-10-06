@@ -338,7 +338,9 @@ def _decode_check(path, cancel):
             log.seek(0)
             error = log.read(4096).decode('utf-8', 'replace')
             decoded = int(frames[-1]) if frames else 0
-            return {'status': 'passed' if proc.returncode == 0 and decoded > 0 else 'failed',
+            # Some FFmpeg builds return zero even after decoder-thread errors.
+            # At loglevel=error any stderr means full decoding was not clean.
+            return {'status': 'passed' if proc.returncode == 0 and decoded > 0 and not error.strip() else 'failed',
                     'decoded_frames': decoded, 'error': error}
         finally:
             if proc.poll() is None:
@@ -454,6 +456,9 @@ def recover_avi(source, output_dir, reference=None, cancel=None, progress=None):
                 continue
             report(f'{sid}번 스트림 복원본 전체 디코딩 검증 중...')
             check = _decode_check(writer.path, cancel)
+            if check['status'] == 'passed' and check['decoded_frames'] != writer.count:
+                check['status'] = 'incomplete'
+                check['reason'] = '회수 후보 수와 실제 디코딩 프레임 수가 다릅니다.'
             manifest['videos'].append({'file': writer.path.name, 'stream': sid,
                 'candidate_frames': writer.count, 'sha256': _hash(writer.path, cancel),
                 'codec': writer.spec['codec'], 'decode_check': check})
