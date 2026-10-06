@@ -74,6 +74,9 @@ class HomeView(QWidget):
         upload_layout.addWidget(self._dual_cb, 0, Qt.AlignHCenter)
         upload_layout.addWidget(self._seq_cb, 0, Qt.AlignHCenter)
         upload_layout.addWidget(upload_btn)
+        recovery_btn = QPushButton("손상 AVI 복원")
+        recovery_btn.clicked.connect(self._open_recovery)
+        upload_layout.addWidget(recovery_btn)
         upload_layout.addStretch(1)
 
         left = QVBoxLayout()
@@ -131,6 +134,10 @@ class HomeView(QWidget):
     def set_settings_menu(self, menu) -> None:
         from ui.analysis_view import make_settings_button
         self._settings_slot.addWidget(make_settings_button(menu, self))
+
+    def _open_recovery(self) -> None:
+        from ui.recovery_dialog import RecoveryDialog
+        RecoveryDialog(self).exec()
 
     def _on_upload_clicked(self) -> None:
         if self._seq_cb.isChecked():
