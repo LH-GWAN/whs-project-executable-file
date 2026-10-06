@@ -3,6 +3,15 @@
 여기 있는 파이썬 파일은 **이 프로젝트에서 수정하지 않는다.**
 원본: https://github.com/LH-GWAN/whs-project (`ENGINE_COMMIT.txt`의 커밋)
 
+2026-10: 원본 레포 작업 사본(`Desktop/화햇/project/whs-project`, `ENGINE_COMMIT.txt` 커밋 이후의
+미커밋 수정 포함)에서 다시 복사했다. 이때 들어간 변경 - 슬랙 처리 방향 전환:
+- `integration_avi.py`: 옛 녹화 잔재가 있어도 기본은 잘라내지 않는다(`--repair-slack`일 때만
+  `_wo_slack.avi`). `--slack`으로 슬랙 영역(embedded/trailing)의 NMEA GPS를 `slack/`에 카빙
+  (`run_slack_carve_avi`). `detect_slack_info()`.
+- `integration_mp4.py`: `detect_slack_info()`.
+- `integration_blackbox.py`: `--detect-slack`(추출 없이 파일마다 `SLACK_JSON …` 한 줄),
+  `--slack`을 AVI에도 전달.
+
 - `integration_blackbox.py` — 앱이 부르는 유일한 진입점(시그니처로 AVI/MP4 판별)
 - `integration_avi.py` / `integration_mp4.py` — 위 파일이 import하는 하위 통합 스크립트
 

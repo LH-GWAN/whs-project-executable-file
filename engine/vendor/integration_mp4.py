@@ -2588,6 +2588,16 @@ def build_slack_sensor_row(off, region_kind, payload, segment):
 
 
 
+def detect_slack_info(path):
+    """앱이 영상을 고를 때 묻는 용도: 슬랙(free/skip Box·gap·trailing)이 있는지와 크기."""
+    filesize = os.path.getsize(path)
+    with open(path, "rb") as f:
+        regions, _boxes = find_slack_regions(f, filesize)
+    total = sum(e - s for _, s, e in regions)
+    return {"container": "mp4", "has_slack": bool(regions), "slack_bytes": total,
+            "regions": [{"kind": k, "start": s, "end": e} for k, s, e in regions]}
+
+
 def run_slack_carve(f, filesize, out_dir, args):
     """정상 경로 추출이 끝난 뒤, 컨테이너가 참조하지 않는 영역(free/skip Box,
     Box 사이 gap, 마지막 Box 뒤 꼬리)에서 GPS/G센서 레코드를 추가로 카빙한다.

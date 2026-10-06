@@ -12,7 +12,8 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from core import gpstime
 from core.driving_events import DrivingEvent, criteria_lines, events_by_row, summarize_counts, vehicle_label
-from core.location_table import COL_EVENT, COL_G, COL_LAT, COL_LON, COL_SPEED, COL_TIME, row_texts
+from core.location_table import (COL_EVENT, COL_G, COL_LAT, COL_LON, COL_SPEED, COL_TIME, gps_slot_rows,
+                                 has_frame_detail, row_texts)
 from core.pipeline import PipelineResult
 from engine.engine_adapter import TrackPoint
 
@@ -36,20 +37,23 @@ def _select_row_indices(records: List[TrackPoint], events: List[DrivingEvent],
                           max_rows: int = MAX_TABLE_ROWS) -> List[int]:
     if max_rows <= 0 or not records:
         return []
-    if len(records) <= max_rows:
-        return list(range(len(records)))
+    # 프레임·G센서 단위로 행을 쓰는 영상은 화면 표의 기본과 같이 1초(GPS 기록)마다 한 행만 싣는다.
+    pool = gps_slot_rows(records) if has_frame_detail(records) else list(range(len(records)))
+    if len(pool) <= max_rows:
+        return pool
     def sample(values, count):
         if count <= 0:
             return []
         if count == 1:
             return values[:1]
         return [values[round(i * (len(values) - 1) / (count - 1))] for i in range(count)]
+    pool_set = set(pool)
     flagged = sorted({i for ev in events for i in range(max(0, ev.start_index),
-                       min(len(records), ev.end_index + 1))})
+                       min(len(records), ev.end_index + 1))} & pool_set)
     if len(flagged) >= max_rows:
         return sample(flagged, max_rows)
     flagged_set = set(flagged)
-    others = [i for i in range(len(records)) if i not in flagged_set]
+    others = [i for i in pool if i not in flagged_set]
     return sorted(flagged + sample(others, max_rows - len(flagged)))
 
 
@@ -117,6 +121,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     unknown_checks = len(records) - failed_checks - ok_checks
     speeds = [records[i].speed_kmh for i in _distinct_fix_indices(records)]
     speed_summary = f"평균 {sum(speeds)/len(speeds):.1f} / 최고 {max(speeds):.1f} km/h" if speeds else "-"
+    avi_repair_html = (f'<div class="kv"><b>AVI 복구</b>{"적용" if extraction.avi_repaired else "없음"}</div>'
+                       if (routing.container or "").lower() == "avi" else "")
     # 일시는 한국 시간(UTC+9)으로 적는다. 분석 일시는 사건을 만든(엔진으로 추출한) 시각이다.
     generated = gpstime.now_display()
     analyzed = gpstime.format_local_iso(pipeline_result.analyzed_at) if pipeline_result.analyzed_at else "-"
@@ -171,8 +177,10 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   ul.criteria {{ font-size: 11px; color: #333; margin: 4px 0 6px; padding-left: 18px; }}
   tr.outlier td {{ color: #b36b00; }}
   tr.gap td {{ text-align: center; color: #999; border: none; }}
+  /* 긴 경로·해시가 종이 폭을 넘지 않게 아무 데서나 줄을 바꾼다(예전엔 경로가 잘려 나갔다). */
+  .kv, p, td {{ overflow-wrap: anywhere; word-break: break-all; }}
   .kv {{ font-size: 12px; margin: 2px 0; }}
-  .kv b {{ display: inline-block; width: 120px; }}
+  .kv b {{ display: inline-block; width: 120px; vertical-align: top; }}
 </style></head><body>
   <h1>Extraction Report</h1>
   <h2>기본 정보</h2>
@@ -190,7 +198,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>이상치 제외</b>{_esc(outlier_count)}개 지점 (좌표 급변·비정상 속도, 원본 CSV에는 보존)</div>
 
   <div class="kv"><b>분석 상태</b>{_esc(extraction.status)} — {_esc(extraction.status_detail)}</div>
-  <div class="kv"><b>AVI 복구</b>{'적용' if extraction.avi_repaired else '없음'}</div>
+  {avi_repair_html}
   <div class="kv"><b>GPS 검증(행)</b>정상 {ok_checks} / 실패 {failed_checks} / 미제공 {unknown_checks}</div>
   <p>검증 실패·이상치·비유한 수치는 지도·속도 계산에서 제외합니다. 미제공은 검증 성공을 뜻하지 않습니다.</p>
   <div class="kv"><b>속도 통계</b>{speed_summary} (유효 GPS 측정 산술평균, 반복 기록 제외)</div>

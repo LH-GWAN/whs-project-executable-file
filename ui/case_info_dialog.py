@@ -28,7 +28,6 @@ class CaseInfoInput:
     memo: str
     settings: Dict
     vehicle_type: str
-    carve_slack: bool
 
 
 class CaseInfoDialog(QDialog):
@@ -58,14 +57,6 @@ class CaseInfoDialog(QDialog):
         self._vehicle.setToolTip("위험운전 행동(급가속·급감속·급회전 등)을 이 차종의 기준으로 판정합니다.\n"
                                  "국토교통부 DTG 위험운전행동 판별 기준(2022), 승용차는 택시 기준")
 
-        self._slack_cb = QCheckBox("MP4 슬랙 카빙 (과거 주행 이력 추가 추출, 느림)")
-        self._slack_cb.setChecked(False)
-        self._slack_cb.setToolTip(
-            "컨테이너가 참조하지 않는 영역에서 이전 녹화분의 GPS를 추가로 카빙합니다.\n"
-            "결과는 engine_output/slack/ 에 따로 저장되며, 현재 영상의 재생 시각과는\n"
-            "매핑되지 않습니다(과거 녹화분이라 sample table이 없음)."
-        )
-
         title = QLabel("Case Information")
         title.setProperty("role", "title")
 
@@ -81,7 +72,6 @@ class CaseInfoDialog(QDialog):
         form.addRow("Examiner", self._examiner)
         form.addRow("memo", self._memo)
         form.addRow("차종", self._vehicle)
-        form.addRow("", self._slack_cb)
 
         start_btn = QPushButton("Start")
         start_btn.setProperty("role", "primary")
@@ -123,9 +113,7 @@ class CaseInfoDialog(QDialog):
                 "speed": self._speed_cb.isChecked(),
                 "location": self._location_cb.isChecked(),
                 "vehicle_type": self._vehicle.currentData(),
-                "carve_slack": self._slack_cb.isChecked(),
             },
             vehicle_type=self._vehicle.currentData(),
-            carve_slack=self._slack_cb.isChecked(),
         )
         self.accept()

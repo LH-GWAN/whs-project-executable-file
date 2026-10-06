@@ -138,6 +138,11 @@ class _VideoPane(QWidget):
         self._caption.setStyleSheet("color: #8a8a8a; font-size: 11px;")
         self._caption.setFixedHeight(16)
         self._caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        # QVideoWidget은 안에 네이티브 영상 창을 둔다. Windows에서 전방을 눌러 키우면 그 창이 커지며
+        # 이름표 위로 올라와 "전방"이 안 보였다(검토 제보; 후방 쪽은 보임). 이름표도 네이티브 창으로
+        # 두고 크기가 바뀔 때마다 맨 위로 올린다.
+        self._caption.setAttribute(Qt.WA_NativeWindow, True)
+        self._caption.setAutoFillBackground(True)
         self._caption.hide()
         self._video = video_widget
         self._video.setParent(self)
@@ -149,9 +154,14 @@ class _VideoPane(QWidget):
         layout.addWidget(self._video, 1)
         self.setCursor(Qt.PointingHandCursor)
 
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._caption.raise_()
+
     def set_caption(self, text: str, visible: bool) -> None:
         self._caption.setText(text)
         self._caption.setVisible(visible)
+        self._caption.raise_()
         self._caption.setToolTip("클릭하면 이 영상을 크게 봅니다. 다시 누르면 원래대로." if visible else "")
 
     def caption_text(self) -> str:

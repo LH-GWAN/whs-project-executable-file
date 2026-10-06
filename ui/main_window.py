@@ -26,7 +26,9 @@ from core.appconfig import (
     reset_map_mode,
     set_map_mode,
 )
+from core.location_table import has_frame_detail
 from core.pipeline import PipelineResult, reopen_case, update_case_json
+from engine.engine_adapter import detect_slack
 from report.report_builder import ReportExporter, render_report_html
 from storage.history_store import HistoryStore, default_app_data_dir
 from ui.address_resolver import AddressResolver
@@ -342,7 +344,10 @@ class MainWindow(QMainWindow):
         if previous and not self._confirm_reanalysis(previous):
             return
 
-        self._start_analysis(video_path=video_path, sha256=sha256,
+        carve = self._ask_slack([("전방 영상" if rear_path else "영상", video_path)])
+        if carve is None:
+            return
+        self._start_analysis(video_path=video_path, sha256=sha256, carve_slack=carve,
                              rear_video_path=rear_path or "", track_mode=track_mode or "")
 
     def _on_sequence_selected(self, items: list) -> None:
@@ -364,14 +369,64 @@ class MainWindow(QMainWindow):
             if not sha256:
                 return  # 취소
             hashes[path] = sha256
+        carve = self._ask_slack([(f"{n}번 영상", item.primary) for n, item in enumerate(items, start=1)])
+        if carve is None:
+            return
         self._start_analysis(video_path=items[0].primary, sha256=hashes[items[0].primary],
-                             sequence=items, sequence_sha256=hashes)
+                             carve_slack=carve, sequence=items, sequence_sha256=hashes)
 
-    def _start_analysis(self, video_path: str, sha256: str, **worker_kwargs) -> None:
+    def _ask_slack(self, targets: list) -> Optional[bool]:
+        """분석할 영상들의 슬랙(컨테이너가 참조하지 않는 영역) 유무를 보고, 있으면 따로 뽑을지 묻는다.
+        True=뽑는다, False=안 뽑는다(없으면 묻지 않고 False), None=취소."""
+        from ui.workers import TaskWorker
+
+        paths = [p for _label, p in targets]
+        progress = QProgressDialog("슬랙 데이터 확인 중...", "취소", 0, 0, self)
+        progress.setWindowTitle(APP_NAME)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        worker = TaskWorker(lambda _cancel, _progress: detect_slack(paths), self)
+        result = {"value": None}
+
+        def done(value) -> None:
+            result["value"] = value
+            progress.close()
+
+        worker.finished_task.connect(done)
+        worker.failed.connect(lambda _m: progress.close())
+        worker.start()
+        progress.exec()
+        worker.wait()
+        worker.deleteLater()
+        info = result["value"]
+        if info is None:
+            return None if progress.wasCanceled() else False
+        found = [(label, p, info[p]) for label, p in targets if info.get(p, {}).get("has_slack")]
+        if not found:
+            return False
+        lines = [f"  · {label} ({os.path.basename(p)}): {d.get('slack_bytes', 0) / 1048576:.1f} MB"
+                 for label, p, d in found]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("슬랙 데이터")
+        box.setText("슬랙 데이터(영상 파일이 참조하지 않는 영역)가 있습니다. 따로 뽑을까요?")
+        box.setInformativeText(
+            "\n".join(lines) + "\n\n"
+            "옛 녹화의 GPS가 남아 있을 수 있습니다. 뽑으면 본 분석과 별개로 '슬랙 데이터' 칸에서 "
+            "지도·표·그래프로 볼 수 있습니다(영상은 없습니다). 원본 영상은 자르거나 고치지 않습니다.")
+        yes = box.addButton("예, 따로 뽑기", QMessageBox.AcceptRole)
+        box.addButton("아니요", QMessageBox.RejectRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        return box.clickedButton() is yes
+
+    def _start_analysis(self, video_path: str, sha256: str, carve_slack: bool = False,
+                        **worker_kwargs) -> None:
         dialog = CaseInfoDialog(self)
         if dialog.exec() != CaseInfoDialog.Accepted or dialog.result_input is None:
             return
         info = dialog.result_input
+        info.settings["carve_slack"] = carve_slack
         self._pending_settings = info.settings
         self._pending_case_number = info.case_number
         self._pending_examiner = info.examiner
@@ -395,7 +450,7 @@ class MainWindow(QMainWindow):
             cases_root_dir=self._cases_root_dir,
             history_db_path=self._history_db_path,
             vehicle_type=info.vehicle_type,
-            carve_slack=info.carve_slack,
+            carve_slack=carve_slack,
             sha256=sha256,
             **worker_kwargs,
         )
@@ -424,6 +479,22 @@ class MainWindow(QMainWindow):
         self._current_settings = self._pending_settings
         self._analysis_view.load_result(result, self._pending_case_number, self._pending_settings)
         self._stack.setCurrentWidget(self._analysis_view)
+        self._notify_frame_detail(result)
+
+    def _notify_frame_detail(self, result: PipelineResult) -> None:
+        """프레임·G센서 단위로 행을 쓰는 영상이면 Location Analysis에 상세보기가 생긴다고 알린다."""
+        if result.is_sequence:
+            numbers = [str(seg.index + 1) for seg in result.segments if has_frame_detail(seg.points)]
+            if not numbers:
+                return
+            text = (f"{', '.join(numbers)}번 영상은 프레임 단위 기록이 있어 Location Analysis에서 "
+                    "해당 영상을 고르면 상세보기(프레임 단위)를 켤 수 있습니다.")
+        else:
+            if not has_frame_detail(result.points):
+                return
+            text = ("이 영상은 프레임 단위 기록이 있어 Location Analysis에 상세보기가 추가됩니다.\n"
+                    "기본은 1초(GPS 기록)마다 한 행이고, 상세보기를 켜면 모든 행이 보입니다.")
+        QMessageBox.information(self, "상세보기", text)
 
     def _on_cancel_requested(self) -> None:
         if self._worker is not None:

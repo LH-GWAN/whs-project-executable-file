@@ -111,14 +111,15 @@ def test_case_without_video_releases_previous_source(qapp, monkeypatch, video):
     monkeypatch.setattr(location_tab, 'MapView', MapStub)
     view = AnalysisView()
     extraction = ExtractionResult(RoutingResult('mp4', True, ''), [], [], '')
-    old = PipelineResult(1, '', video, extraction, 6, [], '', 3)
+    old = PipelineResult(1, '', video, extraction, 6, [], '', 'car')
     view.load_result(old, 'A', {})
     assert wait_until(qapp, lambda: view._tracker_tab._player.isSeekable())
-    new = PipelineResult(2, '', '', extraction, None, [], '', 3)
+    new = PipelineResult(2, '', '', extraction, None, [], '', 'car')
     view.load_result(new, 'B', {})
     assert view._tracker_tab._player.source().isEmpty()
     assert view._tracker_tab._rear_player.source().isEmpty()
     assert view._tracker_tab._duration_hint_ms == 0
     assert not view._tracker_tab._play_btn.isEnabled()
-    assert 'AVI 복구 없음' in view._analysis_status.text()
+    assert 'AVI 복구' not in view._analysis_status.text()   # MP4 사건에는 AVI 복구 문구를 적지 않는다
+    assert '슬랙 GPS 0건' in view._analysis_status.text()
     view.deleteLater(); qapp.processEvents()

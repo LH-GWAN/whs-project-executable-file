@@ -37,8 +37,7 @@ class SpeedTab(QWidget):
         stats_row.addWidget(self._max_label)
         stats_row.addWidget(self._flag_label)
         stats_row.addStretch(1)
-        # 이 탭은 속도 변화로 정해지는 넷(급가속·급출발·급감속·급정지)만 그린다 - 그 구간의 속도
-        # 선 색이 바뀐다. 방향 계열(급진로변경·급회전·급U턴)은 지도와 Location 표에서 본다.
+        # 급가속·급출발·급감속·급정지 구간은 속도 선 색이 바뀐다.
         for kind in SPEED_EVENT_KINDS:
             legend = QLabel(f"━ {EVENT_LABELS[kind]}")
             legend.setStyleSheet(f"color: {EVENT_COLORS[kind]}; font-weight: bold;")

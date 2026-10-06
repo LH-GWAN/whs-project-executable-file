@@ -21,7 +21,9 @@ from PySide6.QtWidgets import (
 from core.appinfo import APP_NAME
 from core.video_tracks import view_tag
 from core.pipeline import PipelineResult
+from core.slack import SlackSet, build_slack_set
 from ui.dataset_view import COMPOSED_LABEL, DatasetView
+from ui.slack_tab import SlackTab
 from ui.location_tab import LocationTab
 from ui.speed_tab import SpeedTab
 from ui.tracker_tab import PlaylistItem, TrackerTab
@@ -146,16 +148,30 @@ class _HashLabel(QLabel):
         super().mousePressEvent(event)
 
 
-def dataset_views(result: PipelineResult) -> List[DatasetView]:
-    """Speed/Location 탭의 묶음. 이어보기면 Composed + 영상별, 아니면 하나."""
+def slack_sets(result: PipelineResult) -> List[SlackSet]:
+    """따로 뽑은 슬랙 데이터. 이어보기면 영상마다 하나씩(있는 영상만)."""
+    if result.is_sequence:
+        sets = [build_slack_set(seg.extraction.slack_points, seg.label) for seg in result.segments]
+    else:
+        sets = [build_slack_set(result.extraction.slack_points)]
+    return [s for s in sets if s is not None]
+
+
+def dataset_views(result: PipelineResult, slacks: Optional[List[SlackSet]] = None) -> List[DatasetView]:
+    """Speed/Location 탭의 묶음. 이어보기면 Composed + 영상별, 아니면 하나. 슬랙 데이터를 뽑았으면
+    맨 뒤에 "… 슬랙" 묶음(위험운전 판정은 하지 않는다 - 시간축이 영상이 아니다)."""
     if not result.is_sequence:
-        return [DatasetView(COMPOSED_LABEL, result.points, result.driving_events)]
-    segs = result.segments
-    labels = [seg.label for seg in segs]
-    composed = DatasetView(COMPOSED_LABEL, result.points, result.driving_events,
-                           boundaries=[(seg.offset_sec, seg.label) for seg in segs[1:]],
-                           segment_labels=labels)
-    return [composed] + [DatasetView(seg.label, seg.points, seg.driving_events) for seg in segs]
+        views = [DatasetView(COMPOSED_LABEL, result.points, result.driving_events)]
+    else:
+        segs = result.segments
+        labels = [seg.label for seg in segs]
+        composed = DatasetView(COMPOSED_LABEL, result.points, result.driving_events,
+                               boundaries=[(seg.offset_sec, seg.label) for seg in segs[1:]],
+                               segment_labels=labels)
+        views = [composed] + [DatasetView(seg.label, seg.points, seg.driving_events) for seg in segs]
+    for slack in slacks or []:
+        views.append(DatasetView(slack.label, slack.points, []))
+    return views
 
 
 class AnalysisView(QWidget):
@@ -245,6 +261,16 @@ class AnalysisView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(header)
         layout.addWidget(file_info)
+        # 슬랙 데이터를 따로 뽑은 사건: 파일 정보 바로 밑에 "슬랙 데이터: [video1] [video3]" 줄.
+        # 누르면 그 슬랙 탭으로 간다. 뽑지 않았거나 슬랙에 GPS가 없으면 줄 자체를 숨긴다.
+        self._slack_bar = QWidget()
+        self._slack_bar.setObjectName("SlackBar")
+        self._slack_bar_layout = QHBoxLayout(self._slack_bar)
+        self._slack_bar_layout.setContentsMargins(12, 2, 12, 2)
+        self._slack_bar_layout.setSpacing(8)
+        self._slack_bar.hide()
+        self._slack_tabs: List[SlackTab] = []
+        layout.addWidget(self._slack_bar)
         self._analysis_status = QLabel("")
         self._analysis_status.setWordWrap(True)
         self._analysis_status.setTextFormat(Qt.PlainText)
@@ -258,10 +284,12 @@ class AnalysisView(QWidget):
         self._case_label.setText(f"Case Number : {case_number}")
         extraction = result.extraction
         prefix = f"이어보기 {len(result.segments)}개 영상 · " if result.is_sequence else ""
+        container = (extraction.routing.container or "").lower()
+        # "AVI 복구"는 AVI에만 해당하는 처리라 MP4 사건에는 적지 않는다(검토 의견).
+        repair = f" · AVI 복구 {'적용' if extraction.avi_repaired else '없음'}" if container == "avi" else ""
         self._analysis_status.setText(
-            f"{prefix}분석 상태: {extraction.status} · 경고 {len(extraction.warnings)}건 · "
-            f"AVI 복구 {'적용' if extraction.avi_repaired else '없음'} · "
-            f"슬랙 별도 좌표 {len(extraction.slack_points)}건")
+            f"{prefix}분석 상태: {extraction.status} · 경고 {len(extraction.warnings)}건{repair} · "
+            f"슬랙 GPS {len(extraction.slack_points)}건")
         self._analysis_status.setToolTip(extraction.status_message + "\n" + "\n".join(extraction.warnings))
 
         self._file_views = self._build_file_views(result)
@@ -292,7 +320,9 @@ class AnalysisView(QWidget):
             self._tracker_tab.load_track(result.extraction.points, result.driving_events)
         else:
             self._tracker_tab.stop()
-        views = dataset_views(result)
+        slacks = slack_sets(result)   # 슬랙을 뽑지 않았거나 GPS가 없으면 빈 목록
+        self._rebuild_slack_tabs(slacks)
+        views = dataset_views(result, slacks)
         if settings.get("speed", True):
             self._tabs.addTab(self._speed_tab, "Speed Analysis")
             self._speed_tab.load_views(views, result.vehicle_type)
@@ -300,7 +330,34 @@ class AnalysisView(QWidget):
             self._tabs.addTab(self._location_tab, "Location Analysis")
             self._location_tab.load_views(views)
 
+        for tab in self._slack_tabs:
+            self._tabs.addTab(tab, f"Slack · {tab.slack.source_label}" if tab.slack.source_label else "Slack")
         self._on_tab_changed(self._tabs.currentIndex())
+
+    def _rebuild_slack_tabs(self, slacks: List[SlackSet]) -> None:
+        for tab in self._slack_tabs:
+            tab.deleteLater()
+        self._slack_tabs = []
+        while self._slack_bar_layout.count():
+            item = self._slack_bar_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        if not slacks:
+            self._slack_bar.hide()
+            return
+        caption = QLabel("슬랙 데이터")
+        caption.setProperty("role", "info-key")
+        self._slack_bar_layout.addWidget(caption)
+        for slack in slacks:
+            tab = SlackTab(slack)
+            tab.map_view().online_map_failed.connect(self.online_map_failed)
+            self._slack_tabs.append(tab)
+            button = QPushButton(slack.source_label or "슬랙 보기")
+            button.setToolTip(slack.summary + "\n누르면 슬랙 데이터 탭으로 갑니다 (영상 없음, 지도만)")
+            button.clicked.connect(lambda _c=False, t=tab: self._tabs.setCurrentWidget(t))
+            self._slack_bar_layout.addWidget(button)
+        self._slack_bar_layout.addStretch(1)
+        self._slack_bar.show()
 
     # ---------- 파일 정보 줄 ----------
     def _build_file_views(self, result: PipelineResult) -> List[Dict]:
@@ -410,7 +467,7 @@ class AnalysisView(QWidget):
 
     def reload_maps(self) -> None:
         """지도 사용 방식(오프라인/온라인)이 바뀐 뒤 이미 떠 있는 지도를 새 방식으로 다시 띄운다."""
-        for tab in (self._tracker_tab, self._location_tab):
+        for tab in (self._tracker_tab, self._location_tab, *self._slack_tabs):
             tab.map_view().reload()
 
     def set_case_number(self, case_number: str) -> None:

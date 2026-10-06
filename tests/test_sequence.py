@@ -147,3 +147,28 @@ def test_seek_slider_click_jumps(tracker):
     slider.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, point, point, Qt.LeftButton,
                                        Qt.LeftButton, Qt.NoModifier))
     assert got and 65000 < got[0] < 85000
+
+
+def test_one_second_rows_and_frame_detail():
+    from core.location_table import gps_slot_rows, has_frame_detail, row_texts
+    # INAVI형: GPS 1초 + 사이 G센서 행 9개
+    pts = []
+    for sec in range(3):
+        pts.append(TrackPoint(start_time_sec=float(sec), latitude=37.5, longitude=127.0, speed_kmh=10,
+                              gps_date="2025-09-01", gps_utc_time=f"12:00:{sec:02}"))
+        pts += [TrackPoint(start_time_sec=sec + 0.1 * k, x_g=0.1, y_g=0.1, z_g=1.0) for k in range(1, 10)]
+    assert gps_slot_rows(pts) == [0, 10, 20] and has_frame_detail(pts)
+    assert row_texts(pts[1], [])[1:3] == ["-", "-"]          # GPS 없는 행은 "-"
+    plain = [p for i, p in enumerate(pts) if i in (0, 10, 20)]
+    assert not has_frame_detail(plain)
+
+
+def test_slack_track_orders_by_gps_time():
+    from core.slack import build_slack_set
+    raw = [TrackPoint(latitude=37.5, longitude=127.0, speed_kmh=5, gps_date="2023-05-26", gps_utc_time="01:00:05"),
+           TrackPoint(latitude=37.5, longitude=127.0, speed_kmh=5, gps_date="2023-05-26", gps_utc_time="01:00:00"),
+           TrackPoint(latitude=37.6, longitude=127.0, speed_kmh=5)]
+    slack = build_slack_set(raw, "video2")
+    assert slack.label == "video2 슬랙" and slack.dates == ["2023-05-26"]
+    assert [p.start_time_sec for p in slack.points] == [0.0, 5.0, None]
+    assert build_slack_set([], "x") is None

@@ -16,6 +16,40 @@ SEGMENT_HEADER = "영상"
 LINK_TEXT = "지도에서 보기"
 
 
+def _is_gps_row(p: TrackPoint) -> bool:
+    return p.has_gps_record or p.has_coords
+
+
+def _gps_key(p: TrackPoint):
+    utc = (p.gps_utc_time or "").strip()
+    if utc:
+        return ("utc", p.gps_date or "", utc)
+    return ("val", p.latitude, p.longitude, p.speed_kmh)
+
+
+def gps_slot_rows(points: List[TrackPoint]) -> List[int]:
+    """GPS 기록이 바뀌는 행(기록 하나당 첫 행)의 번호 - "1초마다" 보기. 같은 기록을 반복해 쓴
+    행(VUGERA는 초당 31행, FineVu 17행)과 G센서 전용 행(INAVI 0.1초)은 빠진다."""
+    out: List[int] = []
+    prev_key = None
+    for i, p in enumerate(points):
+        if not _is_gps_row(p):
+            continue
+        key = _gps_key(p)
+        if key != prev_key:
+            out.append(i)
+            prev_key = key
+    return out
+
+
+def has_frame_detail(points: List[TrackPoint]) -> bool:
+    """GPS 기록보다 훨씬 자주 행을 쓰는 영상(프레임·G센서 단위)인가. 그러면 Location 표는 기본으로
+    1초 단위 행만 보이고 '상세보기'로 전체 행을 연다."""
+    slots = len(gps_slot_rows(points))
+    extra = len(points) - slots
+    return extra >= 5 and len(points) >= 1.5 * max(1, slots)
+
+
 def validation_text(rec: TrackPoint) -> str:
     if rec.gps_checksum_ok is False or rec.gps_trusted is False:
         return "실패"
@@ -35,7 +69,7 @@ def row_texts(rec: TrackPoint, here: Sequence[DrivingEvent]) -> List[str]:
     elif rec.is_dropout:
         lat, lon = "(GPS 끊김)", "-"
     else:
-        lat, lon = "(GPS 없음)", "-"
+        lat, lon = "-", "-"   # GPS 기록이 없는 행(G센서 전용 등). 예전엔 "(GPS 없음)"이었다.
     if failed:
         speed = "(검증 실패)"
     elif rec.is_outlier:

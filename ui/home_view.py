@@ -136,10 +136,16 @@ class HomeView(QWidget):
         if self._seq_cb.isChecked():
             self._upload_sequence()
             return
+        if self._dual_cb.isChecked():
+            self._notice("전방 영상을 선택해 주세요.")
         path, _ = QFileDialog.getOpenFileName(self, "블랙박스 영상 선택 (전방)", "", VIDEO_FILTER)
         if not path:
             return
         self._start_single(path)
+
+    def _notice(self, text: str, title: str = "영상 선택") -> None:
+        """파일 창의 제목만으로는 뭘 고르는지 잘 안 보인다는 의견으로, 창을 띄우기 전에 알린다."""
+        QMessageBox.information(self, title, text)
 
     def _start_single(self, path: str) -> None:
         track_mode = ""
@@ -191,6 +197,7 @@ class HomeView(QWidget):
         받지 않고 다시 고르거나 전방만 분석하게 한다 - 전혀 다른 영상을 나란히 틀면 뒤죽박죽이
         되는데 막을 방법이 없다는 검토 의견. 취소하면 전방만 분석."""
         suggested = find_rear_sibling(front_path) or ""
+        self._notice("후방 영상을 선택해 주세요.\n(취소하면 전방만 분석합니다)")
         while True:
             rear, _ = QFileDialog.getOpenFileName(
                 self, "후방 영상 선택 (취소하면 전방만 분석)",
@@ -310,6 +317,7 @@ class HomeView(QWidget):
 
     def _upload_sequence(self) -> None:
         dual = self._dual_cb.isChecked()
+        self._notice("전방 영상들을 선택해 주세요. (여러 개 선택)" if dual else "이어볼 영상들을 선택해 주세요. (여러 개 선택)")
         fronts, _ = QFileDialog.getOpenFileNames(
             self, "전방 영상들을 선택해 주세요 (여러 개)" if dual else "이어볼 영상들을 선택해 주세요 (여러 개)",
             "", VIDEO_FILTER)
@@ -328,6 +336,7 @@ class HomeView(QWidget):
                 return
         rears: List[str] = []
         if dual and not (len(dual_track) == len(fronts) and track_mode == TRACK_MODE_BOTH):
+            self._notice("후방 영상들을 선택해 주세요. (여러 개 선택)\n(취소하면 전방만 이어봅니다)")
             rears, _ = QFileDialog.getOpenFileNames(
                 self, "후방 영상들을 선택해 주세요 (여러 개, 취소하면 전방만 이어봅니다)",
                 os.path.dirname(fronts[0]), VIDEO_FILTER)

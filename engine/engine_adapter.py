@@ -4,12 +4,13 @@ import csv
 import glob
 import math
 import os
+import json
 import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from core.format_sniffer import RoutingResult, sniff
 from engine.registry import ENGINE_NAME, NEEDS_EXTRA_TRACK_PASSES
@@ -530,3 +531,30 @@ def load_existing_results(output_dir: str) -> tuple[List[TrackPoint], Optional[s
     points.sort(key=lambda p: (p.start_time_sec is None, p.start_time_sec or 0.0))
     time_source = next((p.time_source for p in points if p.time_source), "")
     return points, primary, time_source
+
+
+def detect_slack(paths: List[str], timeout_sec: float = 300) -> Dict[str, dict]:
+    """영상마다 슬랙(컨테이너가 참조하지 않는 영역) 유무·크기. 엔진 `--detect-slack`(추출 없음)을
+    서브프로세스로 돌리고 `SLACK_JSON …` 줄을 읽는다. 못 읽은 파일은 has_slack=False, error."""
+    out: Dict[str, dict] = {}
+    if not paths:
+        return out
+    argv = build_subprocess_argv(["--detect-slack", *paths])
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout_sec)
+        stdout = proc.stdout or ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {p: {"path": p, "has_slack": False, "error": str(exc)} for p in paths}
+    for line in stdout.splitlines():
+        if not line.startswith("SLACK_JSON "):
+            continue
+        try:
+            info = json.loads(line[len("SLACK_JSON "):])
+        except ValueError:
+            continue
+        if isinstance(info, dict) and info.get("path"):
+            out[info["path"]] = info
+    for p in paths:
+        out.setdefault(p, {"path": p, "has_slack": False, "error": "감지 결과 없음"})
+    return out

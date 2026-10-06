@@ -5,7 +5,9 @@ from typing import List
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
+    QHBoxLayout,
     QLabel,
+    QPushButton,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -17,7 +19,8 @@ from core import geocode
 from core.driving_events import DrivingEvent, events_by_row
 from core.geocode import external_map_url
 from core.location_table import (COL_CHECK, COL_EVENT, COL_G, COL_LAT, COL_LINK, COL_LON,
-                                 COL_SPEED, COLUMNS, SEGMENT_HEADER, row_texts)
+                                 COL_SPEED, COLUMNS, SEGMENT_HEADER, gps_slot_rows, has_frame_detail,
+                                 row_texts)
 from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
 from ui.dataset_view import COMPOSED_LABEL, DatasetView, fill_view_bar, make_view_bar
@@ -31,7 +34,6 @@ _MAP_LINK_COLUMN = COL_LINK
 # 이어보기의 "영상" 칸. 논리 번호는 맨 뒤(기존 칸 번호를 그대로 두려고)지만 화면에서는 맨 앞에 둔다.
 _SEGMENT_COLUMN = len(COLUMNS)
 _DROPOUT_COLOR = QColor(190, 110, 40)
-_NOGPS_COLOR = QColor(170, 170, 170)
 _IMPACT_COLOR = QColor(200, 60, 60)
 _IMPACT_G = 2.0
 
@@ -45,6 +47,15 @@ class LocationTab(QWidget):
         self._map = MapView()
         self._views: List[DatasetView] = []
         self._view_bar = make_view_bar(self._show_view)
+        # 프레임·G센서 단위로 행을 쓰는 영상은 기본으로 1초(GPS 기록)마다 한 행만 보인다.
+        # 상세보기를 켜면 모든 행이 나온다(검토 의견: 기본은 1초, 필요할 때만 프레임 단위).
+        self._detail_btn = QPushButton("상세보기 (프레임 단위)")
+        self._detail_btn.setCheckable(True)
+        self._detail_btn.setToolTip("이 영상은 GPS보다 자주 행을 기록합니다. 켜면 모든 행(프레임·G센서 단위)을,\n"
+                                    "끄면 GPS 기록마다 한 행(1초 단위)만 보입니다.")
+        self._detail_btn.toggled.connect(lambda _on: self._show_view(self.current_view()))
+        self._detail_btn.hide()
+        self._row_index: List[int] = []   # 표 행 → 지점 번호
         self._table = QTableWidget(0, len(COLUMNS) + 1)
         self._table.setHorizontalHeaderLabels(COLUMNS + [SEGMENT_HEADER])
         self._table.horizontalHeader().moveSection(_SEGMENT_COLUMN, 0)
@@ -79,18 +90,22 @@ class LocationTab(QWidget):
         splitter.addWidget(table_panel)
         splitter.setSizes([500, 500])
 
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 4, 0)
+        top.addWidget(self._view_bar, 1)
+        top.addWidget(self._detail_btn)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._view_bar)
+        layout.addLayout(top)
         layout.addWidget(splitter, 1)
 
     def map_view(self) -> MapView:
         return self._map
 
     def _on_cell_double_clicked(self, row: int, column: int) -> None:
-        if column != _MAP_LINK_COLUMN or not (0 <= row < len(self._points)):
+        if column != _MAP_LINK_COLUMN or not (0 <= row < len(self._row_index)):
             return
-        point = self._points[row]
+        point = self._points[self._row_index[row]]
         if not point.has_fix:
             return
         QDesktopServices.openUrl(QUrl(external_map_url(point.latitude, point.longitude)))
@@ -105,8 +120,9 @@ class LocationTab(QWidget):
         rows = self._table.selectionModel().selectedRows() if self._table.selectionModel() else []
         if not rows:
             return
-        index = rows[0].row()
-        if 0 <= index < len(self._points):
+        row = rows[0].row()
+        if 0 <= row < len(self._row_index):
+            index = self._row_index[row]
             point = self._points[index]
             if point.start_time_sec is not None:
                 self._map.set_playback_time(point.start_time_sec)
@@ -160,10 +176,15 @@ class LocationTab(QWidget):
         self._selected_key = None
         self._table.setColumnHidden(_SEGMENT_COLUMN, not view.segment_labels)
 
+        detail = has_frame_detail(records)
+        self._detail_btn.setVisible(detail)
+        self._row_index = list(range(len(records))) if (not detail or self._detail_btn.isChecked()) \
+            else gps_slot_rows(records)
         row_events = events_by_row(events, len(records))
-        self._table.setRowCount(len(records))
-        for row, rec in enumerate(records):
-            here = row_events[row]
+        self._table.setRowCount(len(self._row_index))
+        for row, index in enumerate(self._row_index):
+            rec = records[index]
+            here = row_events[index]
             texts = row_texts(rec, here)
             items = [QTableWidgetItem(t) for t in texts]
             lat_item, lon_item = items[COL_LAT], items[COL_LON]
@@ -178,9 +199,6 @@ class LocationTab(QWidget):
             elif texts[COL_LAT] == "(GPS 끊김)":
                 lat_item.setForeground(_DROPOUT_COLOR)
                 lon_item.setForeground(_DROPOUT_COLOR)
-            elif texts[COL_LAT] == "(GPS 없음)":
-                lat_item.setForeground(_NOGPS_COLOR)
-                lon_item.setForeground(_NOGPS_COLOR)
             g = rec.g_magnitude
             if g is not None and g >= _IMPACT_G:
                 items[COL_G].setForeground(_IMPACT_COLOR)
