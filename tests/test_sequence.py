@@ -172,3 +172,21 @@ def test_slack_track_orders_by_gps_time():
     assert slack.label == "video2 슬랙" and slack.dates == ["2023-05-26"]
     assert [p.start_time_sec for p in slack.points] == [0.0, 5.0, None]
     assert build_slack_set([], "x") is None
+
+
+def test_detect_slack_sees_appended_file(tmp_path):
+    """첫 RIFF/ftyp가 선언한 크기 뒤에 파일이 통째로 이어붙어 있으면 그 뒤는 슬랙이다."""
+    import struct
+    from engine.engine_adapter import detect_slack
+    riff = b"RIFF" + struct.pack("<I", 4 + 8 + 64) + b"AVI " + b"LIST" + struct.pack("<I", 64) + b"hdrl" + b"\0" * 60
+    avi = tmp_path / "a.avi"
+    avi.write_bytes(riff + riff)                       # 같은 RIFF를 한 번 더 이어붙임
+    box = lambda t, payload: struct.pack(">I", 8 + len(payload)) + t + payload
+    mp4 = tmp_path / "b.mp4"
+    first = box(b"ftyp", b"isom" + b"\0" * 12) + box(b"moov", b"\0" * 32)
+    mp4.write_bytes(first + box(b"ftyp", b"isom" + b"\0" * 12) + box(b"mdat", b"\0" * 100))
+    info = detect_slack([str(avi), str(mp4)])
+    assert info[str(avi)]["has_slack"] and info[str(avi)]["regions"][0]["kind"] == "appended_riff"
+    assert info[str(avi)]["regions"][0]["start"] == len(riff)
+    assert info[str(mp4)]["has_slack"] and info[str(mp4)]["regions"][0]["kind"] == "appended_file"
+    assert info[str(mp4)]["regions"][0]["start"] == len(first)

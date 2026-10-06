@@ -675,7 +675,11 @@ OpenMapTiles의 `transportation` / `building` 이 **아니다**.
 RIFF)를 보면 `_wo_slack.avi`로 잘라내 그걸로 추출했는데("AVI 복구"), 이제 기본은 원본 그대로
 추출한다(idx1은 현재 녹화분만 가리키므로 결과는 같다 - 실샘플 VUGERA 2246개 그대로). 잘라내려면
 `--avi-opt=--repair-slack`. 슬랙 안의 옛 GPS는 `--slack`으로 MP4·AVI 모두 `<out>/slack/`에
-카빙한다(엔진 `integration_avi.run_slack_carve_avi`, NMEA 텍스트만 - FineVu 72바이트 이진은 못 찾음).
+카빙한다(엔진 `integration_avi.run_slack_carve_avi`, NMEA 텍스트만 - FineVu 72바이트 이진은 시그니처가 없어
+못 찾고, 사용자 결정으로 하지 않는다). 슬랙 영역은 세 가지다: movi 안의 옛 녹화 잔재(`embedded`), 첫
+RIFF가 선언한 크기 뒤에 **옛 녹화 파일이 통째로 이어붙은 경우**(`appended_riff` - 예전엔 뒤의 RIFF를
+정상 파일로 세서 놓쳤다), 미상 꼬리(`trailing`). MP4는 free/skip 박스·gap·꼬리에 더해 두 번째 `ftyp`
+부터 끝까지(`appended_file`). 실샘플 두 개를 이어붙여 확인: AVI는 뒤 파일 GPS 2271건, MP4는 69건이 나온다.
 
 - **고를 때 묻는다**: 파일을 고르고 해시를 낸 뒤 엔진 `--detect-slack`(추출 없이 `SLACK_JSON` 한 줄,
   `engine_adapter.detect_slack`)으로 슬랙 유무·크기를 보고, 있으면 "슬랙 데이터가 있습니다(n번 영상

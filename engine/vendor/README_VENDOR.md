@@ -7,8 +7,8 @@
 미커밋 수정 포함)에서 다시 복사했다. 이때 들어간 변경 - 슬랙 처리 방향 전환:
 - `integration_avi.py`: 옛 녹화 잔재가 있어도 기본은 잘라내지 않는다(`--repair-slack`일 때만
   `_wo_slack.avi`). `--slack`으로 슬랙 영역(embedded/trailing)의 NMEA GPS를 `slack/`에 카빙
-  (`run_slack_carve_avi`). `detect_slack_info()`.
-- `integration_mp4.py`: `detect_slack_info()`.
+  (`run_slack_carve_avi`). `detect_slack_info()`. 첫 RIFF 뒤에 이어붙은 RIFF(`appended_riff`)도 슬랙.
+- `integration_mp4.py`: `detect_slack_info()`. 두 번째 `ftyp`부터 끝까지 슬랙(`appended_file`).
 - `integration_blackbox.py`: `--detect-slack`(추출 없이 파일마다 `SLACK_JSON …` 한 줄),
   `--slack`을 AVI에도 전달.
 
