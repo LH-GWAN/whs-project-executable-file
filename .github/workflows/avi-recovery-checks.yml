@@ -64,7 +64,8 @@ jobs:
           python -m compileall -q app.py core engine ui storage report tests
           python -m core.avi_recovery --help
       - name: Full pytest including real AVI decode and Qt cases
-        run: python -m pytest -q -ra tests --junitxml=test-results.xml
+        timeout-minutes: 5
+        run: python -m pytest -vv -ra -o faulthandler_timeout=60 tests --junitxml=test-results.xml
       - name: Require complete test execution
         shell: python
         run: |
