@@ -19,7 +19,8 @@ class RecoveryDialog(QDialog):
         layout = QVBoxLayout(self)
         notice = QLabel('AVI의 남아 있는 MJPEG/H.264 영상과 NMEA GPS를 회수합니다.\n'
                         '헤더가 소실됐으면 동일 기기·해상도·코덱·FPS·채널 순서의 정상 AVI를 지정하세요.\n'
-                        '참조가 없으면 가능한 JPEG 정지영상과 GPS만 회수합니다. MP4는 지원하지 않습니다.')
+                        '참조가 없으면 가능한 JPEG 정지영상과 GPS만 회수합니다. MP4는 지원하지 않습니다.\n'
+                        '영상 끝 경계를 확인할 수 없으면 슬랙 혼입을 막기 위해 AVI 생성을 보류합니다.')
         notice.setWordWrap(True)
         layout.addWidget(notice)
         form = QFormLayout()
@@ -83,7 +84,8 @@ class RecoveryDialog(QDialog):
         verified = sum(v['decode_check']['status'] == 'passed' for v in result['videos'])
         self._status.setText(f"결과: 디코딩 검증 성공 영상 {verified}개 / 영상 후보 {len(result['videos'])}개 / "
             f"JPEG {result['jpeg_stills']}개 / GPS {result['gps_records']}개\n{result['output_dir']}\n"
-            '영상 후보는 재생 성공을 보장하지 않습니다. recovery.json에서 검증 결과를 확인하세요.')
+            '영상 후보는 재생 성공을 보장하지 않습니다. recovery.json에서 검증 결과를 확인하세요.'
+            + ('\n'+result['video_withheld_reason'] if result.get('video_withheld_reason') else ''))
         self._open.setEnabled(True)
 
     def _failed(self, message):

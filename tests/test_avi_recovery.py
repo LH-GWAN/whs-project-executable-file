@@ -72,6 +72,16 @@ def test_mjpeg_severe_damage_decodes_survivors(media, tmp_path, kind, expected):
     before = sha(src)
     out = tmp_path/'result'
     result = recover_avi(src, out, media['mjpeg'] if kind == 'header_and_middle' else None)
+    if kind in ('combined', 'header_and_middle'):
+        # No trustworthy movi size or idx1 survives: a reference cannot prove
+        # where this recording ends. Keep isolated stills, never stitch slack.
+        assert result['videos'] == []
+        assert result['jpeg_stills'] == expected
+        assert result['jpeg_scope'] == 'whole_file_untrusted'
+        assert result['video_boundary_verified'] is False
+        assert result['video_withheld_reason']
+        assert sha(src) == before == result['source_sha256'] == sha(out/'damaged_source.avi')
+        return
     assert result['status'] == 'video_recovered'
     video = result['videos'][0]
     assert video['candidate_frames'] == expected
@@ -139,12 +149,18 @@ def test_trailing_slack_excluded_from_video(media, tmp_path):
 def test_wrong_reference_dimensions_not_accepted(media, tmp_path):
     source = tmp_path/'broken.avi'
     mutate(media['mjpeg'], 'header_and_middle', source)
+    raw = bytearray(source.read_bytes())
+    original = media['mjpeg'].read_bytes()
+    idx = original.rfind(b'idx1')
+    raw[idx:] = original[idx:]
+    source.write_bytes(raw)
     ref = bytearray(media['mjpeg'].read_bytes())
     off = ref.index(b'strf')+8+4
     struct.pack_into('<i', ref, off, 640)
     reference = tmp_path/'reference.avi'
     reference.write_bytes(ref)
     result = recover_avi(source, tmp_path/'out', reference)
+    assert result['video_boundary_verified']
     assert not result['videos']
     assert result['jpeg_stills'] == 45
 
@@ -193,9 +209,10 @@ def test_eighty_percent_frames_and_all_headers_destroyed(media, tmp_path):
     source = tmp_path/'severely_damaged.avi'
     source.write_bytes(raw)
     result = recover_avi(source, tmp_path/'out', media['mjpeg'])
-    assert result['videos'][0]['candidate_frames'] == 12
-    assert result['videos'][0]['decode_check']['decoded_frames'] == 12
-    assert result['videos'][0]['decode_check']['status'] == 'passed'
+    assert result['videos'] == []
+    assert result['jpeg_stills'] == 12
+    assert result['video_boundary_verified'] is False
+    assert result['jpeg_scope'] == 'whole_file_untrusted'
 
 
 def test_all_chunk_headers_destroyed_body_survives(media, tmp_path):
@@ -228,7 +245,7 @@ def test_undersized_movi_does_not_hide_later_frames(media, tmp_path):
     source.write_bytes(raw)
     result = recover_avi(source, tmp_path/'out')
     assert result['videos'][0]['decode_check']['decoded_frames'] == 60
-    assert 'untrusted' in result['video_scan_range']['basis']
+    assert result['video_scan_range']['basis'] == 'idx1_validated'
 
 
 def test_zero_exit_with_decoder_errors_is_not_success(tmp_path, monkeypatch):

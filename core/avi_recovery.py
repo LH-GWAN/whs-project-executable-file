@@ -145,20 +145,86 @@ def _nal_types(data):
             if m.end() < len(data) and not data[m.end()] & 128}
 
 
-def _media_bounds(buf):
-    """Honor a surviving movi boundary so normal trailing slack is not promoted."""
-    for match in re.finditer(b'LIST....movi', buf, re.DOTALL):
+def _index_boundary(buf, cancel=None, limit=None):
+    """Find idx1 backed by several surviving chunk headers, not a bare signature.
+
+    Offsets may be absolute or relative to the lost movi marker. Infer one
+    common base and require agreement across dispersed index entries.
+    """
+    limit = len(buf) if limit is None else limit
+    pos = 0
+    candidates = 0
+    while True:
+        _check(cancel)
+        pos = buf.find(b'idx1', pos, limit)
+        if pos < 0 or pos + 8 > len(buf):
+            return None
+        index = pos
+        pos += 4
+        candidates += 1
+        if candidates > 256:
+            return None
+        size = _u32(buf, index + 4)
+        if size < 48 or size % 16 or size // 16 > MAX_RECORDS or index + 8 + size > limit:
+            continue
+        count = size // 16
+        entries = [struct.unpack_from('<4sIII', buf, index + 8 + n*16)
+                   for n in sorted({i*(count-1)//min(count-1, 15) for i in range(min(count, 16))})]
+        if any(not re.fullmatch(rb'[0-9]{2}(?:dc|db|wb|st|tx|pc)', tag)
+               or not 0 < length <= MAX_PACKET for tag, _, off, length in entries):
+            continue
+        bases = {0}
+        # Find a surviving anchor near the start; later probes test the same base.
+        for tag, _, off, length in entries[:4]:
+            p = 0
+            for _ in range(128):
+                p = buf.find(tag, p, min(index, MAX_HEADER))
+                if p < 0:
+                    break
+                if p+8 <= index and _u32(buf, p+4) == length and p >= off:
+                    bases.add(p-off)
+                p += 1
+        for base in sorted(bases):
+            hits = 0
+            for tag, _, off, length in entries:
+                p = base + off
+                if p+8+length <= index and buf[p:p+4] == tag and _u32(buf, p+4) == length:
+                    hits += 1
+            if hits >= max(3, (len(entries)+1)//2):
+                return index
+    return None
+
+
+def _media_bounds(buf, cancel=None):
+    """Bound media independently of reference headers; never widen into slack."""
+    # A second complete AVI is a separate recording, never boundary evidence
+    # for the damaged first recording. This also prevents borrowing its idx1.
+    limit = len(buf)
+    for other in re.finditer(rb'RIFF....AVI LIST....hdrl', buf, re.DOTALL):
+        if other.start() > 0:
+            limit = other.start()
+            break
+    index = _index_boundary(buf, cancel, limit)
+    for match in re.finditer(b'LIST....movi', buf[:min(limit, MAX_HEADER)], re.DOTALL):
+        _check(cancel)
         p = match.start()
         size = _u32(buf, p+4)
-        if size >= 4:
-            end = p+8+size
-            if end <= len(buf):
-                following = bytes(buf[end:end+4])
-                if end == len(buf) or following in (b'idx1', b'JUNK', b'RIFF', b'LIST'):
-                    return p+12, end, 'movi'
-                return p+12, len(buf), 'invalid_movi_size_untrusted'
+        if size < 4:
+            continue
+        end = p+8+size
+        if index is not None and index >= p+12:
+            return p+12, index, 'movi' if end == index else 'idx1_validated'
+        if end <= limit:
+            following = bytes(buf[end:end+4])
+            # A surviving size remains a boundary even if idx1 itself is erased.
+            if end == limit or following in (b'idx1', b'JUNK', b'RIFF', b'LIST', b'\0'*4):
+                return p+12, end, 'movi'
+        elif (limit == len(buf) and end <= MAX_FILE and buf[:4] == b'RIFF'
+              and buf[8:12] == b'AVI ' and _u32(buf, 4)+8 >= end):
             return p+12, len(buf), 'truncated_movi'
-    # Signature/size lost. This scope is explicitly untrusted, never a current-track source.
+        break
+    if index is not None:
+        return 0, index, 'idx1_validated'
     return 0, len(buf), 'whole_file_untrusted'
 
 
@@ -404,7 +470,13 @@ def recover_avi(source, output_dir, reference=None, cancel=None, progress=None):
                 manifest['reference'] = {'path': str(reference), 'sha256': ref_hash,
                                          'usage': 'headers_only_user_selected'}
             specs = {i: s for i, (h, fmt) in enumerate(streams) if (s := _video_spec(h, fmt))}
-            scope = _media_bounds(buf)
+            scope = _media_bounds(buf, cancel)
+            bounded = scope[2] != 'whole_file_untrusted'
+            manifest['video_boundary_verified'] = bounded
+            manifest['video_withheld_reason'] = (None if bounded else
+                '영상 경계를 확인할 수 없어 슬랙 혼입 방지를 위해 AVI 생성을 보류했습니다.')
+            if not bounded:
+                specs = {}
             manifest['video_scan_range'] = {'start': scope[0], 'end': scope[1], 'basis': scope[2]}
             report('손상 구간 뒤의 영상 청크와 GPS를 탐색 중...')
             for sid, spec in specs.items():
@@ -421,6 +493,7 @@ def recover_avi(source, output_dir, reference=None, cancel=None, progress=None):
             manifest['gps_records'] = _gps(buf, work/'recovered_gps.csv', cancel)
             # Header-free MJPEG salvage: keep stills, never guess frame rate/camera identity.
             manifest['jpeg_stills'] = 0
+            manifest['jpeg_scope'] = scope[2]
             if not any(w.count for w in writers.values()):
                 pos, end = scope[0], scope[1]
                 stills = work/'jpeg_stills'
@@ -472,6 +545,8 @@ def recover_avi(source, output_dir, reference=None, cancel=None, progress=None):
             raise ValueError('복원 도중 참조 영상이 변경됐습니다.')
         (work/'recovery.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
         (work/'READ_ME.txt').write_text(TIMING_WARNING+'\n\n상태: '+manifest['status']+
+            '\n'+(manifest['video_withheld_reason'] or '')+
+            '\nJPEG 경계 근거: '+manifest['jpeg_scope']+
             '\n영상·GPS·JPEG의 원본 위치는 *_offsets.csv 및 recovered_gps.csv에 기록됩니다.\n'
             'FFmpeg 검증이 passed인 영상만 실제 디코딩 성공이 확인된 것입니다.\n'
             '참조 영상은 같은 기기·해상도·코덱·FPS·채널 순서여야 합니다.\n', encoding='utf-8')
