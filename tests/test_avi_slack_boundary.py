@@ -35,15 +35,15 @@ def test_index_bounds_damaged_video_before_decodable_slack(media, tmp_path, code
     assert result['video_scan_range']['basis'] == 'idx1_validated'
     assert result['video_boundary_verified']
     rows = list(csv.DictReader((out/'frame_offsets.csv').open(encoding='utf-8-sig')))
-    expected_offsets = {p for _, p, data in frames
-                        if damage != 'header_middle' or not a <= p < b}
+    # A lost H.264 reference also invalidates frames 35..39 until IDR 40.
+    excluded_stop = 40 if codec == 'libx264' else 35
+    expected_offsets = {p for n, (_, p, data) in enumerate(frames)
+                        if damage != 'header_middle' or not 20 <= n < excluded_stop}
     assert {int(r['source_payload_offset']) for r in rows} == expected_offsets
     assert all(int(r['source_payload_offset'])+int(r['source_payload_size']) <= idx for r in rows)
     assert result['videos'][0]['candidate_frames'] == len(expected_offsets)
-    # Middle H.264 loss may break prediction. Never require false decode success.
-    if codec == 'mjpeg' or damage != 'header_middle':
-        assert result['videos'][0]['decode_check']['status'] == 'passed'
-        assert result['videos'][0]['decode_check']['decoded_frames'] == len(expected_offsets)
+    assert result['videos'][0]['decode_check']['status'] == 'passed'
+    assert result['videos'][0]['decode_check']['decoded_frames'] == len(expected_offsets)
     gps = list(csv.DictReader((out/'recovered_gps.csv').open(encoding='utf-8-sig')))
     assert len(gps) == 1 and int(gps[0]['source_offset']) == gps_offset
     assert gps[0]['scope'] == 'whole_file_untrusted'

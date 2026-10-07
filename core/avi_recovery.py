@@ -275,6 +275,31 @@ def _packets(buf, specs, cancel, scope):
         pos = next_pos
 
 
+def _intact_gap(buf, start, end, sid):
+    """Recognize interleaved chunks without mistaking silent audio for damage.
+
+    A missing/rejected video chunk or unparseable gap breaks H.264 prediction.
+    Accept the unpadded chunk layout used by some dashcams as well as RIFF pads.
+    """
+    while start < end:
+        if buf[start:start+1] == b'\0':
+            start += 1
+            if start == end:
+                return True
+        if start+8 > end:
+            return False
+        tag = bytes(buf[start:start+4])
+        size = _u32(buf, start+4)
+        if not (tag == b'JUNK' or re.fullmatch(rb'[0-9]{2}(?:dc|db|wb|st|tx|pc)', tag)):
+            return False
+        if tag in (f'{sid:02d}dc'.encode(), f'{sid:02d}db'.encode()):
+            return False
+        if size > MAX_PACKET or start+8+size > end:
+            return False
+        start += 8+size
+    return True
+
+
 class _AVIWriter:
     """One video stream only: no synthetic GPS/audio interleaving or old indices."""
     def __init__(self, path, spec):
@@ -288,6 +313,12 @@ class _AVIWriter:
         self.sps = self.pps = False
         self.started = spec['codec'] in ('MJPG', 'JPEG')
         self.config = []
+        self.damaged_packets = self.dependent_packets = self.discontinuities = 0
+
+    def break_prediction(self):
+        self.started = False
+        self.config.clear()
+        self.discontinuities += 1
 
     def _prefix(self):
         s = self.spec
@@ -303,6 +334,12 @@ class _AVIWriter:
 
     def add(self, data):
         if self.spec['codec'] not in ('MJPG', 'JPEG'):
+            # Treat long zero runs as suspected overwrites, conservatively
+            # excluding padded packets too. Resume only at the next IDR.
+            if b'\0'*32 in data:
+                self.damaged_packets += 1
+                self.break_prediction()
+                return False
             types = _nal_types(data)
             self.sps |= 7 in types
             self.pps |= 8 in types
@@ -312,6 +349,7 @@ class _AVIWriter:
                         self.config.append(data)
                     return False
                 if not (5 in types and self.sps and self.pps):
+                    self.dependent_packets += 1
                     return False
                 data = b''.join(self.config) + data
                 self.config.clear()
@@ -484,8 +522,13 @@ def recover_avi(source, output_dir, reference=None, cancel=None, progress=None):
             with (work/'frame_offsets.csv').open('x', newline='', encoding='utf-8-sig') as log:
                 rows = csv.writer(log)
                 rows.writerow(['stream', 'recovered_frame_index', 'source_payload_offset', 'source_payload_size'])
+                previous_ends = {}
                 for sid, offset, data in _packets(buf, specs, cancel, scope):
                     writer = writers[sid]
+                    if (writer.spec['codec'] not in ('MJPG', 'JPEG') and sid in previous_ends
+                            and not _intact_gap(buf, previous_ends[sid], offset-8, sid)):
+                        writer.break_prediction()
+                    previous_ends[sid] = offset+len(data)
                     if writer.add(data):
                         rows.writerow([sid, writer.count-1, offset, len(data)])
             for writer in writers.values():
@@ -534,6 +577,9 @@ def recover_avi(source, output_dir, reference=None, cancel=None, progress=None):
                 check['reason'] = '회수 후보 수와 실제 디코딩 프레임 수가 다릅니다.'
             manifest['videos'].append({'file': writer.path.name, 'stream': sid,
                 'candidate_frames': writer.count, 'sha256': _hash(writer.path, cancel),
+                'h264_exclusions': {'zero_filled_packets': writer.damaged_packets,
+                    'waiting_for_idr_packets': writer.dependent_packets,
+                    'prediction_breaks': writer.discontinuities},
                 'codec': writer.spec['codec'], 'decode_check': check})
         manifest['status'] = ('video_recovered' if any(v['decode_check']['status'] == 'passed' for v in manifest['videos'])
             else 'video_candidates_unverified' if manifest['videos'] else 'metadata_or_stills_only'
