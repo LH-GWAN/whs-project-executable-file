@@ -254,3 +254,15 @@ def test_missing_decoded_frames_is_not_full_recovery(media, tmp_path, monkeypatc
     assert result['videos'][0]['candidate_frames'] == 60
     assert result['videos'][0]['decode_check']['status'] == 'incomplete'
     assert result['status'] == 'video_candidates_unverified'
+
+
+def test_cli_help_with_legacy_windows_output_encoding():
+    import os
+    import sys
+    env = dict(os.environ, PYTHONIOENCODING='cp1252', PYTHONUTF8='0')
+    result = subprocess.run(
+        [sys.executable, '-m', 'core.avi_recovery', '--help'],
+        cwd=Path(__file__).resolve().parents[1], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+    assert result.returncode == 0, result.stderr.decode('utf-8', 'replace')
+    assert '손상 AVI' in result.stdout.decode('utf-8')

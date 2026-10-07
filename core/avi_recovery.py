@@ -488,6 +488,11 @@ def recover_avi(source, output_dir, reference=None, cancel=None, progress=None):
 
 
 def main():
+    # Redirected Windows consoles may default to cp1252, which cannot print Korean.
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='backslashreplace')
     p = argparse.ArgumentParser(description='손상 AVI에서 영상/GPS 회수 (원본 보존)')
     p.add_argument('source')
     p.add_argument('output', help='존재하지 않는 새 결과 폴더')
