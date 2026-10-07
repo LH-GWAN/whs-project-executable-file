@@ -26,6 +26,10 @@ jobs:
       QT_QPA_PLATFORM: offscreen
       QTWEBENGINE_DISABLE_SANDBOX: "1"
       QTWEBENGINE_CHROMIUM_FLAGS: --disable-gpu
+      # Hosted runners have no reliable GPU decode surfaces; exercise real
+      # Qt playback with software decoding, including stop/release teardown.
+      QT_FFMPEG_DECODING_HW_DEVICE_TYPES: ","
+      QT_DISABLE_HW_TEXTURES_CONVERSION: "1"
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
     steps:
