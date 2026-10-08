@@ -145,13 +145,15 @@ def _nal_types(data):
             if m.end() < len(data) and not data[m.end()] & 128}
 
 
-def _index_boundary(buf, cancel=None, limit=None):
+def _index_boundary(buf, cancel=None, limit=None, *, details=False, media_limit=None,
+                    excluded_indexes=()):
     """Find idx1 backed by several surviving chunk headers, not a bare signature.
 
     Offsets may be absolute or relative to the lost movi marker. Infer one
     common base and require agreement across dispersed index entries.
     """
     limit = len(buf) if limit is None else limit
+    media_limit = limit if media_limit is None else media_limit
     pos = 0
     candidates = 0
     while True:
@@ -164,6 +166,8 @@ def _index_boundary(buf, cancel=None, limit=None):
         candidates += 1
         if candidates > 256:
             return None
+        if any(a <= index < b for a, b in excluded_indexes):
+            continue
         size = _u32(buf, index + 4)
         if size < 48 or size % 16 or size // 16 > MAX_RECORDS or index + 8 + size > limit:
             continue
@@ -175,7 +179,13 @@ def _index_boundary(buf, cancel=None, limit=None):
             continue
         bases = {0}
         # Find a surviving anchor near the start; later probes test the same base.
-        for tag, _, off, length in entries[:4]:
+        # Dispersed probes can all lie beyond MAX_HEADER in long recordings.
+        # Use early index entries as anchors, including survivors after 8KB loss.
+        anchors = [struct.unpack_from('<4sIII', buf, index+8+n*16)
+                   for n in range(min(count, 32))]
+        for tag, _, off, length in anchors:
+            if not re.fullmatch(rb'[0-9]{2}(?:dc|db|wb|st|tx|pc)', tag):
+                continue
             p = 0
             for _ in range(128):
                 p = buf.find(tag, p, min(index, MAX_HEADER))
@@ -191,7 +201,23 @@ def _index_boundary(buf, cancel=None, limit=None):
                 if p+8+length <= index and buf[p:p+4] == tag and _u32(buf, p+4) == length:
                     hits += 1
             if hits >= max(3, (len(entries)+1)//2):
-                return index
+                # A preallocated movi can contain old recordings BEFORE idx1.
+                # Bound by all index references, not by idx1's physical address.
+                media_end = 0
+                for n in range(count):
+                    if n % 4096 == 0:
+                        _check(cancel)
+                    tag, _, off, length = struct.unpack_from('<4sIII', buf, index+8+n*16)
+                    stop = base+off+8+length
+                    if (not re.fullmatch(rb'[0-9]{2}(?:dc|db|wb|st|tx|pc)', tag)
+                            or not 0 < length <= MAX_PACKET
+                            or stop > min(index, media_limit)):
+                        break
+                    if length & 1 and stop < min(index, media_limit) and buf[stop:stop+1] == b'\0':
+                        stop += 1
+                    media_end = max(media_end, stop)
+                else:
+                    return (index, media_end) if details else index
     return None
 
 
@@ -200,11 +226,18 @@ def _media_bounds(buf, cancel=None):
     # A second complete AVI is a separate recording, never boundary evidence
     # for the damaged first recording. This also prevents borrowing its idx1.
     limit = len(buf)
+    excluded_indexes = []
     for other in re.finditer(rb'RIFF....AVI LIST....hdrl', buf, re.DOTALL):
         if other.start() > 0:
-            limit = other.start()
-            break
-    index = _index_boundary(buf, cancel, limit)
+            limit = min(limit, other.start())
+            other_end = other.start()+8+_u32(buf, other.start()+4)
+            if other.start()+24 <= other_end <= len(buf):
+                excluded_indexes.append((other.start(), other_end))
+    # An embedded stale header must not hide the current recording's index.
+    # Accept only an index whose references all precede that stale header.
+    validated = _index_boundary(buf, cancel, details=True, media_limit=limit,
+                                excluded_indexes=excluded_indexes)
+    index, indexed_end = validated if validated else (None, None)
     for match in re.finditer(b'LIST....movi', buf[:min(limit, MAX_HEADER)], re.DOTALL):
         _check(cancel)
         p = match.start()
@@ -213,7 +246,25 @@ def _media_bounds(buf, cancel=None):
             continue
         end = p+8+size
         if index is not None and index >= p+12:
-            return p+12, index, 'movi' if end == index else 'idx1_validated'
+            return p+12, indexed_end, 'movi' if end == indexed_end else 'idx1_validated'
+        if limit < len(buf) and end > limit:
+            # With idx1 lost and conflicting embedded AVI headers, retain only
+            # the contiguous chunk prefix. Never resync into the old recording.
+            cursor, count = p+12, 0
+            while cursor+8 <= limit:
+                _check(cancel)
+                tag = bytes(buf[cursor:cursor+4])
+                length = _u32(buf, cursor+4)
+                if (not re.fullmatch(rb'[0-9]{2}(?:dc|db|wb|st|tx|pc)|JUNK', tag)
+                        or length > MAX_PACKET or cursor+8+length > limit):
+                    break
+                cursor += 8+length
+                count += 1
+                if length & 1 and buf[cursor:cursor+1] == b'\0':
+                    cursor += 1
+            if count >= 3:
+                return p+12, cursor, 'contiguous_before_embedded_avi'
+            break
         if end <= limit:
             following = bytes(buf[end:end+4])
             # A surviving size remains a boundary even if idx1 itself is erased.
@@ -224,7 +275,7 @@ def _media_bounds(buf, cancel=None):
             return p+12, len(buf), 'truncated_movi'
         break
     if index is not None:
-        return 0, index, 'idx1_validated'
+        return 0, indexed_end, 'idx1_validated'
     return 0, len(buf), 'whole_file_untrusted'
 
 
@@ -267,7 +318,11 @@ def _packets(buf, specs, cancel, scope):
             if not valid:
                 pos = p+1
                 continue
-            offset, next_pos = p+8, p+8+size+(size & 1)
+            offset, next_pos = p+8, p+8+size
+            # Some dashcams omit RIFF word padding even between video chunks.
+            # Do not skip the first byte of the following chunk's identifier.
+            if size & 1 and next_pos < end and buf[next_pos:next_pos+1] == b'\0':
+                next_pos += 1
         count += 1
         if count > MAX_RECORDS:
             raise ValueError('복원 청크 수가 안전 한도를 초과했습니다.')
