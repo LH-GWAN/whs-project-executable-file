@@ -49,11 +49,20 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install ffmpeg -y --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-          $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
-          ($machinePath + ";" + $userPath).Split(";") | Where-Object { $_ } | Add-Content $env:GITHUB_PATH
+          # Pinned upstream-listed Gyan build, independent of the Chocolatey
+          # feed. Verify the publisher's archive hash before running binaries.
+          $archive = Join-Path $env:RUNNER_TEMP "ffmpeg-9.0.2.zip"
+          $unpack = Join-Path $env:RUNNER_TEMP "ffmpeg-9.0.2"
+          curl.exe --fail --location --retry 3 --retry-all-errors --connect-timeout 20 --max-time 180 --output $archive https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg download failed" }
+          $expected = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "FFmpeg archive SHA-256 mismatch" }
+          Expand-Archive -Path $archive -DestinationPath $unpack -Force
+          $exe = Get-ChildItem -Path $unpack -Filter ffmpeg.exe -Recurse -File | Select-Object -First 1
+          if (-not $exe -or -not (Test-Path (Join-Path $exe.DirectoryName "ffprobe.exe"))) { throw "FFmpeg/FFprobe not installed" }
+          $exe.DirectoryName | Add-Content $env:GITHUB_PATH
+          & $exe.FullName -version
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg cannot run" }
       - name: Install project dependencies
         run: |
           python -m pip install --upgrade pip
