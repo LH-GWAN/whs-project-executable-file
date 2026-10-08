@@ -12,6 +12,7 @@ import shutil
 import struct
 import subprocess
 import threading
+from fractions import Fraction
 
 import pytest
 
@@ -23,8 +24,8 @@ def ffmpeg(*args):
                           capture_output=True, check=True, timeout=60)
 
 
-def pixels(path):
-    r = ffmpeg('-xerror', '-i', path, '-map', '0:v:0', '-f', 'framemd5', '-')
+def pixels(path, stream=0):
+    r = ffmpeg('-xerror', '-i', path, '-map', f'0:v:{stream}', '-f', 'framemd5', '-')
     assert not r.stderr
     return [line.rsplit(',', 1)[-1].strip() for line in r.stdout.decode().splitlines()
             if line and not line.startswith('#')]
@@ -35,6 +36,13 @@ def packet_map(path):
                         '-show_entries', 'packet=pos,size,flags', '-of', 'json', str(path)],
                        capture_output=True, check=True, timeout=20)
     return json.loads(r.stdout)['packets']
+
+
+def video_rate(path):
+    r = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                        '-show_entries', 'stream=r_frame_rate', '-of', 'json', str(path)],
+                       capture_output=True, check=True, timeout=20)
+    return Fraction(json.loads(r.stdout)['streams'][0]['r_frame_rate'])
 
 
 def top_boxes(data):
@@ -55,17 +63,22 @@ def mp4_media(tmp_path_factory):
     assert shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg/FFprobe required'
     root = tmp_path_factory.mktemp('mp4')
     result = {}
-    for kind in ('avc', 'bframes', 'fragmented', 'hevc', 'wrong'):
+    for kind in ('avc', 'bframes', 'fragmented', 'hevc', 'wrong',
+                 'fragmented_bframes', 'fragmented_hevc_bframes', 'fragmented_continuous'):
         path = root / (kind + '.mp4')
-        codec = 'libx265' if kind == 'hevc' else 'libx264'
+        codec = 'libx265' if 'hevc' in kind else 'libx264'
         size = '128x96' if kind == 'wrong' else '160x90'
-        extra = (['-x265-params', 'pools=1:frame-threads=1:keyint=15:min-keyint=15:scenecut=0:bframes=0:log-level=error']
-                 if codec == 'libx265' else ['-g', '15', '-keyint_min', '15', '-sc_threshold', '0',
-                                            '-bf', '2' if kind == 'bframes' else '0'])
+        gop = '60' if kind == 'fragmented_continuous' else '15'
+        bframes = '2' if 'bframes' in kind else '0'
+        extra = (['-x265-params', 'pools=1:frame-threads=1:keyint=15:min-keyint=15:scenecut=0:'
+                  f'bframes={bframes}:log-level=error'] if codec == 'libx265' else
+                 ['-g', gop, '-keyint_min', gop, '-sc_threshold', '0', '-bf', bframes])
         ffmpeg('-f', 'lavfi', '-i', f'testsrc2=size={size}:rate=30', '-f', 'lavfi',
                '-i', 'sine=frequency=440:sample_rate=48000', '-t', '3', '-c:v', codec,
                '-threads', '1', '-pix_fmt', 'yuv420p', *extra, '-c:a', 'aac',
-               *(['-movflags', 'frag_keyframe+empty_moov+default_base_moof'] if kind == 'fragmented' else []), path)
+               *(['-movflags', 'frag_keyframe+empty_moov+default_base_moof']
+                 if kind.startswith('fragmented') else []),
+               *(['-frag_duration', '500000'] if kind == 'fragmented_continuous' else []), path)
         result[kind] = path
     return result
 
@@ -137,7 +150,8 @@ def test_classic_damage_has_exact_surviving_pixels(mp4_media, tmp_path, damage):
     assert rows and all(int(r['source_nal_offset']) + int(r['source_nal_size']) <= len(data) for r in rows)
 
 
-@pytest.mark.parametrize('kind', ['avc', 'bframes', 'hevc', 'fragmented'])
+@pytest.mark.parametrize('kind', ['avc', 'bframes', 'hevc', 'fragmented',
+                                 'fragmented_bframes', 'fragmented_hevc_bframes'])
 def test_codec_and_reordering_preserve_all_pixels(mp4_media, tmp_path, kind):
     source = mp4_media[kind]
     result = recover_mp4(source, tmp_path/'out')
@@ -145,11 +159,13 @@ def test_codec_and_reordering_preserve_all_pixels(mp4_media, tmp_path, kind):
     v = result['videos'][0]
     assert v['candidate_frames'] == v['decode_check']['decoded_frames'] == 90
     assert pixels(tmp_path/'out'/v['file']) == pixels(source)
+    assert video_rate(tmp_path/'out'/v['file']) == video_rate(source)
 
 
 @pytest.mark.parametrize('damage', ['moof_zero', 'mdat_header_zero', 'init_zero', 'fragment_payload_zero'])
-def test_fragment_resync_reaches_later_healthy_fragments(mp4_media, tmp_path, damage):
-    source = mp4_media['fragmented']; data = bytearray(source.read_bytes()); boxes = top_boxes(data)
+@pytest.mark.parametrize('kind', ['fragmented', 'fragmented_continuous'])
+def test_fragment_resync_reaches_later_healthy_fragments(mp4_media, tmp_path, damage, kind):
+    source = mp4_media[kind]; data = bytearray(source.read_bytes()); boxes = top_boxes(data)
     moofs = [b for b in boxes if b[0] == b'moof']; mdats = [b for b in boxes if b[0] == b'mdat']
     reference = None; damaged = []
     if damage == 'init_zero':
@@ -167,6 +183,47 @@ def test_fragment_resync_reaches_later_healthy_fragments(mp4_media, tmp_path, da
     indices = expected_indices(packet_map(source), damaged)
     assert v['decode_check']['decoded_frames'] == len(indices)
     assert pixels(tmp_path/'out'/v['file']) == [original[i] for i in indices]
+    assert video_rate(tmp_path/'out'/v['file']) == video_rate(source)
+
+
+@pytest.mark.parametrize('preallocated', [False, True])
+def test_fragment_partial_recording_keeps_original_fps(mp4_media, tmp_path, preallocated):
+    source = mp4_media['fragmented']; packets = packet_map(source)
+    data = bytearray(source.read_bytes())
+    end = int(packets[65]['pos']) + int(packets[65]['size']) // 2
+    damaged = [(end, len(data))]
+    if preallocated:
+        data[end:] = bytes(len(data) - end)
+    else:
+        del data[end:]
+    path = tmp_path/'unfinished.mp4'; path.write_bytes(data)
+    result = recover_mp4(path, tmp_path/'out')
+    assert result['status'] == 'video_recovered', result
+    video = result['videos'][0]; recovered = tmp_path/'out'/video['file']
+    indices = expected_indices(packets, damaged); original = pixels(source)
+    assert pixels(recovered) == [original[i] for i in indices]
+    assert video_rate(recovered) == video_rate(source)
+
+
+@pytest.mark.parametrize('damaged_stream', [0, 1])
+def test_partial_multitrack_index_loss_cannot_mix_cameras(tmp_path, damaged_stream):
+    source = tmp_path/'dual.mp4'
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=30', '-f', 'lavfi',
+           '-i', 'color=c=blue:size=160x90:rate=30', '-t', '3', '-map', '0:v', '-map', '1:v',
+           '-c:v', 'libx264', '-threads', '1', '-g', '15', '-keyint_min', '15',
+           '-sc_threshold', '0', '-bf', '0', source)
+    data = bytearray(source.read_bytes())
+    first = data.find(b'stsz'); second = data.find(b'stsz', first+4)
+    struct.pack_into('>I', data, (first, second)[damaged_stream]+12, 0xFFFFFFFF)
+    path = tmp_path/'damaged.mp4'; path.write_bytes(data)
+    result = recover_mp4(path, tmp_path/'out')
+    assert result['status'] == 'video_recovered', result
+    assert len(result['videos']) == 1, result['videos']
+    video = result['videos'][0]; live_stream = 1-damaged_stream
+    assert video['stream'] == live_stream+1
+    assert video['decode_check']['decoded_frames'] == 90
+    assert pixels(tmp_path/'out'/video['file']) == pixels(source, live_stream)
+    assert any('샘플 표' in message for message in result['diagnostics'])
 
 
 @pytest.mark.parametrize('slack', ['appended_file', 'video_in_free', 'video_before_moov', 'header_lost_appended'])

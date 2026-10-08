@@ -6,6 +6,7 @@ external data references and sample description changes rather than guessing.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 from fractions import Fraction
 import re
 import struct
@@ -388,10 +389,13 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
     """Resolve tfhd/trun offsets, including 64-bit bases and per-track defaults."""
     byid = {t.id: t for t in tracks}
     media = [(b.payload, b.end) for b in boxes if b.kind == b'mdat']
-    durations, errors, dts_ends = {}, [], {}
+    duration_counts, errors, dts_ends = {}, [], {}
+    sample_numbers = {t.id: max((n for _, _, n in t.samples), default=0) for t in tracks}
+    broken_tracks = set()
     for moof in (b for b in boxes if b.kind == b'moof'):
         check(); previous_end = moof.start
         for traf in (b for b in children(data, moof.payload, moof.end) if b.kind == b'traf'):
+            tid = None
             try:
                 tfhd = child(data, traf, b'tfhd'); p = tfhd.payload
                 if p + 8 > tfhd.end or data[p] != 0:
@@ -416,12 +420,16 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                 if p != tfhd.end:
                     raise InvalidMP4('invalid tfhd extent')
                 t = byid.get(tid); cursor = base; pending = []; ticks = 0
+                number = sample_numbers.get(tid, 0)
+                pending_composition, kept_durations = [], Counter()
+                excluded = 0
                 timing = [b for b in children(data, traf.payload, traf.end) if b.kind == b'tfdt']
                 dts = None
                 if timing:
                     td = timing[0]
                     width = 8 if data[td.payload] == 1 else 4
-                    if len(timing) != 1 or td.payload + 4 + width != td.end:
+                    if (len(timing) != 1 or td.payload + 4 + width != td.end
+                            or data[td.payload] not in (0, 1)):
                         raise InvalidMP4('invalid fragment decode time')
                     dts = int.from_bytes(data[td.payload + 4:td.end], 'big')
                 for run in (b for b in children(data, traf.payload, traf.end) if b.kind == b'trun'):
@@ -443,12 +451,21 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                             ss = u32(data, p); p += 4
                         if rf & 0x400:
                             p += 4
+                        composition = 0
                         if rf & 0x800:
+                            composition = int.from_bytes(data[p:p + 4], 'big', signed=data[run.payload] == 1)
                             p += 4
                         if not 0 < ss <= 64 * 1024 * 1024 or cursor < 0:
                             raise InvalidMP4('invalid fragment sample size/offset')
+                        number += 1
+                        if number > MAX_TABLE:
+                            raise InvalidMP4('too many declared fragment samples')
+                        pending_composition.append(composition)
                         if any(a <= cursor and cursor + ss <= b for a, b in media):
-                            pending.append((cursor, ss, len(t.samples) + len(pending) + 1 if t else 0))
+                            pending.append((cursor, ss, number))
+                            kept_durations[sd] += 1
+                        else:
+                            excluded += 1
                         ticks += sd
                         cursor += ss
                     if p != run.end:
@@ -456,16 +473,37 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                 if t:
                     if len(t.samples) + len(pending) > MAX_TABLE:
                         raise InvalidMP4('too many fragment samples')
-                    if pending and (dts is None or (tid in dts_ends and dts != dts_ends[tid])):
+                    if pending and (tid in broken_tracks or dts is None
+                                    or (tid in dts_ends and dts != dts_ends[tid])):
                         t.break_offsets.add(pending[0][0])
+                    # Keep source sample numbers, including missing samples, so
+                    # a skipped mdat cannot silently bridge prediction chains.
+                    old_number = sample_numbers.get(tid, 0)
+                    if len(t.composition) < old_number:
+                        t.composition.extend([0] * (old_number - len(t.composition)))
+                    t.composition.extend(pending_composition)
+                    sample_numbers[tid] = number
                     t.samples.extend(pending)
-                    durations[tid] = durations.get(tid, 0) + ticks
+                    duration_counts.setdefault(tid, Counter()).update(kept_durations)
+                    if excluded:
+                        errors.append(f'moof@{moof.start} track {tid}: {excluded} samples outside surviving mdat')
+                    if pending:
+                        broken_tracks.discard(tid)
                     if dts is not None:
                         dts_ends[tid] = dts + ticks
                 previous_end = cursor
             except (InvalidMP4, struct.error, IndexError) as exc:
                 errors.append(f'moof@{moof.start}: {exc}')
+                if tid in byid:
+                    broken_tracks.add(tid)
     for t in tracks:
-        if durations.get(t.id) and t.samples:
-            t.fps = Fraction(len(t.samples) * t.timescale, durations[t.id])
+        counts = duration_counts.get(t.id)
+        if counts and not counts.get(0):
+            duration, frequency = counts.most_common(1)[0]
+            total = sum(counts.values())
+            # An audio-alignment extension to one picture must not change a
+            # CFR recording's nominal playback rate. Missing pictures do not
+            # contribute durations to the review video's rate either.
+            t.fps = (Fraction(t.timescale, duration) if frequency * 2 > total else
+                     Fraction(total * t.timescale, sum(d * n for d, n in counts.items())))
     return errors

@@ -584,6 +584,13 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
             all_rows, nal_rows = [], []
             for t in videos:
                 _check(cancel); stats = dict(damaged_samples=0, waiting_for_idr=0, prediction_breaks=0)
+                if not t.samples and len(videos) > 1:
+                    reason = (f'{t.id}번 영상의 샘플 표가 소실되어 여러 영상 채널을 구별할 수 없습니다. '
+                              '채널 혼입 방지를 위해 해당 영상 생성을 보류했습니다.')
+                    manifest['diagnostics'].append(reason)
+                    manifest['video_withheld_reason'] = '\n'.join(filter(None, (
+                        manifest['video_withheld_reason'], reason)))
+                    continue
                 t.fps = requested_fps or t.fps
                 if t.codec == 'h264':
                     try:
