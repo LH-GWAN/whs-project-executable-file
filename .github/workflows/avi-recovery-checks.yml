@@ -1,8 +1,8 @@
-name: IDAS regression (AVI recovery)
+name: IDAS regression (AVI and MP4 recovery)
 
 on:
   push:
-    branches: [avi-damage-recovery]
+    branches: [avi-damage-recovery, mp4-damage-recovery]
   pull_request:
   workflow_dispatch:
 
@@ -67,7 +67,8 @@ jobs:
           node --version
           python -m compileall -q app.py core engine ui storage report tests
           python -m core.avi_recovery --help
-      - name: Full pytest including real AVI decode and Qt cases
+          python -m core.mp4_recovery --help
+      - name: Full pytest including real AVI/MP4 decode and Qt cases
         timeout-minutes: 5
         run: python -m pytest -vv -ra -o faulthandler_timeout=60 tests --junitxml=test-results.xml
       - name: Require complete test execution
@@ -77,7 +78,7 @@ jobs:
           suites = ET.parse("test-results.xml").getroot().findall("testsuite")
           totals = {key: sum(int(s.get(key, 0)) for s in suites) for key in ("tests", "failures", "errors", "skipped")}
           print(totals)
-          assert totals["tests"] >= 129, totals
+          assert totals["tests"] >= 177, totals
           assert totals["failures"] == totals["errors"] == totals["skipped"] == 0, totals
       - name: Save test results
         if: always()

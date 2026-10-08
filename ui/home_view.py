@@ -74,7 +74,7 @@ class HomeView(QWidget):
         upload_layout.addWidget(self._dual_cb, 0, Qt.AlignHCenter)
         upload_layout.addWidget(self._seq_cb, 0, Qt.AlignHCenter)
         upload_layout.addWidget(upload_btn)
-        recovery_btn = QPushButton("손상 AVI 복원")
+        recovery_btn = QPushButton("손상 AVI/MP4 복원")
         recovery_btn.clicked.connect(self._open_recovery)
         upload_layout.addWidget(recovery_btn)
         upload_layout.addStretch(1)
