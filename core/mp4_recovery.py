@@ -10,7 +10,9 @@ import argparse
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from bisect import bisect_right
 from fractions import Fraction
+import hashlib
 import json
 import math
 import mmap
@@ -18,12 +20,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
 
 from core.avi_recovery import RecoveryCancelled, _check, _hash
-from core.mp4_structure import (InvalidMP4, MAX_TABLE, Track, discover,
+from core.mp4_structure import (InvalidMP4, MAX_TABLE, Track, box_at, discover,
                                 fragment_samples, parse_moov)
 
 MAX_FILE = 16 * 1024**3
@@ -198,6 +201,12 @@ class Frame:
     modulus: int = 0
     reference: bool = False
     b_picture: bool = False
+    cra: bool = False
+    rasl: bool = False
+
+    @property
+    def random_access(self):
+        return self.idr or self.cra
 
 
 def nal_kind(nal, codec):
@@ -222,7 +231,7 @@ def nal_kind(nal, codec):
 
 def indexed_frames(buf, track, limit, media, check, stats, forbidden=()):
     avc = AVC(track.parameters) if track.codec == 'h264' else None
-    waiting = True; previous_num = None
+    waiting = True; previous_num = None; suppress_rasl = False
     for offset, size, sample in track.samples:
         check()
         try:
@@ -251,14 +260,23 @@ def indexed_frames(buf, track, limit, media, check, stats, forbidden=()):
                 elif track.codec == 'hevc' and kind < 32:
                     starts += bool(nal[2] & 0x80)
                     frame.idr |= kind in (16, 17, 18, 19, 20)
+                    frame.cra |= kind == 21
+                    frame.rasl |= kind in (8, 9)
                 frame.nals.append((p, n)); p += n
             if starts != 1:
                 raise InvalidMP4('missing/multiple picture starts')
             if offset in track.break_offsets or (previous_num is not None and sample != previous_num + 1):
                 waiting = True; stats['prediction_breaks'] += 1
             previous_num = sample
-            if frame.idr:
+            if frame.random_access:
+                # CRA starts a clean random-access sequence only after its
+                # RASL leading pictures are discarded. In an intact sequence
+                # those pictures still have their references and are retained.
+                suppress_rasl = waiting and frame.cra
                 waiting = False
+            if suppress_rasl and frame.rasl:
+                stats['discarded_rasl'] = stats.get('discarded_rasl', 0) + 1
+                continue
             if waiting:
                 stats['waiting_for_idr'] += 1
                 continue
@@ -337,34 +355,58 @@ def carved_frames(buf, track, media, check, stats):
             yield current
 
 
-def carve_metadata(buf, work, cancel):
+def carve_metadata(buf, work, cancel, boxes=(), limit=None, tracks=()):
     from core.paths import ensure_vendor_importable
     ensure_vendor_importable()
     from integration_mp4 import try_parse_nmea, classify_segment
+    limit = len(buf) if limit is None else limit
+    owners = sorted((b for b in boxes if b.kind != b'ftyp'), key=lambda b: b.start)
+    owner_starts = [b.start for b in owners]
+    text = sorted((a, a+n) for t in tracks if t.handler in (b'text', b'sbtl', b'subt', b'meta')
+                  for a, n, _ in t.samples if 0 <= a < a+n <= limit)
+    text_starts = [a for a, _ in text]
+    def region(begin, end):
+        if begin >= limit:
+            return 'after_first_recording'
+        i = bisect_right(owner_starts, begin) - 1
+        owner = owners[i] if i >= 0 and end <= owners[i].end else None
+        if owner and owner.kind in (b'free', b'skip'):
+            return 'free_or_skip'
+        j = bisect_right(text_starts, begin) - 1
+        if owner and owner.kind == b'mdat' and j >= 0 and end <= text[j][1]:
+            return 'surviving_metadata_sample'
+        if owner and begin >= owner.payload:
+            return owner.kind.decode('ascii', 'replace') + '_unindexed'
+        return 'unallocated_or_damaged'
     gps = sensor = 0
     with (work / 'recovered_gps.csv').open('x', newline='', encoding='utf-8-sig') as gf:
         w = csv.writer(gf)
         w.writerow(['source_offset', 'gps_date_utc', 'gps_time_utc', 'latitude', 'longitude',
-                    'speed_kmh', 'scope', 'raw_nmea'])
+                    'speed_kmh', 'scope', 'raw_nmea', 'source_region', 'idas_outlier_reason'])
         for m in NMEA.finditer(buf):
             _check(cancel); raw = m.group().decode('ascii'); rec = try_parse_nmea(raw)
             if (not rec or rec['checksum_ok'] is not True or not rec['status_valid'] or rec.get('mode') == 'N'
                     or rec['parse_warnings'] or rec['lat'] is None or rec['lon'] is None
-                    or (rec['lat'] == 0 and rec['lon'] == 0)):
+                    or not math.isfinite(rec['lat']) or not math.isfinite(rec['lon'])
+                    or abs(rec['lat']) > 90 or abs(rec['lon']) > 180
+                    or (abs(rec['lat']) < 1e-6 and abs(rec['lon']) < 1e-6)):
                 continue
             # GGA has no UTC date. Preserve it as unknown, never borrow a date.
             try:
                 datetime.fromisoformat((rec['date'] or '2000-01-01') + 'T' + rec['utc_time'])
             except ValueError:
                 continue
+            speed = rec.get('speed_kmh')
+            outlier = ('invalid_speed' if speed is not None and
+                       (not math.isfinite(speed) or not 0 <= speed <= 300) else '')
             w.writerow([m.start(), rec['date'], rec['utc_time'], rec['lat'], rec['lon'],
-                        rec.get('speed_kmh'), 'whole_file_untrusted', raw]); gps += 1
+                        speed, 'whole_file_untrusted', raw, region(m.start(), m.end()), outlier]); gps += 1
             if gps > MAX_TABLE:
                 raise ValueError('GPS 회수 수가 안전 한도를 초과했습니다.')
     with (work / 'recovered_gsensor.csv').open('x', newline='', encoding='utf-8-sig') as sf:
         w = csv.writer(sf)
         w.writerow(['source_offset', 'x_raw', 'y_raw', 'z_raw', 'scale', 'x_g', 'y_g', 'z_g',
-                    'scope', 'raw_sensor'])
+                    'scope', 'raw_sensor', 'source_region'])
         for m in SENSOR.finditer(buf):
             _check(cancel); raw = m.group().decode('ascii'); kind, rec = classify_segment(raw)
             values = [rec.get(k) for k in ('x_g', 'y_g', 'z_g')]
@@ -372,13 +414,13 @@ def carve_metadata(buf, work, cancel):
                     isinstance(v, (float, int)) and math.isfinite(v) and abs(v) <= 1000 for v in values):
                 continue
             w.writerow([m.start(), rec['x_raw'], rec['y_raw'], rec['z_raw'], rec['scale'], *values,
-                        'whole_file_untrusted', raw]); sensor += 1
+                        'whole_file_untrusted', raw, region(m.start(), m.end())]); sensor += 1
             if sensor > MAX_TABLE:
                 raise ValueError('G센서 회수 수가 안전 한도를 초과했습니다.')
     return gps, sensor
 
 
-def run_command(args, cancel, timeout=120):
+def run_command(args, cancel, timeout=120, *, capture_stdout=False):
     """No shell/network, cancellable, bounded log/progress files on disk."""
     with tempfile.TemporaryFile() as log, tempfile.TemporaryFile() as output:
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output, stderr=log)
@@ -391,12 +433,26 @@ def run_command(args, cancel, timeout=120):
                 if os.fstat(log.fileno()).st_size > 8 * 1024**2 or os.fstat(output.fileno()).st_size > 8 * 1024**2:
                     reason = 'log_limit'; break
                 time.sleep(.03)
+            _check(cancel)
+            # A short-lived process can exit between polls. Its final output
+            # must satisfy the same limits as a still-running process.
+            if os.fstat(log.fileno()).st_size > 8 * 1024**2 or os.fstat(output.fileno()).st_size > 8 * 1024**2:
+                reason = 'log_limit'
             if reason:
-                return dict(status=reason, error='FFmpeg 실행 한도 초과', decoded_frames=0)
-            log.seek(0); error = log.read(4096).decode('utf-8', 'replace')
-            output.seek(0); frames = re.findall(rb'frame=(\d+)', output.read())
-            return dict(status='passed' if proc.returncode == 0 and not error.strip() else 'failed',
-                        decoded_frames=int(frames[-1]) if frames else 0, error=error)
+                return dict(status=reason, error='FFmpeg 실행 한도 초과', decoded_frames=0,
+                            returncode=proc.poll(), elapsed_seconds=round(time.monotonic()-start, 3))
+            log.seek(0); errors = log.read()
+            # Inspect the complete bounded log, keeping only a short preview
+            # in the manifest. Whitespace before an error cannot hide it.
+            error = errors.decode('utf-8', 'replace').strip()[:4096]
+            output.seek(0); stdout = output.read(); frames = re.findall(rb'frame=(\d+)', stdout)
+            result = dict(status='passed' if proc.returncode == 0 and not error.strip() else 'failed',
+                        decoded_frames=int(frames[-1]) if frames else 0, error=error,
+                        returncode=proc.returncode, stderr_bytes=len(errors),
+                        elapsed_seconds=round(time.monotonic()-start, 3))
+            if capture_stdout:
+                result['stdout'] = stdout.decode('utf-8', 'replace')
+            return result
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -410,19 +466,55 @@ def decode_check(path, count, cancel):
     exe = shutil.which('ffmpeg')
     if not exe:
         return dict(status='not_run', decoded_frames=0, reason='FFmpeg 없음')
-    check = run_command([exe, '-nostdin', '-v', 'error', '-xerror', '-err_detect', 'explode',
-        '-ec', '0', '-threads', '1', '-protocol_whitelist', 'file,pipe', '-i', str(path),
+    check = run_command([exe, '-nostdin', '-v', 'error', '-xerror', '-err_detect', 'explode+bitstream+buffer+careful',
+        '-threads', '1', '-protocol_whitelist', 'file,pipe', '-i', str(path),
         '-map', '0:v:0', '-progress', 'pipe:1', '-f', 'null', '-'], cancel)
     if check['status'] == 'passed' and check['decoded_frames'] != count:
         check['status'] = 'incomplete'; check['reason'] = '회수 후보 수와 디코딩 프레임 수 불일치'
     return check
 
 
+def probe_check(path, track, count, cancel):
+    exe = shutil.which('ffprobe')
+    if not exe:
+        return dict(status='not_run', reason='FFprobe 없음')
+    result = run_command([exe, '-v', 'error', '-protocol_whitelist', 'file,pipe', '-count_packets',
+                          '-show_streams', '-of', 'json', str(path)], cancel, capture_stdout=True)
+    stdout = result.pop('stdout', '')
+    if result['status'] != 'passed':
+        return result
+    try:
+        streams = json.loads(stdout)['streams']
+        if (len(streams) != 1 or streams[0]['codec_type'] != 'video'
+                or streams[0]['codec_name'] != track.codec
+                or (streams[0]['width'], streams[0]['height']) != (track.width, track.height)
+                or int(streams[0]['nb_read_packets']) != count
+                or Fraction(streams[0]['r_frame_rate']) != track.fps):
+            raise ValueError('independent container/sample count mismatch')
+        result['video_packets'] = count
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+        result.update(status='failed', reason=str(exc))
+    return result
+
+
+def verification_tools(cancel):
+    result = {}
+    for name in ('ffmpeg', 'ffprobe'):
+        exe = shutil.which(name)
+        if not exe:
+            result[name] = dict(available=False)
+            continue
+        version = run_command([exe, '-version'], cancel, timeout=5, capture_stdout=True)
+        result[name] = dict(available=True, path=exe, sha256=_hash(exe, cancel),
+            version=version.pop('stdout', '').splitlines()[:1], version_check=version)
+    return result
+
+
 def write_elementary(path, buf, track, frames, cancel):
     with path.open('wb') as out:
         for frame in frames:
             _check(cancel)
-            if frame.idr:
+            if frame.random_access:
                 for nal in track.parameters:
                     out.write(b'\0\0\0\1' + nal)
             for p, n in frame.nals:
@@ -439,18 +531,91 @@ def mux(buf, target, track, frames, cancel):
         return dict(status='not_run', reason=str(exc))
 
 
+def audit_mp4(path, source, track, frames, cancel):
+    """Reopen the result and compare every copied NAL to its evidence extent.
+
+    Decode success alone cannot prove provenance. Check the actual output
+    sample map, codec configuration and byte content before accepting it.
+    """
+    try:
+        source_hash, output_hash = hashlib.sha256(), hashlib.sha256()
+        with path.open('rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            boxes = []; p = 0
+            while p < len(data):
+                _check(cancel)
+                if len(boxes) >= 3:
+                    raise InvalidMP4('unexpected recovered container contents')
+                b = box_at(data, p, len(data)); boxes.append(b); p = b.end
+            if [b.kind for b in boxes] != [b'ftyp', b'mdat', b'moov']:
+                raise InvalidMP4('unexpected recovered container layout')
+            tracks, _, errors = parse_moov(data, boxes[2])
+            if errors or len(tracks) != 1 or tracks[0].handler != b'vide':
+                raise InvalidMP4('recovered container must have exactly one video track')
+            actual = tracks[0]
+            parameters = ([n for kind in (7, 8) for n in track.parameters if n[0] & 31 == kind]
+                          if track.codec == 'h264' else track.parameters)
+            if (actual.table_error or len(actual.samples) != len(frames)
+                    or (actual.codec, actual.width, actual.height, actual.length_size, actual.fps)
+                    != (track.codec, track.width, track.height, 4, track.fps)
+                    or actual.parameters != parameters):
+                raise InvalidMP4('recovered sample map/configuration mismatch')
+            total = 0
+            for (offset, size, _), frame in zip(actual.samples, frames):
+                _check(cancel)
+                if not boxes[1].payload <= offset < offset + size <= boxes[1].end:
+                    raise InvalidMP4('recovered sample outside media')
+                p = offset
+                for source_offset, length in frame.nals:
+                    if (not 0 <= source_offset < source_offset + length <= len(source)
+                            or p + 4 + length > offset + size
+                            or int.from_bytes(data[p:p+4], 'big') != length):
+                        raise InvalidMP4('recovered NAL extent mismatch')
+                    expected = source[source_offset:source_offset+length]
+                    copied = data[p+4:p+4+length]
+                    if expected != copied:
+                        raise InvalidMP4('recovered NAL differs from evidence bytes')
+                    prefix = length.to_bytes(4, 'big')
+                    source_hash.update(prefix); source_hash.update(expected)
+                    output_hash.update(prefix); output_hash.update(copied)
+                    total += 1; p += 4 + length
+                if p != offset + size:
+                    raise InvalidMP4('unexpected bytes in recovered sample')
+        return dict(status='passed', matched_frames=len(frames), matched_nals=total,
+                    source_nal_sha256=source_hash.hexdigest(), output_nal_sha256=output_hash.hexdigest())
+    except (InvalidMP4, ValueError, IndexError, struct.error) as exc:
+        return dict(status='failed', reason=str(exc))
+
+
 def export_video(work, buf, track, frames, cancel, progress):
     raw = work / f'recovered_track{track.id:02d}.{track.codec}'
     target = work / f'recovered_track{track.id:02d}.mp4'
-    write_elementary(raw, buf, track, frames, cancel)
-    result = mux(buf, target, track, frames, cancel)
-    check = decode_check(target, len(frames), cancel) if result['status'] == 'passed' else result
+    initial_count = len(frames); attempts = 0
+    deadline = time.monotonic() + 300
+    def validate(candidate):
+        nonlocal attempts
+        _check(cancel)
+        if attempts >= 256 or time.monotonic() >= deadline:
+            return dict(status='verification_limit', reason='트랙 검증 시간/횟수 한도 초과'), dict(status='not_run')
+        attempts += 1
+        result = mux(buf, target, track, candidate, cancel)
+        if result['status'] != 'passed':
+            return result, dict(status='not_run')
+        payload = audit_mp4(target, buf, track, candidate, cancel)
+        if payload['status'] != 'passed':
+            return dict(status='failed', reason='원본 NAL 대조 실패', decoded_frames=0), payload
+        probe = probe_check(target, track, len(candidate), cancel)
+        if probe['status'] not in ('passed', 'not_run'):
+            return dict(status='failed', reason='독립 MP4 구조 검증 실패', probe_check=probe), payload
+        decoded = decode_check(target, len(candidate), cancel)
+        decoded['probe_check'] = probe
+        return decoded, payload
+    check, payload = validate(frames)
     discarded = []
     if check['status'] in ('failed', 'incomplete'):
         progress(f'{track.id}번 영상: 독립 GOP별로 재검증 중...')
         groups = []; group = []
         for frame in frames:
-            if frame.idr and group:
+            if frame.random_access and group:
                 groups.append(group); group = []
             group.append(frame)
         if group:
@@ -458,30 +623,76 @@ def export_video(work, buf, track, frames, cancel, progress):
         survivors = []
         for i, group in enumerate(groups):
             _check(cancel)
-            write_elementary(raw, buf, track, group, cancel)
-            result = mux(buf, target, track, group, cancel)
-            test = decode_check(target, len(group), cancel) if result['status'] == 'passed' else result
+            # A CRA tested independently has no pictures from the preceding
+            # GOP. Drop its RASL pictures before decoding that isolated group.
+            isolated = [f for f in group if not (group[0].cra and f.rasl)]
+            test, group_payload = validate(isolated)
             if test['status'] == 'passed':
-                survivors.extend(group)
+                survivors.extend(isolated)
+                if len(isolated) != len(group):
+                    discarded.append(dict(gop=i, candidate_frames=len(group), kept_prefix_frames=len(isolated),
+                        source_offset=group[0].offset, reason='CRA random access: RASL excluded'))
             else:
-                discarded.append(dict(gop=i, candidate_frames=len(group), source_offset=group[0].offset,
-                                      decode_check=test))
+                # The first bad picture invalidates later predictions, but
+                # need not erase the healthy prefix. Every retained prefix is
+                # muxed and fully decoded, never accepted by frame count alone.
+                low, high = 0, len(isolated)
+                if test['status'] in ('failed', 'incomplete'):
+                    for _ in range(16):
+                        if high - low <= 1:
+                            break
+                        middle = (low + high) // 2
+                        prefix_check, _ = validate(isolated[:middle])
+                        if prefix_check['status'] == 'passed':
+                            low = middle
+                        elif prefix_check['status'] in ('failed', 'incomplete'):
+                            high = middle
+                        else:
+                            break
+                survivors.extend(isolated[:low])
+                discarded.append(dict(gop=i, candidate_frames=len(group), kept_prefix_frames=low,
+                    source_offset=group[0].offset, decode_check=test, payload_check=group_payload))
         frames = survivors
-        write_elementary(raw, buf, track, frames, cancel)
         if frames:
-            result = mux(buf, target, track, frames, cancel)
-            check = decode_check(target, len(frames), cancel) if result['status'] == 'passed' else result
+            check, payload = validate(frames)
         else:
             check = dict(status='failed', decoded_frames=0, reason='검증에 성공한 독립 GOP 없음')
     # A failed mux can leave a header-only or corrupt file. Do not present it as recovery.
     if check['status'] not in ('passed', 'not_run'):
         target.unlink(missing_ok=True)
+    if frames:
+        write_elementary(raw, buf, track, frames, cancel)
     return frames, dict(file=target.name if target.exists() else None, stream=track.id,
-        codec=track.codec, candidate_frames=len(frames),
+        codec=track.codec, candidate_frames=len(frames), initial_candidate_frames=initial_count,
         sha256=_hash(target, cancel) if target.exists() else None, fps=str(track.fps) if track.fps else None,
         fps_basis='surviving_or_reference_configuration',
-        elementary_file=raw.name, elementary_sha256=_hash(raw, cancel), decode_check=check,
-        discarded_gops=discarded)
+        elementary_file=raw.name if raw.exists() else None,
+        elementary_sha256=_hash(raw, cancel) if raw.exists() else None, decode_check=check,
+        payload_check=payload, decode_attempts=attempts, discarded_gops=discarded)
+
+
+def publish_result(work, output, cancel):
+    """Exclusively reserve the destination; publish the manifest last.
+
+    Directory rename replaces an empty destination on POSIX. mkdir provides
+    the same no-clobber rule on Windows and Linux, including competing jobs.
+    """
+    output.mkdir()
+    moved = []
+    try:
+        for path in sorted(work.iterdir(), key=lambda p: (p.name == 'recovery.json', p.name)):
+            _check(cancel)
+            target = output/path.name
+            os.rename(path, target); moved.append(target)
+        work.rmdir()
+    except BaseException:
+        for path in reversed(moved):
+            path.unlink(missing_ok=True)
+        try:
+            output.rmdir()
+        except OSError:
+            pass  # Preserve any file created by another process.
+        raise
 
 
 def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, *, fps=None):
@@ -513,9 +724,11 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 _check(cancel); dst.write(block)
         if copied.stat().st_size != size or _hash(copied, cancel) != original_hash:
             raise ValueError('원본과 복원용 사본의 SHA-256이 다릅니다.')
-        manifest = dict(schema=1, container='mp4', created_at_utc=datetime.now(timezone.utc).isoformat(),
+        manifest = dict(schema=2, container='mp4', created_at_utc=datetime.now(timezone.utc).isoformat(),
             source_path=str(source), source_sha256=original_hash, source_size=size, source_copy=copied.name,
-            copy_sha256_verified=True, original_timeline_preserved=False, warning=TIMING_WARNING,
+            copy_sha256_verified=True, copy_sha256_verified_at_completion=False,
+            original_timeline_preserved=False, warning=TIMING_WARNING,
+            verification_tools=verification_tools(cancel),
             reference=None, videos=[], jpeg_stills=0, diagnostics=[], video_boundary_verified=False,
             video_withheld_reason=None)
         reference_tracks, reference_defaults = [], {}
@@ -535,6 +748,7 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 for t in reference_tracks:
                     t.samples.clear()  # Never transplant the reference's sample layout.
                     t.composition.clear()
+                    t.decode_times.clear(); t.durations.clear()
                     t.break_offsets.clear()
             manifest['reference'] = dict(path=str(reference), sha256=rhash, usage='codec_settings_only')
         with copied.open('rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as buf:
@@ -619,42 +833,71 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 frames, video = export_video(work, buf, t, frames, cancel, report)
                 video['exclusions'] = stats; video['width'], video['height'] = t.width, t.height
                 video['recovery_method'] = 'source_sample_tables' if t.samples else 'bounded_avc_nal_carving'
+                video['source_sample_number_basis'] = ('surviving_fragment_declarations'
+                    if t.samples and any(b.kind == b'moof' for b in boxes) else 'source_stbl_ordinal'
+                    if t.samples else 'unknown')
                 if requested_fps:
                     video['fps_basis'] = 'user_supplied'
                 manifest['videos'].append(video)
                 for i, frame in enumerate(frames):
-                    all_rows.append([t.id, i, frame.offset, frame.size, frame.sample, video['recovery_method']])
+                    number = frame.sample - 1
+                    dts = t.decode_times[number] if 0 <= number < len(t.decode_times) else None
+                    duration = t.durations[number] if 0 <= number < len(t.durations) else None
+                    pts = dts + (t.composition[number] if number < len(t.composition) else 0) if dts is not None else None
+                    all_rows.append([t.id, i, frame.offset, frame.size, frame.sample, video['recovery_method'],
+                        video['source_sample_number_basis'], dts, pts, duration, t.timescale if dts is not None else None])
                     for p, n in frame.nals:
                         nal_rows.append([t.id, i, p, n])
             report('체크섬이 유효한 GPS 및 G센서 별도 회수 중...')
-            manifest['gps_records'], manifest['gsensor_records'] = carve_metadata(buf, work, cancel)
+            manifest['gps_records'], manifest['gsensor_records'] = carve_metadata(buf, work, cancel, boxes, limit, tracks)
             manifest['metadata_scope'] = 'whole_file_untrusted'
             manifest['damaged_box_gaps'] = gaps[:1000]
         for name, header, rows in [
                 ('frame_offsets.csv', ['stream', 'recovered_frame_index', 'source_payload_offset',
-                                      'source_payload_extent', 'source_sample_number', 'method'], all_rows),
+                                      'source_payload_extent', 'source_sample_number', 'method', 'source_sample_number_basis',
+                                      'source_dts_ticks', 'source_pts_ticks', 'source_duration_ticks', 'source_timescale'], all_rows),
                 ('nal_offsets.csv', ['stream', 'recovered_frame_index', 'source_nal_offset', 'source_nal_size'], nal_rows)]:
             with (work / name).open('x', newline='', encoding='utf-8-sig') as log:
                 w = csv.writer(log); w.writerow(header); w.writerows(rows)
         manifest['status'] = ('video_recovered' if any(v['decode_check']['status'] == 'passed' for v in manifest['videos'])
-            else 'video_candidates_unverified' if manifest['videos'] else 'metadata_only'
+            else 'video_candidates_unverified' if any(v['candidate_frames'] for v in manifest['videos']) else 'metadata_only'
             if manifest['gps_records'] or manifest['gsensor_records'] else 'nothing_recovered')
         manifest['artifact_sha256'] = {p.name: _hash(p, cancel) for p in work.iterdir() if p.suffix == '.csv'}
         if _hash(source, cancel) != original_hash:
             raise ValueError('복원 도중 원본이 변경됐습니다. 결과를 폐기합니다.')
+        if copied.stat().st_size != size or _hash(copied, cancel) != original_hash:
+            raise ValueError('복원 도중 사본이 변경됐습니다. 결과를 폐기합니다.')
+        manifest['copy_sha256_verified_at_completion'] = True
+        for video in manifest['videos']:
+            for filename, expected in ((video['file'], video['sha256']),
+                                       (video['elementary_file'], video['elementary_sha256'])):
+                if filename and (not (work/filename).is_file() or _hash(work/filename, cancel) != expected):
+                    raise ValueError('검증 이후 복원 결과가 변경됐습니다. 결과를 폐기합니다.')
         if reference and _hash(reference, cancel) != manifest['reference']['sha256']:
             raise ValueError('복원 도중 참조 영상이 변경됐습니다.')
-        (work / 'recovery.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        for tool in manifest['verification_tools'].values():
+            if tool['available'] and _hash(tool['path'], cancel) != tool['sha256']:
+                raise ValueError('복원 도중 검증 도구가 변경됐습니다. 결과를 폐기합니다.')
         (work / 'READ_ME.txt').write_text(TIMING_WARNING + '\n\n상태: ' + manifest['status'] + '\n'
-            'FFmpeg 전체 디코딩 검증이 passed인 MP4만 검증된 복원본입니다.\n'
+            '원본 NAL 바이트 대조 및 FFmpeg 전체 디코딩 검증이 모두 passed인 MP4만 검증된 복원본입니다.\n'
+            'FFprobe가 있으면 코덱·해상도·FPS·실제 패킷 수도 독립적으로 확인합니다.\n'
+            '디코딩 성공은 손상 전 화소·실제 시각의 일치나 모든 비트 손상 검출을 보증하지 않습니다.\n'
             '참조 영상의 코덱/FPS 설정만 사용하며 영상·GPS·샘플 표를 복사하지 않습니다.\n'
             '소실된 음성·GPS·영상 바이트와 원래 시간축을 만들어 넣지 않습니다.\n'
             'NAL 카빙 프레임의 extent에는 음성/텍스트 틈이 포함될 수 있습니다. 실제 복사된 영상 바이트는 '
-            'nal_offsets.csv의 각 구간입니다.\n' + (manifest['video_withheld_reason'] or ''), encoding='utf-8')
+            'nal_offsets.csv의 각 구간입니다.\n'
+            'frame_offsets.csv의 source DTS/PTS는 살아 있는 구조 값이며 UTC나 GPS 동기화 시각이 아닙니다. '
+            '소실된 fragment의 샘플 번호는 추정하지 않습니다.\n'
+            'GPS/G센서의 source_region은 바이트 위치 분류이며 현재 녹화·시각 동기화를 보증하지 않습니다.\n'
+            'idas_outlier_reason이 있는 GPS는 이상치입니다. 모든 회수 메타데이터를 지도·통계·위험운전 판정에 '
+            '자동 사용하지 않습니다. GGA의 날짜는 미상으로 남깁니다.\n' + (manifest['video_withheld_reason'] or ''), encoding='utf-8')
+        manifest['artifact_sha256']['READ_ME.txt'] = _hash(work/'READ_ME.txt', cancel)
+        (work / 'recovery.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        for name, expected in manifest['artifact_sha256'].items():
+            if _hash(work/name, cancel) != expected:
+                raise ValueError('복원 결과 기록이 변경됐습니다. 결과를 폐기합니다.')
         _check(cancel)
-        if output.exists():
-            raise FileExistsError('출력 폴더가 이미 있습니다.')
-        os.rename(work, output)
+        publish_result(work, output, cancel)
         return dict(manifest, output_dir=str(output))
     except BaseException:
         shutil.rmtree(work, ignore_errors=True)

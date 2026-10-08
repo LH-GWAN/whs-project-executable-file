@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 import threading
 from fractions import Fraction
 
@@ -454,6 +455,234 @@ def test_broken_codec_and_sample_tables_do_not_block_gps(mp4_media, tmp_path):
     r = recover_mp4(path, tmp_path/'out')
     assert r['status'] == 'metadata_only' and r['gps_records'] == 1
     assert r['diagnostics'] and not r['videos']
+
+
+@pytest.mark.parametrize('lost', [1, 18, 46])
+def test_hevc_cra_resumes_after_a_lost_picture(mp4_media, tmp_path, lost):
+    source = mp4_media['hevc']; data = bytearray(source.read_bytes()); packets = packet_map(source)
+    packet = packets[lost]; a = int(packet['pos']); b = a + int(packet['size'])
+    data[a:b] = bytes(b-a)
+    path = tmp_path/'damaged.mp4'; path.write_bytes(data)
+    result = recover_mp4(path, tmp_path/'out')
+    original = pixels(source)
+    expected = [original[i] for i in expected_indices(packets, [(a, b)])]
+    assert pixels(tmp_path/'out'/result['videos'][0]['file']) == expected
+
+
+def test_corrupt_entropy_keeps_the_healthy_gop_prefix(mp4_media, tmp_path):
+    source = mp4_media['avc']; data = bytearray(source.read_bytes()); packet = packet_map(source)[8]
+    a, size = int(packet['pos']), int(packet['size'])
+    # Preserve the length and slice headers. This damage is found by the full
+    # decoder, rather than a zero-fill/header heuristic in the recovery parser.
+    data[a+128:a+size] = b'\xff' * (size-128)
+    path = tmp_path/'damaged.mp4'; path.write_bytes(data)
+    result = recover_mp4(path, tmp_path/'out')
+    original = pixels(source)
+    assert pixels(tmp_path/'out'/result['videos'][0]['file']) == original[:8] + original[15:]
+
+
+def test_decoder_error_after_log_preview_cannot_pass():
+    from core.mp4_recovery import run_command
+    result = run_command([sys.executable, '-c',
+        "import sys; sys.stderr.write(' ' * 4096 + 'decode error'); print('frame=1')"], None)
+    assert result['status'] == 'failed'
+
+
+@pytest.mark.parametrize('stream', ['stdout', 'stderr'])
+def test_fast_decoder_output_is_bounded(stream):
+    from core.mp4_recovery import run_command
+    result = run_command([sys.executable, '-c',
+        f"import sys; sys.{stream}.write(' ' * (8 * 1024**2 + 1))"], None)
+    assert result['status'] == 'log_limit'
+
+
+def test_recovery_copy_change_discards_results(mp4_media, tmp_path):
+    def progress(message):
+        if '별도 회수' in message:
+            copied = next(tmp_path.glob('.mp4-recovery-*/damaged_source.mp4'))
+            with copied.open('r+b') as out:
+                out.seek(-1, os.SEEK_END); out.write(b'X')
+    with pytest.raises(ValueError, match='사본'):
+        recover_mp4(mp4_media['avc'], tmp_path/'out', progress=progress)
+    assert not (tmp_path/'out').exists() and not list(tmp_path.glob('.mp4-recovery-*'))
+
+
+def test_validated_output_change_discards_results(mp4_media, tmp_path):
+    def progress(message):
+        if '별도 회수' in message:
+            target = next(tmp_path.glob('.mp4-recovery-*/recovered_track*.mp4'))
+            with target.open('ab') as out:
+                out.write(b'changed after decode')
+    with pytest.raises(ValueError, match='결과'):
+        recover_mp4(mp4_media['avc'], tmp_path/'out', progress=progress)
+    assert not (tmp_path/'out').exists() and not list(tmp_path.glob('.mp4-recovery-*'))
+
+
+@pytest.mark.parametrize('kind', ['fragmented_hevc_bframes', 'hevc', 'bframes', 'fragmented_bframes'])
+def test_hevc_random_access_has_exact_display_order(mp4_media, tmp_path, kind):
+    source = mp4_media[kind]; original = pixels(source); packets = packet_map(source)
+    frame_info = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_frames',
+        '-show_entries', 'frame=pkt_pos', '-of', 'json', str(source)], capture_output=True, check=True, timeout=20)
+    positions = [int(f['pkt_pos']) for f in json.loads(frame_info.stdout)['frames']]
+    assert len(positions) == len(original)
+    data = bytearray(source.read_bytes()); p = packets[18]; a, n = int(p['pos']), int(p['size'])
+    data[a:a+n] = bytes(n)
+    path = tmp_path/'damaged.mp4'; path.write_bytes(data)
+    r = recover_mp4(path, tmp_path/'out'); v = r['videos'][0]
+    rows = list(csv.DictReader((tmp_path/'out'/'frame_offsets.csv').open(encoding='utf-8-sig')))
+    recovered = {int(row['source_payload_offset']) for row in rows}
+    expected = [picture for pos, picture in zip(positions, original) if pos in recovered]
+    assert v['candidate_frames'] >= 70 and len(expected) == v['candidate_frames']
+    assert pixels(tmp_path/'out'/v['file']) == expected
+    if 'hevc_bframes' in kind:
+        assert v['exclusions']['discarded_rasl'] >= 1
+
+
+@pytest.mark.parametrize('kind', ['bframes', 'fragmented_hevc_bframes'])
+def test_source_time_csv_matches_independent_container_ticks(mp4_media, tmp_path, kind):
+    source = mp4_media[kind]
+    probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_packets',
+        '-show_entries', 'packet=pos,dts,pts,duration', '-of', 'json', str(source)],
+        capture_output=True, check=True, timeout=20)
+    packets = json.loads(probe.stdout)['packets']; bypos = {int(p['pos']): p for p in packets}
+    origin = int(packets[0]['dts'])
+    r = recover_mp4(source, tmp_path/'out')
+    rows = list(csv.DictReader((tmp_path/'out'/'frame_offsets.csv').open(encoding='utf-8-sig')))
+    assert not r['original_timeline_preserved']
+    for row in rows:
+        packet = bypos[int(row['source_payload_offset'])]
+        assert int(row['source_dts_ticks']) == int(packet['dts']) - origin
+        assert int(row['source_pts_ticks']) == int(packet['pts']) - origin
+
+
+def test_bit_exact_audit_rejects_an_output_that_a_decoder_accepts(mp4_media, tmp_path, monkeypatch):
+    import core.mp4_writer as writer
+    original_write = writer.write_mp4
+    def wrong_write(target, *args, **kwargs):
+        original_write(target, *args, **kwargs)
+        packet = packet_map(target)[0]
+        with target.open('r+b') as out:
+            # Keep the sample size, but alter one copied byte.
+            out.seek(int(packet['pos'])+5); old = out.read(1)
+            out.seek(-1, os.SEEK_CUR); out.write(bytes([old[0] ^ 1]))
+    monkeypatch.setattr(writer, 'write_mp4', wrong_write)
+    monkeypatch.setattr('core.mp4_recovery.decode_check',
+                        lambda path, count, cancel: dict(status='passed', decoded_frames=count))
+    r = recover_mp4(mp4_media['avc'], tmp_path/'out')
+    assert r['status'] == 'nothing_recovered'
+    assert r['videos'][0]['payload_check']['status'] == 'failed'
+    assert not list((tmp_path/'out').glob('recovered_track*.mp4'))
+
+
+def test_independent_probe_failure_cannot_be_verified(mp4_media, tmp_path, monkeypatch):
+    monkeypatch.setattr('core.mp4_recovery.probe_check',
+                        lambda *args: dict(status='failed', reason='packet count mismatch'))
+    r = recover_mp4(mp4_media['avc'], tmp_path/'out')
+    assert r['status'] == 'nothing_recovered'
+    assert r['videos'][0]['decode_check']['status'] == 'failed'
+    assert not list((tmp_path/'out').glob('recovered_track*.mp4'))
+
+
+def test_validation_records_tools_and_all_payload_hashes(mp4_media, tmp_path):
+    r = recover_mp4(mp4_media['avc'], tmp_path/'out'); v = r['videos'][0]
+    assert r['schema'] == 2 and r['copy_sha256_verified_at_completion']
+    assert v['payload_check']['matched_frames'] == v['candidate_frames'] == 90
+    assert v['payload_check']['source_nal_sha256'] == v['payload_check']['output_nal_sha256']
+    assert v['decode_check']['probe_check']['video_packets'] == 90
+    for tool in r['verification_tools'].values():
+        assert tool['available'] and tool['version'] and len(tool['sha256']) == 64
+    for name, digest in r['artifact_sha256'].items():
+        assert hashlib.sha256((tmp_path/'out'/name).read_bytes()).hexdigest() == digest
+
+
+def test_metadata_regions_do_not_promote_slack_to_trusted_gps(tmp_path):
+    from core.mp4_writer import box
+    gps = nmea('GPRMC,120000.00,A,3730.000,N,12700.000,E,1000.0,0.0,081026,,,A')
+    undated = nmea('GPGGA,120001.00,3730.000,N,12700.000,E,1,08,1.0,10.0,M,0.0,M,,')
+    ftyp = box(b'ftyp', b'isom'+bytes(4)+b'isom')
+    path = tmp_path/'source.mp4'
+    path.write_bytes(ftyp+box(b'mdat', b'\0'+gps+b'\r\n')+box(b'free', b'\0'+undated+b'\r\n')+
+                     ftyp+box(b'mdat', b'\0'+gps+b'\r\n'))
+    r = recover_mp4(path, tmp_path/'out')
+    rows = list(csv.DictReader((tmp_path/'out'/'recovered_gps.csv').open(encoding='utf-8-sig')))
+    assert r['gps_records'] == 3
+    assert [row['source_region'] for row in rows] == ['mdat_unindexed', 'free_or_skip', 'after_first_recording']
+    assert all(row['scope'] == 'whole_file_untrusted' for row in rows)
+    assert rows[1]['gps_date_utc'] == '' and rows[0]['idas_outlier_reason'] == 'invalid_speed'
+
+
+@pytest.mark.parametrize('kind', ['hevc', 'bframes'])
+def test_compact_sample_sizes_keep_all_original_pixels(mp4_media, tmp_path, kind):
+    from core.mp4_writer import box, full
+    data = mp4_media[kind].read_bytes()
+    def convert(data):
+        result = b''
+        for typ, a, b in top_boxes(data):
+            payload = data[a+8:b]
+            if typ in (b'moov', b'trak', b'mdia', b'minf', b'stbl'):
+                payload = convert(payload)
+            elif typ == b'stsz':
+                fixed, count = struct.unpack_from('>II', payload, 4)
+                sizes = [fixed]*count if fixed else list(struct.unpack_from('>'+str(count)+'I', payload, 12))
+                result += full(b'stz2', bytes(3)+b'\x10'+struct.pack('>I', count)+
+                               b''.join(struct.pack('>H', n) for n in sizes))
+                continue
+            result += box(typ, payload)
+        return result
+    path = tmp_path/'compact.mp4'; path.write_bytes(convert(data))
+    assert pixels(path) == pixels(mp4_media[kind])  # Independent reader accepts the fixture.
+    r = recover_mp4(path, tmp_path/'out')
+    assert r['videos'][0]['recovery_method'] == 'source_sample_tables'
+    assert pixels(tmp_path/'out'/r['videos'][0]['file']) == pixels(mp4_media[kind])
+
+
+@pytest.mark.parametrize('kind', ['hevc', 'avc'])
+def test_broken_movie_header_preserves_valid_track_tables(mp4_media, tmp_path, kind):
+    data = bytearray(mp4_media[kind].read_bytes()); p = data.find(b'mvhd'); data[p:p+4] = b'xxxx'
+    path = tmp_path/'damaged.mp4'; path.write_bytes(data)
+    r = recover_mp4(path, tmp_path/'out')
+    assert r['diagnostics'] and r['videos'][0]['recovery_method'] == 'source_sample_tables'
+    assert pixels(tmp_path/'out'/r['videos'][0]['file']) == pixels(mp4_media[kind])
+
+
+@pytest.mark.parametrize('width,packed', [(4, b'\x12\xf0'), (8, b'\x01\x02\xff'), (16, b'\x00\x01\x00\x02\xff\xff')])
+def test_compact_size_widths_and_bad_counts_are_bounded(width, packed):
+    from core.mp4_structure import InvalidMP4, box_at, sample_sizes
+    from core.mp4_writer import box, full
+    data = box(b'stbl', full(b'stz2', bytes(3)+bytes([width])+struct.pack('>I', 3)+packed))
+    assert sample_sizes(data, box_at(data, 0, len(data))) == [1, 2, (1 << width)-1]
+    bad = bytearray(data); struct.pack_into('>I', bad, 24, 0xFFFFFFFF)
+    with pytest.raises(InvalidMP4):
+        sample_sizes(bad, box_at(bad, 0, len(bad)))
+
+
+def test_publish_failure_cleans_only_owned_results(tmp_path, monkeypatch):
+    from core.mp4_recovery import publish_result
+    work = tmp_path/'work'; work.mkdir(); (work/'a.csv').write_text('first')
+    (work/'recovery.json').write_text('{}'); output = tmp_path/'out'
+    original_rename = os.rename
+    def failing_rename(source, target):
+        if Path(source).name == 'recovery.json':
+            (output/'other_process').write_text('preserve')
+            raise OSError('publication interrupted')
+        return original_rename(source, target)
+    monkeypatch.setattr('core.mp4_recovery.os.rename', failing_rename)
+    with pytest.raises(OSError, match='interrupted'):
+        publish_result(work, output, None)
+    assert list(output.iterdir()) == [output/'other_process']
+    assert (output/'other_process').read_text() == 'preserve'
+
+
+def test_decoder_timeout_and_cancel_terminate_the_child():
+    from core.mp4_recovery import run_command
+    result = run_command([sys.executable, '-c', 'import time; time.sleep(20)'], None, timeout=.05)
+    assert result['status'] == 'timeout'
+    cancel = threading.Event(); timer = threading.Timer(.05, cancel.set); timer.start()
+    try:
+        with pytest.raises(RecoveryCancelled):
+            run_command([sys.executable, '-c', 'import time; time.sleep(20)'], cancel)
+    finally:
+        timer.cancel()
 
 
 # Reuse the established Qt fixture instead of creating a second QApplication.

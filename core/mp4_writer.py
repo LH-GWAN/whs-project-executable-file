@@ -20,7 +20,16 @@ MATRIX = struct.pack('>9I', 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
 
 def composition_offsets(track, frames, tick, scale):
     if track.composition and all(0 < f.sample <= len(track.composition) for f in frames):
-        return [round(track.composition[f.sample - 1] * scale / track.timescale) for f in frames]
+        if not all(f.sample <= len(track.decode_times) and track.decode_times[f.sample-1] is not None for f in frames):
+            raise InvalidMP4('DTS 없는 B-picture의 표시 순서를 확인할 수 없습니다.')
+        orders = [track.decode_times[f.sample-1] + track.composition[f.sample-1] for f in frames]
+        if len(set(orders)) != len(orders):
+            raise InvalidMP4('중복 source PTS: picture 표시 순서를 확인할 수 없습니다.')
+        # Keep source presentation order, while closing holes in review time.
+        # Copying old CTS offsets after deleting pictures produces duplicate
+        # or decreasing timestamps at a recovered GOP/CRA boundary.
+        ranked = {value: i for i, value in enumerate(sorted(orders))}
+        return [(ranked[value] - i) * tick for i, value in enumerate(orders)]
     if track.codec != 'h264':
         return [0] * len(frames)
     if not any(f.b_picture for f in frames):
@@ -110,7 +119,7 @@ def write_mp4(target, buf, track, frames, check=lambda: None):
         stsc = full(b'stsc', struct.pack('>IIII', 1, 1, 1, 1))
         stsz = full(b'stsz', struct.pack('>II', 0, len(sizes)) + b''.join(struct.pack('>I', n) for n in sizes))
         co64 = full(b'co64', struct.pack('>I', len(positions)) + b''.join(struct.pack('>Q', n) for n in positions))
-        keys = [i+1 for i, f in enumerate(frames) if f.idr]
+        keys = [i+1 for i, f in enumerate(frames) if f.random_access]
         stss = full(b'stss', struct.pack('>I', len(keys)) + b''.join(struct.pack('>I', n) for n in keys))
         ctts = full(b'ctts', struct.pack('>I', len(offsets)) + b''.join(struct.pack('>Ii', 1, n) for n in offsets), version=1)
         stbl = box(b'stbl', stsd + stts + stsc + stsz + co64 + stss + ctts)

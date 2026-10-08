@@ -102,7 +102,8 @@ class RecoveryDialog(QDialog):
 
     def _done(self, result):
         verified = sum(v['decode_check']['status'] == 'passed' for v in result['videos'])
-        self._status.setText(f"결과: 디코딩 검증 성공 영상 {verified}개 / 영상 후보 {len(result['videos'])}개 / "
+        candidates = sum(v.get('candidate_frames', 1) > 0 for v in result['videos'])
+        self._status.setText(f"결과: 디코딩 검증 성공 영상 {verified}개 / 영상 후보 {candidates}개 / "
             f"JPEG {result['jpeg_stills']}개 / GPS {result['gps_records']}개 / "
             f"G센서 {result.get('gsensor_records', 0)}개\n{result['output_dir']}\n"
             '영상 후보는 재생 성공을 보장하지 않습니다. recovery.json에서 검증 결과를 확인하세요.'

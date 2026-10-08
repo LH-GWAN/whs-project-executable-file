@@ -151,6 +151,32 @@ class Track:
     table_error: str = ''
     break_offsets: set[int] = field(default_factory=set)
     composition: list[int] = field(default_factory=list)
+    decode_times: list[int | None] = field(default_factory=list)
+    durations: list[int] = field(default_factory=list)
+
+
+def sample_sizes(data, stbl):
+    sizes = [b for b in children(data, stbl.payload, stbl.end) if b.kind in (b'stsz', b'stz2')]
+    if len(sizes) != 1:
+        raise InvalidMP4('missing/duplicate sample sizes')
+    sz = sizes[0]; p = sz.payload
+    if p + 12 > sz.end or bytes(data[p:p+4]) != bytes(4):
+        raise InvalidMP4('invalid sample size header')
+    count = u32(data, p + 8)
+    if count > MAX_TABLE:
+        raise InvalidMP4('invalid sample size count')
+    if sz.kind == b'stsz':
+        fixed = u32(data, p + 4)
+        if p + 12 + (0 if fixed else count * 4) != sz.end:
+            raise InvalidMP4('invalid sample size extent')
+        return [fixed] * count if fixed else [u32(data, p + 12 + i * 4) for i in range(count)]
+    width = data[p + 7]
+    if (bytes(data[p+4:p+7]) != bytes(3) or width not in (4, 8, 16)
+            or p + 12 + (count * width + 7) // 8 != sz.end):
+        raise InvalidMP4('invalid compact sample sizes')
+    if width == 4:
+        return [(data[p+12+i//2] >> (4 if i % 2 == 0 else 0)) & 15 for i in range(count)]
+    return [int.from_bytes(data[p+12+i*(width//8):p+12+(i+1)*(width//8)], 'big') for i in range(count)]
 
 
 def parse_track(data, trak):
@@ -201,13 +227,7 @@ def parse_track(data, trak):
     if t.handler not in (b'vide', b'text', b'sbtl', b'subt', b'meta'):
         return t
     try:
-        sz = child(data, stbl, b'stsz')
-        if sz.payload + 12 > sz.end:
-            raise InvalidMP4('short sample sizes')
-        fixed, count = u32(data, sz.payload + 4), u32(data, sz.payload + 8)
-        if count > MAX_TABLE or sz.payload + 12 + (0 if fixed else count * 4) != sz.end:
-            raise InvalidMP4('invalid sample size count')
-        sizes = [fixed] * count if fixed else [u32(data, sz.payload + 12 + i * 4) for i in range(count)]
+        sizes = sample_sizes(data, stbl); count = len(sizes)
         stsc = child(data, stbl, b'stsc'); p, n = table(data, stsc, 12)
         mapping = [struct.unpack_from('>III', data, p + i * 12) for i in range(n)]
         offsets = [b for b in children(data, stbl.payload, stbl.end) if b.kind in (b'stco', b'co64')]
@@ -245,6 +265,10 @@ def parse_track(data, trak):
             raise InvalidMP4('invalid sample durations')
         if count:
             t.fps = Fraction(count * t.timescale, sum(a * b for a, b in runs))
+        ticks = 0
+        for number, duration in runs:
+            for _ in range(number):
+                t.decode_times.append(ticks); t.durations.append(duration); ticks += duration
         ctts = [b for b in children(data, stbl.payload, stbl.end) if b.kind == b'ctts']
         if ctts:
             ct = ctts[0]; p = ct.payload
@@ -263,7 +287,7 @@ def parse_track(data, trak):
             if len(t.composition) != count:
                 raise InvalidMP4('composition sample count mismatch')
     except (InvalidMP4, struct.error, IndexError) as exc:
-        t.samples.clear(); t.composition.clear(); t.table_error = str(exc)
+        t.samples.clear(); t.composition.clear(); t.decode_times.clear(); t.durations.clear(); t.table_error = str(exc)
     return t
 
 
@@ -272,9 +296,11 @@ def parse_moov(data, box):
         raise InvalidMP4('moov exceeds recovery limit')
     parts = children(data, box.payload, box.end)
     mvhd = [b for b in parts if b.kind == b'mvhd']
-    if len(mvhd) != 1 or mvhd[0].end - mvhd[0].payload < 96:
-        raise InvalidMP4('invalid movie header')
     tracks, errors = [], []
+    if len(mvhd) != 1 or mvhd[0].end - mvhd[0].payload < 96:
+        # Movie-level duration/clock is not used to recover track samples or
+        # playback rate. Intact, independently checked tracks can survive it.
+        errors.append('invalid movie header; independently validated track tables used')
     for b in parts:
         if b.kind != b'trak':
             continue
@@ -421,7 +447,7 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                     raise InvalidMP4('invalid tfhd extent')
                 t = byid.get(tid); cursor = base; pending = []; ticks = 0
                 number = sample_numbers.get(tid, 0)
-                pending_composition, kept_durations = [], Counter()
+                pending_composition, pending_times, pending_durations, kept_durations = [], [], [], Counter()
                 excluded = 0
                 timing = [b for b in children(data, traf.payload, traf.end) if b.kind == b'tfdt']
                 dts = None
@@ -461,6 +487,8 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                         if number > MAX_TABLE:
                             raise InvalidMP4('too many declared fragment samples')
                         pending_composition.append(composition)
+                        pending_times.append(dts + ticks if dts is not None else None)
+                        pending_durations.append(sd)
                         if any(a <= cursor and cursor + ss <= b for a, b in media):
                             pending.append((cursor, ss, number))
                             kept_durations[sd] += 1
@@ -482,6 +510,10 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                     if len(t.composition) < old_number:
                         t.composition.extend([0] * (old_number - len(t.composition)))
                     t.composition.extend(pending_composition)
+                    if len(t.decode_times) < old_number:
+                        t.decode_times.extend([None] * (old_number - len(t.decode_times)))
+                        t.durations.extend([0] * (old_number - len(t.durations)))
+                    t.decode_times.extend(pending_times); t.durations.extend(pending_durations)
                     sample_numbers[tid] = number
                     t.samples.extend(pending)
                     duration_counts.setdefault(tid, Counter()).update(kept_durations)
