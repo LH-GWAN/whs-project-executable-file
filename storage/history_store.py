@@ -69,12 +69,37 @@ class CaseRecord:
     track_mode: str = ""
     # 연속 영상 이어보기의 구간 목록(core/pipeline.segment_record 형식). 하나짜리 사건은 빈 목록
     segments: List[Dict] = field(default_factory=list)
+    # 분석 상태(ExtractionResult.status). "analyzing"은 분석 도중 프로세스가 죽은 사건이다.
+    analysis_status: str = ""
 
 
 class HistoryStore:
+    # 손상된 DB를 비켜 두고 새로 시작했을 때 그 경로. main_window가 시작 때 한 번 알린다(리뷰 #67).
+    recovered_from: str = ""
+
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or os.path.join(default_app_data_dir(), "history.db")
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        try:
+            self._open()
+        except sqlite3.DatabaseError as exc:
+            # 쓰레기 바이트·잘린 파일이면 실행할 때마다 시작에 실패했다(리뷰 #67). 손상 파일을 옮기고
+            # 빈 DB로 시작한다. 사건 폴더(cases/)는 그대로 있으니 증거는 잃지 않는다.
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            aside = f"{self.db_path}.corrupt-{datetime.now():%Y%m%d-%H%M%S}"
+            os.replace(self.db_path, aside)
+            for suffix in ("-journal", "-wal", "-shm"):
+                try:
+                    os.remove(self.db_path + suffix)
+                except OSError:
+                    pass
+            self._open()
+            HistoryStore.recovered_from = f"{aside} ({type(exc).__name__}: {exc})"
+
+    def _open(self) -> None:
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -91,6 +116,8 @@ class HistoryStore:
             self._conn.execute("ALTER TABLE cases ADD COLUMN track_mode TEXT")
         if "segments_json" not in existing:
             self._conn.execute("ALTER TABLE cases ADD COLUMN segments_json TEXT")
+        if "analysis_status" not in existing:
+            self._conn.execute("ALTER TABLE cases ADD COLUMN analysis_status TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -196,6 +223,15 @@ class HistoryStore:
         self._conn.execute("UPDATE cases SET track_mode = ? WHERE id = ?", (mode, case_id))
         self._conn.commit()
 
+    def set_analysis_status(self, case_id: int, status: str) -> None:
+        self._conn.execute("UPDATE cases SET analysis_status = ? WHERE id = ?", (status, case_id))
+        self._conn.commit()
+
+    def set_output_folder(self, case_id: int, output_folder: str) -> None:
+        """사건 폴더를 만들자마자 기록한다 - 분석 중 프로세스가 죽어도 폴더를 찾아 지울 수 있게(리뷰 #31)."""
+        self._conn.execute("UPDATE cases SET output_folder = ? WHERE id = ?", (output_folder, case_id))
+        self._conn.commit()
+
     def set_segments(self, case_id: int, segments: List[Dict]) -> None:
         self._conn.execute("UPDATE cases SET segments_json = ? WHERE id = ?",
                            (json.dumps(segments, ensure_ascii=False), case_id))
@@ -222,14 +258,24 @@ def _row_to_case(row: sqlite3.Row) -> CaseRecord:
         detected_format=row["detected_format"] or "",
         avi_repaired=bool(row["avi_repaired"]),
         output_folder=row["output_folder"] or "",
-        analysis_settings=json.loads(row["analysis_settings_json"] or "{}"),
+        analysis_settings=_load_json_dict(row["analysis_settings_json"]),
         created_at=row["created_at"] or "",
         last_opened_at=row["last_opened_at"],
         report_pdf_path=row["report_pdf_path"],
         rear_video_filename=(row["rear_video_filename"] or "") if "rear_video_filename" in row.keys() else "",
         track_mode=(row["track_mode"] or "") if "track_mode" in row.keys() else "",
         segments=_load_segments(row),
+        analysis_status=(row["analysis_status"] or "") if "analysis_status" in row.keys() else "",
     )
+
+
+def _load_json_dict(text: Optional[str]) -> Dict:
+    """깨진 JSON 행 하나가 전체 목록 조회를 막지 않게 빈 값으로 읽는다(리뷰 #67)."""
+    try:
+        value = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _load_segments(row: sqlite3.Row) -> List[Dict]:

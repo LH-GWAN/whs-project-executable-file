@@ -21,10 +21,7 @@ def _is_gps_row(p: TrackPoint) -> bool:
 
 
 def _gps_key(p: TrackPoint):
-    utc = (p.gps_utc_time or "").strip()
-    if utc:
-        return ("utc", p.gps_date or "", utc)
-    return ("val", p.latitude, p.longitude, p.speed_kmh)
+    return p.record_key()
 
 
 def gps_slot_rows(points: List[TrackPoint]) -> List[int]:
@@ -46,11 +43,15 @@ def has_frame_detail(points: List[TrackPoint]) -> bool:
     """GPS 기록보다 훨씬 자주 행을 쓰는 영상(프레임·G센서 단위)인가. 그러면 Location 표는 기본으로
     1초 단위 행만 보이고 '상세보기'로 전체 행을 연다."""
     slots = len(gps_slot_rows(points))
+    if slots == 0:
+        return False   # GPS가 전혀 없는 G센서 전용 영상은 전체 행을 그대로 보인다(리뷰 #47)
     extra = len(points) - slots
-    return extra >= 5 and len(points) >= 1.5 * max(1, slots)
+    return extra >= 5 and len(points) >= 1.5 * slots
 
 
 def validation_text(rec: TrackPoint) -> str:
+    if rec.is_dropout and not rec.has_coords:
+        return "끊김"   # 측위 실패(status=V) 행은 검증 실패가 아니라 수신 끊김이다(리뷰 #93)
     if rec.gps_checksum_ok is False or rec.gps_trusted is False:
         return "실패"
     return "정상" if rec.gps_checksum_ok is True else "미제공"
@@ -58,16 +59,17 @@ def validation_text(rec: TrackPoint) -> str:
 
 def row_texts(rec: TrackPoint, here: Sequence[DrivingEvent]) -> List[str]:
     """COLUMNS 순서의 칸 글자."""
-    failed = rec.gps_checksum_ok is False or rec.gps_trusted is False
+    dropout = rec.is_dropout and not rec.has_coords
+    failed = (rec.gps_checksum_ok is False or rec.gps_trusted is False) and not dropout
     time_text = f"{rec.start_time_sec:.2f}" if rec.start_time_sec is not None else "-"
     if rec.is_outlier:
         lat, lon = "(이상치)", "(이상치)"
+    elif dropout:
+        lat, lon = "(GPS 끊김)", "-"   # 좌표 없는 끊김은 검증 실패보다 먼저 본다(리뷰 #93)
     elif failed:
         lat, lon = "(검증 실패)", "-"
     elif rec.has_fix:
         lat, lon = f"{rec.latitude:.6f}", f"{rec.longitude:.6f}"
-    elif rec.is_dropout:
-        lat, lon = "(GPS 끊김)", "-"
     else:
         lat, lon = "-", "-"   # GPS 기록이 없는 행(G센서 전용 등). 예전엔 "(GPS 없음)"이었다.
     if failed:

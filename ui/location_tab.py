@@ -61,8 +61,8 @@ class LocationTab(QWidget):
         self._table.horizontalHeader().moveSection(_SEGMENT_COLUMN, 0)
         self._table.setColumnHidden(_SEGMENT_COLUMN, True)
         self._table.horizontalHeaderItem(_EVENT_COLUMN).setToolTip(
-            "선택한 차종 기준(국토부 DTG 위험운전행동 판별 기준)으로 판정한 급가속·급출발·급감속·"
-            "급정지·급진로변경·급좌/우회전·급U턴.\n판정에 쓰인 측정 구간의 모든 행에 표시합니다.")
+            "선택한 차종 기준(국토부 DTG 위험운전행동 판별 기준)으로 판정한 급가속·급출발·급감속·급정지.\n"
+            "방향 계열(급진로변경·급회전·급U턴)과 과속은 판정하지 않습니다.\n판정에 쓰인 측정 구간의 모든 행에 표시합니다.")
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -144,7 +144,7 @@ class LocationTab(QWidget):
             self._selected_label.setText(f"{base}  ({cached})" if cached else base)
             return
         self._selected_label.setText(f"{base}  (주소 조회 중…)")
-        self._resolver.request(point.latitude, point.longitude)
+        self._resolver.request(point.latitude, point.longitude, owner="location")
 
     def _on_address_resolved(self, lat: float, lon: float, address: str) -> None:
         if self._selected_key is None or geocode.cache_key(lat, lon) != self._selected_key:
@@ -157,9 +157,17 @@ class LocationTab(QWidget):
 
     def load_views(self, views: List[DatasetView]) -> None:
         """views[0]이 Composed(이어 붙인 전체 - 지도는 이어진 궤적, 표는 video1→video2… 순), 그 뒤가
-        영상별. 영상이 하나면 views는 하나."""
+        영상별. 영상이 하나면 views는 하나. 빈 목록이면 표·지도를 비운다(끈 탭에 이전 사건이 남지 않게)."""
         self._views = list(views)
         fill_view_bar(self._view_bar, self._views)
+        if not self._views:
+            self._points = []
+            self._row_index = []
+            self._table.setRowCount(0)
+            self._map.set_track([], [])
+            self._selected_label.setText("")
+            self._detail_btn.hide()
+            return
         self._show_view(0)
 
     def current_view(self) -> int:
@@ -171,7 +179,8 @@ class LocationTab(QWidget):
         view = self._views[index]
         records, events = view.points, view.events
         self._points = records
-        self._map.set_track(records, events)
+        self._map.set_track(view.map_points if view.map_points is not None else records, events,
+                            baseline=(index == 0))
         self._selected_label.setText("")
         self._selected_key = None
         self._table.setColumnHidden(_SEGMENT_COLUMN, not view.segment_labels)
@@ -186,6 +195,8 @@ class LocationTab(QWidget):
             rec = records[index]
             here = row_events[index]
             texts = row_texts(rec, here)
+            # 1초 보기에서도 세로 머리글은 리포트 '#'와 같은 전체 지점 번호(리뷰 #129).
+            self._table.setVerticalHeaderItem(row, QTableWidgetItem(str(index + 1)))
             items = [QTableWidgetItem(t) for t in texts]
             lat_item, lon_item = items[COL_LAT], items[COL_LON]
             if rec.is_outlier:

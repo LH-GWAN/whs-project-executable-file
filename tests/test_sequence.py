@@ -99,7 +99,7 @@ def tracker(monkeypatch):
     app = QApplication.instance() or QApplication([])
 
     class MapStub(QWidget):
-        def set_track(self, *a): pass
+        def set_track(self, *a, **k): pass
         def set_playback_time(self, t): self.t = t
     monkeypatch.setattr(tracker_tab, 'MapView', MapStub)
     tab = tracker_tab.TrackerTab()

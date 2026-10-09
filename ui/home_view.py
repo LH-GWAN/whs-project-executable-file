@@ -251,7 +251,9 @@ class HomeView(QWidget):
         dialog.canceled.connect(on_cancel)
         worker.start()
         dialog.exec()
-        worker.wait(30000)
+        worker.wait()          # 실행 중인 QThread를 지우면 abort된다 - 끝날 때까지 기다린다
+        worker.deleteLater()   # 끝난 워커와 진행 창은 바로 치운다(리뷰 #132)
+        dialog.deleteLater()
         if user_cancelled[0] or result[0] is None:
             return None
         return result[0]
@@ -311,6 +313,7 @@ class HomeView(QWidget):
             worker.cancel()
         worker.wait()
         worker.deleteLater()
+        dialog.deleteLater()
         if worker.is_cancelled() and not result["error"]:
             return None, ""
         return result["value"], result["error"]
@@ -328,7 +331,17 @@ class HomeView(QWidget):
                                     "영상을 하나만 골라 이어보기 없이 이 영상만 분석합니다.")
             self._start_single(fronts[0])
             return
-        dual_track = [f for f in fronts if has_dual_video_tracks(f)]
+        # 트랙 수 확인은 파일마다 앞 2MB를 읽어 느린 공유 폴더에서는 수십 초 걸린다 - 워커에서(리뷰 #134).
+        dual_track, error = self._run_task(
+            "영상 확인", "영상 트랙을 확인하는 중...",
+            lambda cancel, progress: [f for f in fronts
+                                      if (progress(f"영상 트랙 확인 중 - {os.path.basename(f)}") or True)
+                                      and not cancel.is_set() and has_dual_video_tracks(f)])
+        if error:
+            QMessageBox.critical(self, "영상 확인", f"영상을 확인하다 오류가 났습니다:\n{error}")
+            return
+        if dual_track is None:
+            return
         track_mode = ""
         if dual_track:
             track_mode = self._ask_dual_track_mode(dual_track[0], len(dual_track)) or ""
@@ -381,7 +394,8 @@ class HomeView(QWidget):
         box.setText("선택한 영상들은 끊김 없이 이어진 녹화로 볼 수 없어 이어보기를 할 수 없습니다.")
         detail = [f"• {p}" for p in plan.problems]
         if plan.slots:
-            detail = ["[시각순 정렬]"] + self._slot_lines(plan) + [""] + detail
+            # 문제가 있으면 정렬하지 않은 목록이 그대로 온다 - '시각순'이라고 적지 않는다(리뷰 #102).
+            detail = ["[시각순 정렬]" if plan.basis else "[선택한 영상]"] + self._slot_lines(plan) + [""] + detail
         box.setInformativeText("\n".join(detail))
         repick = box.addButton("다시 고르기", QMessageBox.AcceptRole)
         box.addButton("취소", QMessageBox.RejectRole)
@@ -438,8 +452,34 @@ class HomeView(QWidget):
                         slot.rear = probe
                     used.add(os.path.normcase(os.path.abspath(path)))
                     break
-                self._ask_repick_rear(front.path, rear.path, check.problems, check.notes)
+                # 이 흐름 전용 창: 단일 전후방용 창([전방만 분석])을 재사용하면 버튼 뜻이 맞지 않고 반환값도
+                # 버려졌다(리뷰 #142).
+                choice = self._ask_mismatch_in_sequence(n, missing, front.path, rear.path, check.problems, check.notes)
+                if choice == "skip":
+                    break
+                if choice == "cancel":
+                    return False
         return True
+
+    def _ask_mismatch_in_sequence(self, n: int, missing: str, front_path: str, rear_path: str,
+                                  problems: List[str], notes: List[str]) -> str:
+        """빠진 짝으로 고른 파일이 대조에 실패했을 때. 'repick' / 'skip' / 'cancel'."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(f"{n}번 영상의 {missing} 영상이 맞지 않습니다")
+        box.setText(f"고른 {missing} 영상은 {n}번 영상과 같은 녹화로 볼 수 없어 받지 않습니다.")
+        detail = [f"전방: {os.path.basename(front_path)}", f"후방: {os.path.basename(rear_path)}", ""]
+        detail += [f"• {p}" for p in problems]
+        if notes:
+            detail += [""] + [f"참고: {x}" for x in notes]
+        box.setInformativeText("\n".join(detail))
+        repick = box.addButton("다시 고르기", QMessageBox.AcceptRole)
+        skip = box.addButton(f"{missing} 제외하고 진행", QMessageBox.AcceptRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.setDefaultButton(repick)
+        box.exec()
+        clicked = box.clickedButton()
+        return "repick" if clicked is repick else "skip" if clicked is skip else "cancel"
 
     def _confirm_sequence(self, plan: SequencePlan) -> bool:
         box = QMessageBox(self)

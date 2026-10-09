@@ -4,6 +4,7 @@ import glob
 import json
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
@@ -40,6 +41,8 @@ class PipelineResult:
     track_mode: str = ""       # 파일 하나에 전·후방 트랙이 든 영상의 보기 방식(both/front/rear)
     rear_sha256: str = ""      # 후방 원본 해시(사본과 대조를 마친 값)
     analyzed_at: str = ""      # 분석(추출) 시각 - 이 PC의 현지 시각 ISO 문자열
+    # 다시 열 때 엔진 산출물 manifest 대조 결과. None=manifest 없음(옛 사건·새 분석 직후).
+    artifacts_verified: Optional[bool] = None
     # 연속 영상 이어보기의 구간들. 비어 있으면 영상 하나짜리 사건이다. 이어보기면 extraction·
     # driving_events·duration_sec는 구간들을 시간축으로 이어 붙인 값(Composed)이다.
     segments: List["SegmentResult"] = field(default_factory=list)
@@ -90,6 +93,126 @@ class SegmentResult:
         return self.extraction.points
 
 
+_COPY_CHUNK = 4 * 1024 * 1024
+
+
+def _copy_cancellable(src: str, dst: str, cancel_event=None) -> None:
+    """shutil.copy2 대신 청크 단위로 복사하며 취소를 확인한다. 큰 영상(수 GB)을 통째로 복사하는 동안
+    취소가 먹지 않아 워커가 한참 돌았고, 그 사이 창을 닫으면 실행 중인 QThread가 파괴돼 abort됐다
+    (리뷰 #15). 취소되면 쓰다 만 사본을 지우고 CancelledError."""
+    try:
+        with open(src, "rb") as fin, open(dst, "wb") as fout:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("분석이 취소되었습니다.")
+                chunk = fin.read(_COPY_CHUNK)
+                if not chunk:
+                    break
+                fout.write(chunk)
+        shutil.copystat(src, dst)
+    except BaseException:
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise
+
+
+def _sha256_cancellable(path: str, cancel_event=None) -> str:
+    def keep_going(_done: int, _total: int) -> bool:
+        return cancel_event is None or not cancel_event.is_set()
+    digest = hashing.sha256_file(path, progress_cb=keep_going)
+    if not digest:
+        raise CancelledError("분석이 취소되었습니다.")
+    return digest
+
+
+# 사본·엔진 출력 경로가 Windows MAX_PATH(260)에 걸리면 추출이 실패하거나 'GPS 없음'이 된다(리뷰 #66).
+# 전체 경로가 이 길이를 넘을 것 같으면 사본 이름을 짧은 고정 이름으로 바꾼다(원본 이름은 case.json에 남는다).
+_MAX_COPY_PATH = 200
+
+
+def _copy_name(source_dir: str, name: str, short: str) -> str:
+    path = os.path.join(source_dir, name)
+    if len(path) + 40 > _MAX_COPY_PATH:   # 뒤에 engine_output/<stem>/TRACK…/coordinates.csv 가 붙는다
+        return short + os.path.splitext(name)[1]
+    return name
+
+
+def _rollback_case(history_store: HistoryStore, case_id: int, case_folder: str) -> None:
+    """실패·취소 때 사본 폴더와 레코드를 치운다. 폴더를 먼저(읽기 전용도 풀어서) 지우고, 단계마다 따로
+    감싼다 - 예전엔 delete_case가 먼저라 DB 삭제가 실패하면(디스크 가득 참) 폴더가 남았고, 읽기 전용
+    사본은 rmtree가 조용히 건너뛰었다(리뷰 #28)."""
+    from core.case_deletion import _rmtree
+    try:
+        if case_folder and os.path.isdir(case_folder):
+            _rmtree(case_folder)
+    except OSError:
+        shutil.rmtree(case_folder, ignore_errors=True)
+    try:
+        history_store.delete_case(case_id)
+    except Exception:  # noqa: BLE001 - 원래 예외를 덮지 않는다
+        pass
+
+
+def _write_json_atomic(path: str, data: Dict) -> None:
+    """임시 파일에 쓰고 fsync 후 os.replace - 쓰다 실패해도 기존 파일이 잘리지 않는다(리뷰 #29)."""
+    folder = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".case-", suffix=".json.tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_artifact_manifest(output_dir: str) -> str:
+    """엔진 산출물(CSV·로그)의 SHA-256 목록을 engine_output/manifest.sha256 에 남긴다. 다시 열 때 대조해
+    산출물이 바뀌었는지 알린다(리뷰 #92). 반환값: manifest 경로."""
+    lines = []
+    for root, _dirs, files in os.walk(output_dir):
+        for name in sorted(files):
+            if name == "manifest.sha256":
+                continue
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, output_dir).replace("\\", "/")
+            try:
+                lines.append(f"{hashing.sha256_file(full)}  {rel}")
+            except OSError:
+                continue
+    path = os.path.join(output_dir, "manifest.sha256")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def verify_artifact_manifest(output_dir: str) -> Optional[bool]:
+    """manifest.sha256 대조. 없으면 None, 전부 일치하면 True, 하나라도 다르거나 빠지면 False."""
+    path = os.path.join(output_dir or "", "manifest.sha256")
+    if not output_dir or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                digest, rel = line.split("  ", 1)
+                full = os.path.join(output_dir, rel)
+                if not os.path.isfile(full) or hashing.sha256_file(full) != digest:
+                    return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _safe_case_folder_name(case_number: str, case_id: int) -> str:
     safe = "".join(c for c in case_number if c.isalnum() or c in "-_") or "case"
     return f"{safe[:48]}_{case_id}"
@@ -120,13 +243,13 @@ def run_analysis_pipeline(
             raise CancelledError("분석이 취소되었습니다.")
 
     check_cancelled()
-    analyzed_at = datetime.now().isoformat(timespec="seconds")
+    analyzed_at = datetime.now().astimezone().isoformat(timespec="seconds")   # 시간대 포함(리뷰 #99)
     # 같은 파일인지 확인하느라 화면에서 이미 계산했으면 다시 읽지 않는다(큰 영상은 수 초).
     if precomputed_sha256:
         sha256 = precomputed_sha256
     else:
         report("파일 해시 계산 중 (SHA-256)...")
-        sha256 = hashing.sha256_file(video_path)
+        sha256 = _sha256_cancellable(video_path, cancel_event)
 
     check_cancelled()
     report("파일 형식 확인 중...")
@@ -163,15 +286,18 @@ def run_analysis_pipeline(
     try:
         os.makedirs(source_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
+        # 분석 중 프로세스가 죽어도 폴더를 찾아 지우고 '분석 중 중단'으로 알 수 있게 바로 기록한다(리뷰 #31).
+        history_store.set_output_folder(case_id, output_dir)
+        history_store.set_analysis_status(case_id, "analyzing")
 
         check_cancelled()
         report("원본 영상을 사건 폴더로 복사 중 (무결성 보존)...")
-        source_copy_path = os.path.join(source_dir, os.path.basename(video_path))
+        source_copy_path = os.path.join(source_dir, _copy_name(source_dir, os.path.basename(video_path), "front"))
         rear_copy_path = ""
         rear_sha256 = ""
-        shutil.copy2(video_path, source_copy_path)
+        _copy_cancellable(video_path, source_copy_path, cancel_event)
         report("분석 사본 SHA-256 검증 중...")
-        if hashing.sha256_file(source_copy_path) != sha256:
+        if _sha256_cancellable(source_copy_path, cancel_event) != sha256:
             raise ValueError("원본 해시와 분석 사본 SHA-256이 다릅니다. 분석을 중단했습니다.")
         check_cancelled()
         # 후방 영상은 분석하지 않고 같이 보기용으로만 보존한다. 이름이 전방과 같으면
@@ -179,15 +305,17 @@ def run_analysis_pipeline(
         if rear_video_path:
             if not os.path.isfile(rear_video_path):
                 raise FileNotFoundError("후방 원본 영상을 찾을 수 없습니다.")
-            rear_sha256 = hashing.sha256_file(rear_video_path)
+            rear_sha256 = _sha256_cancellable(rear_video_path, cancel_event)
             check_cancelled()
             report("후방 영상을 사건 폴더로 복사 중...")
-            rear_name = os.path.basename(rear_video_path)
-            if rear_name == os.path.basename(video_path):
+            rear_name = _copy_name(source_dir, os.path.basename(rear_video_path), "rear")
+            # NTFS·APFS는 대소문자를 구분하지 않아 REC.MP4와 rec.mp4가 같은 파일이다(리뷰 #18).
+            if rear_name.casefold() == os.path.basename(source_copy_path).casefold() \
+                    or os.path.exists(os.path.join(source_dir, rear_name)):
                 rear_name = "rear_" + rear_name
             rear_copy_path = os.path.join(source_dir, rear_name)
-            shutil.copy2(rear_video_path, rear_copy_path)
-            if hashing.sha256_file(rear_copy_path) != rear_sha256:
+            _copy_cancellable(rear_video_path, rear_copy_path, cancel_event)
+            if _sha256_cancellable(rear_copy_path, cancel_event) != rear_sha256:
                 raise ValueError("후방 사본 SHA-256이 다릅니다. 분석을 중단했습니다.")
 
         report("GPS/센서 메타데이터 추출 중..." + (" (슬랙 카빙 포함)" if carve_slack else ""))
@@ -211,17 +339,19 @@ def run_analysis_pipeline(
         vehicle_type = driving_events.normalize_vehicle(vehicle_type)
         events = driving_events.detect_driving_events(extraction.points, vehicle_type)
 
-        _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
+        _record_engine_runs(history_store, case_id, extraction.engine_runs, output_dir)
+        write_artifact_manifest(output_dir)
+        _write_case_json(case_folder, case_id, case_number, examiner, memo, source_copy_path, sha256,
                           routing, extraction, dur, settings, events, carve_slack,
                           vehicle_type, rear_copy_path=rear_copy_path, track_mode=track_mode,
-                          created_at=analyzed_at)
-
-        _record_engine_runs(history_store, case_id, extraction.engine_runs, output_dir)
+                          created_at=analyzed_at, rear_sha256=rear_sha256,
+                          original_filename=os.path.basename(video_path))
 
         history_store.update_case_extraction(
             case_id, duration_sec=dur, avi_repaired=_avi_was_repaired(output_dir),
             output_folder=output_dir,
         )
+        history_store.set_analysis_status(case_id, extraction.status)
         if rear_copy_path:
             history_store.set_rear_video(case_id, os.path.basename(rear_copy_path))
         if track_mode:
@@ -243,8 +373,7 @@ def run_analysis_pipeline(
             analyzed_at=analyzed_at,
         )
     except BaseException:
-        history_store.delete_case(case_id)
-        shutil.rmtree(case_folder, ignore_errors=True)
+        _rollback_case(history_store, case_id, case_folder)
         raise
 
 
@@ -273,12 +402,19 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
             metadata = {}
     except (OSError, ValueError):
         pass
-    # Legacy cases have no reliable success marker: never silently promote failures to OK.
-    fallback_status = "ok" if any(p.has_fix for p in points) else "unknown"
+    # 상태는 DB(analysis_status) > case.json 순으로 믿는다. 둘 다 없으면 좌표가 있어도 'ok'로 올리지
+    # 않는다 - case.json이 0바이트로 잘린 timed_out 사건이 리포트에 'ok'로 찍혔다(리뷰 #30).
+    # "analyzing"은 분석 도중 프로세스가 죽은 사건이다(리뷰 #31).
+    status = case.analysis_status or str(metadata.get("status") or "")
+    if status == "analyzing":
+        status, detail = "engine_failed", "분석이 끝나기 전에 프로그램이 종료됐습니다. 이 사건은 다시 분석하세요."
+    elif not status:
+        status, detail = "unknown", "저장된 분석 상태를 확인할 수 없습니다."
+    else:
+        detail = str(metadata.get("status_detail") or "")
     extraction = ExtractionResult(
         routing=routing, points=points, engine_runs=[],
-        status=metadata.get("status", fallback_status),
-        status_detail=metadata.get("status_detail", "저장된 분석 상태를 확인할 수 없습니다." if fallback_status == "unknown" else ""),
+        status=status, status_detail=detail,
         warnings=_collect_warnings(case.output_folder) if case.output_folder else [],
         avi_repaired=case.avi_repaired,
         slack_points=load_slack_points(case.output_folder) if case.output_folder else [],
@@ -288,17 +424,20 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
     case_folder = os.path.dirname(case.output_folder) if case.output_folder else ""
     rear_copy = (os.path.join(case_folder, "source", case.rear_video_filename)
                  if case_folder and case.rear_video_filename else "")
+    copy_name = str(metadata.get("source_video_filename") or case.source_video_filename)
     return PipelineResult(
         case_id=case.id or -1,
         case_folder=case_folder,
-        source_copy_path=(os.path.join(case_folder, "source", case.source_video_filename)
-                          if case_folder else ""),
+        source_copy_path=(os.path.join(case_folder, "source", copy_name) if case_folder else ""),
+        artifacts_verified=verify_artifact_manifest(case.output_folder),
         extraction=extraction,
         duration_sec=case.duration_sec,
         driving_events=events,
         sha256=case.source_video_sha256,
         vehicle_type=vehicle_type,
-        rear_copy_path=rear_copy if rear_copy and os.path.isfile(rear_copy) else "",
+        # 사본이 없어도 경로를 남긴다 - 그래야 무결성 표시등이 '사본 없음'(회색)으로 알린다. 예전엔
+        # 비워서 후방이 조용히 빠지고 표시등이 초록이 됐다(리뷰 #17).
+        rear_copy_path=rear_copy,
         track_mode=case.track_mode or "",
         rear_sha256=str(metadata.get("rear_sha256") or ""),
         analyzed_at=case.created_at,
@@ -319,8 +458,7 @@ def update_case_json(case_folder: str, case_number: str, examiner: str, memo: st
         data["examiner"] = examiner
         data["memo"] = memo
         data["info_updated_at"] = datetime.now().isoformat(timespec="seconds")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(path, data)
         return True
     except (OSError, ValueError):
         return False
@@ -333,15 +471,16 @@ def _avi_was_repaired(output_dir: str) -> bool:
 def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_path, sha256,
                       routing, extraction: ExtractionResult, dur, settings, events,
                       carve_slack, vehicle_type: str, rear_copy_path: str = "", track_mode: str = "",
-                      created_at: str = "", segments: Optional[List[Dict]] = None) -> None:
+                      created_at: str = "", segments: Optional[List[Dict]] = None,
+                      rear_sha256: str = "", original_filename: str = "") -> None:
     case_json_path = os.path.join(case_folder, "case.json")
-    with open(case_json_path, "w", encoding="utf-8") as f:
-        json.dump({
+    _write_json_atomic(case_json_path, {
             "case_id": case_id,
             "case_number": case_number,
             "examiner": examiner,
             "memo": memo,
-            "source_video_filename": os.path.basename(video_path),
+            "source_video_filename": os.path.basename(video_path),   # source/ 안 사본 이름
+            "original_filename": original_filename or os.path.basename(video_path),
             "source_video_sha256": sha256,
             "detected_format": routing.container,
             "avi_repaired": _avi_was_repaired(os.path.join(case_folder, "engine_output")),
@@ -349,7 +488,7 @@ def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_pa
             "status_detail": extraction.status_detail,
             "warnings": extraction.warnings,
             "copy_sha256_verified": True,
-            "rear_sha256": hashing.sha256_file(rear_copy_path) if rear_copy_path else "",
+            "rear_sha256": rear_sha256,   # 이미 사본과 대조한 값(다시 해시하지 않음, 리뷰 #95)
             "engine_runs": [{"argv": r.argv, "exit_code": r.exit_code,
                 "started_at": r.started_at.isoformat(), "finished_at": r.finished_at.isoformat()}
                 for r in extraction.engine_runs],
@@ -370,7 +509,7 @@ def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_pa
             "rear_video_filename": os.path.basename(rear_copy_path) if rear_copy_path else "",
             "track_mode": track_mode,
             "segments": segments or [],
-        }, f, ensure_ascii=False, indent=2)
+        })
 
 
 def _record_engine_runs(history_store: HistoryStore, case_id: int, runs, output_dir: str) -> None:
@@ -421,13 +560,21 @@ def combine_segments(segments: List[SegmentResult]) -> tuple:
         runs += seg.extraction.engine_runs
         warnings += [f"[{seg.label}] {w}" for w in seg.extraction.warnings]
         slack += seg.extraction.slack_points
-        if status == "ok" and seg.extraction.status != "ok":
-            status = seg.extraction.status
-            detail = f"{seg.label}: {seg.extraction.status_detail or seg.extraction.status_message}"
+    # 구간마다 비정상 상태를 모두 모은다 - 첫 하나만 남기면 다른 구간의 시간 초과가 묻힌다(리뷰 #32).
+    bad = [seg for seg in segments if seg.extraction.status != "ok"]
+    if bad:
+        priority = ["timed_out", "engine_failed", "unsupported", "gps_untrusted", "no_gps", "unknown"]
+        status = min((seg.extraction.status for seg in bad),
+                     key=lambda st: priority.index(st) if st in priority else len(priority))
+        detail = "; ".join(f"{seg.label}: {seg.extraction.status}"
+                           + (f"({seg.extraction.status_detail})" if seg.extraction.status_detail else "")
+                           for seg in bad)
     first = segments[0].extraction
     combined = ExtractionResult(
         routing=first.routing, points=points, engine_runs=runs,
-        used_input_path=segments[0].primary_copy_path, primary_source_file=first.primary_source_file,
+        used_input_path=segments[0].primary_copy_path,
+        primary_source_file="; ".join(s.extraction.primary_source_file for s in segments
+                                      if s.extraction.primary_source_file) or None,
         time_source=first.time_source, warnings=warnings, status=status, status_detail=detail,
         slack_points=slack, avi_repaired=any(s.extraction.avi_repaired for s in segments))
     return combined, events
@@ -490,14 +637,14 @@ def run_sequence_pipeline(
     if not any(settings.get(key, True) for key in ("tracker", "speed", "location")):
         raise ValueError("분석 항목을 최소 한 개 선택하세요.")
     vehicle_type = driving_events.normalize_vehicle(vehicle_type)
-    analyzed_at = datetime.now().isoformat(timespec="seconds")
+    analyzed_at = datetime.now().astimezone().isoformat(timespec="seconds")   # 시간대 포함(리뷰 #99)
     known = dict(precomputed_sha256 or {})
 
     def sha_of(path: str) -> str:
         if not known.get(path):
             check_cancelled()
             report(f"파일 해시 계산 중 (SHA-256) - {os.path.basename(path)}")
-            known[path] = hashing.sha256_file(path)
+            known[path] = _sha256_cancellable(path, cancel_event)
         return known[path]
 
     routings = []
@@ -514,7 +661,8 @@ def run_sequence_pipeline(
     first = items[0].primary
     provisional = CaseRecord(
         id=None, case_number=case_number, examiner=examiner, memo=memo,
-        source_video_path=first, source_video_filename=os.path.basename(first),
+        source_video_path=first,
+        source_video_filename=f"01_{os.path.basename(first)}",   # source/ 안 사본 이름(리뷰 #96)
         source_video_size_bytes=sum(os.path.getsize(p) for it in items for p in (it.front, it.rear) if p),
         source_video_sha256=known[first], detected_format=routings[0].container,
         analysis_settings=settings, created_at=analyzed_at,
@@ -531,6 +679,8 @@ def run_sequence_pipeline(
     try:
         os.makedirs(source_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
+        history_store.set_output_folder(case_id, output_dir)
+        history_store.set_analysis_status(case_id, "analyzing")
         segments: List[SegmentResult] = []
         offset = 0.0
         total = len(items)
@@ -543,12 +693,13 @@ def run_sequence_pipeline(
                     continue
                 check_cancelled()
                 report(f"[{label}/{total}] {'전방' if role == 'front' else '후방'} 영상을 사건 폴더로 복사 중...")
-                name = f"{n + 1:02d}_{os.path.basename(path)}"
-                if role == "rear" and item.front and name == f"{n + 1:02d}_{os.path.basename(item.front)}":
+                name = _copy_name(source_dir, f"{n + 1:02d}_{os.path.basename(path)}", f"{n + 1:02d}_{role}")
+                if role == "rear" and (os.path.exists(os.path.join(source_dir, name)) or (
+                        copies["front"] and name.casefold() == os.path.basename(copies["front"]).casefold())):
                     name = f"{n + 1:02d}_rear_{os.path.basename(path)}"
                 copy = os.path.join(source_dir, name)
-                shutil.copy2(path, copy)
-                if hashing.sha256_file(copy) != known[path]:
+                _copy_cancellable(path, copy, cancel_event)
+                if _sha256_cancellable(copy, cancel_event) != known[path]:
                     raise ValueError(f"{os.path.basename(path)}: 원본 해시와 사본 SHA-256이 다릅니다. 분석을 중단했습니다.")
                 copies[role] = copy
             primary_copy = copies["front"] or copies["rear"]
@@ -579,11 +730,14 @@ def run_sequence_pipeline(
         combined, events = combine_segments(segments)
         records = [segment_record(seg, routings[seg.index].container) for seg in segments]
         track_mode = next((it.track_mode for it in items if it.track_mode), "")
-        _write_case_json(case_folder, case_id, case_number, examiner, memo, first, known[first],
-                          routings[0], combined, offset, settings, events, carve_slack,
-                          vehicle_type, track_mode=track_mode, created_at=analyzed_at, segments=records)
+        write_artifact_manifest(output_dir)
+        _write_case_json(case_folder, case_id, case_number, examiner, memo, segments[0].primary_copy_path,
+                          known[first], routings[0], combined, offset, settings, events, carve_slack,
+                          vehicle_type, track_mode=track_mode, created_at=analyzed_at, segments=records,
+                          original_filename=os.path.basename(first))
         history_store.update_case_extraction(case_id, duration_sec=offset,
                                              avi_repaired=combined.avi_repaired, output_folder=output_dir)
+        history_store.set_analysis_status(case_id, combined.status)
         history_store.set_segments(case_id, records)
         if track_mode:
             history_store.set_track_mode(case_id, track_mode)
@@ -593,8 +747,7 @@ def run_sequence_pipeline(
             extraction=combined, duration_sec=offset, driving_events=events, sha256=known[first],
             vehicle_type=vehicle_type, track_mode=track_mode, analyzed_at=analyzed_at, segments=segments)
     except BaseException:
-        history_store.delete_case(case_id)
-        shutil.rmtree(case_folder, ignore_errors=True)
+        _rollback_case(history_store, case_id, case_folder)
         raise
 
 
@@ -618,8 +771,9 @@ def _reopen_sequence(case: CaseRecord) -> PipelineResult:
             points=points, engine_runs=[], used_input_path=front or rear,
             primary_source_file=primary, time_source=time_source,
             warnings=_collect_warnings(seg_out) if os.path.isdir(seg_out) else [],
-            status=rec.get("status") or ("ok" if any(p.has_fix for p in points) else "unknown"),
-            status_detail=rec.get("status_detail") or "",
+            status=(rec.get("status") or "unknown") if os.path.isdir(seg_out) else "unknown",
+            status_detail=(rec.get("status_detail") or "") if os.path.isdir(seg_out)
+            else "엔진 산출물 폴더가 없습니다.",
             slack_points=load_slack_points(seg_out) if os.path.isdir(seg_out) else [],
             avi_repaired=_avi_was_repaired(seg_out))
         dur = rec.get("duration_sec")
@@ -637,4 +791,5 @@ def _reopen_sequence(case: CaseRecord) -> PipelineResult:
         source_copy_path=segments[0].primary_copy_path if segments else "",
         extraction=combined, duration_sec=case.duration_sec or offset, driving_events=events,
         sha256=case.source_video_sha256, vehicle_type=vehicle_type, track_mode=case.track_mode or "",
-        analyzed_at=case.created_at, segments=segments)
+        analyzed_at=case.created_at, segments=segments,
+        artifacts_verified=verify_artifact_manifest(case.output_folder))

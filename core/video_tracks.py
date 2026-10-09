@@ -58,18 +58,40 @@ def _mp4_video_tracks(path: str) -> int:
 
 
 def _avi_video_tracks(path: str) -> int:
-    # hdrl LIST는 파일 앞쪽에 있다. 앞 2MB 안의 'strh' 청크 중 fccType 'vids'를 센다.
+    """첫 RIFF의 hdrl LIST 안 strl/strh 중 fccType 'vids'만 센다. 앞 2MB를 통째로 문자열 검색하면 뒤에
+    이어붙은 옛 녹화 RIFF의 strh까지 세어 1트랙 파일이 2트랙으로 보였다(리뷰 #101)."""
     with open(path, "rb") as f:
-        head = f.read(2 * 1024 * 1024)
-    count = 0
-    pos = 0
-    while True:
-        pos = head.find(b"strh", pos)
-        if pos < 0:
-            break
-        if head[pos + 8:pos + 12] == b"vids":
-            count += 1
-        pos += 4
+        head = f.read(12)
+        if len(head) < 12 or head[:4] != b"RIFF":
+            return 0
+        riff_end = min(8 + struct.unpack("<I", head[4:8])[0], os.path.getsize(path))
+        pos = 12
+        count = 0
+        while pos + 12 <= riff_end:
+            f.seek(pos)
+            hdr = f.read(12)
+            if len(hdr) < 12:
+                break
+            ck_id, ck_size, list_type = hdr[:4], struct.unpack("<I", hdr[4:8])[0], hdr[8:12]
+            if ck_id == b"LIST" and list_type == b"hdrl":
+                hdrl_start, hdrl_end = pos + 12, min(pos + 8 + ck_size, riff_end)
+                q = hdrl_start
+                while q + 8 <= hdrl_end:
+                    f.seek(q)
+                    sub = f.read(12)
+                    if len(sub) < 8:
+                        break
+                    sub_id, sub_size = sub[:4], struct.unpack("<I", sub[4:8])[0]
+                    if sub_id == b"LIST" and sub[8:12] == b"strl":
+                        f.seek(q + 12)
+                        strh = f.read(12)
+                        if strh[:4] == b"strh" and strh[8:12] == b"vids":
+                            count += 1
+                    q += 8 + sub_size + (sub_size & 1)
+                return count
+            if ck_id == b"LIST" and list_type == b"movi":
+                break
+            pos += 8 + ck_size + (ck_size & 1)
     return count
 
 

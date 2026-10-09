@@ -123,7 +123,7 @@ def tracker(qapp, monkeypatch):
     from PySide6.QtWidgets import QWidget
     from ui import tracker_tab
     class MapStub(QWidget):
-        def set_track(self, *a): pass
+        def set_track(self, *a, **k): pass
         def set_playback_time(self, t): self.seconds = t
     monkeypatch.setattr(tracker_tab, 'MapView', MapStub)
     monkeypatch.setattr(tracker_tab.geocode, 'is_available', lambda: False)
@@ -242,7 +242,7 @@ def test_location_verification_labels(qapp, monkeypatch):
     from PySide6.QtWidgets import QWidget
     from ui import location_tab
     class MapStub(QWidget):
-        def set_track(self, *args): pass
+        def set_track(self, *args, **kwargs): pass
     monkeypatch.setattr(location_tab, 'MapView', MapStub)
     tab = location_tab.LocationTab()
     tab.load([point(0, gps_checksum_ok=True), point(1, gps_checksum_ok=False), point(2)], [])

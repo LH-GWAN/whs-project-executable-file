@@ -8,8 +8,9 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
 from core import gpstime
-from core.acceleration import _distinct_fix_indices, compute_point_accelerations
-from core.driving_events import DrivingEvent
+from core.acceleration import MAX_GAP_SEC, _distinct_fix_indices, compute_point_accelerations
+from core.driving_events import EVENT_PRIORITY, DrivingEvent
+_PRIORITY = {k: n for n, k in enumerate(EVENT_PRIORITY)}
 from engine.engine_adapter import TrackPoint
 
 _BG = QColor("#0d1117")
@@ -34,7 +35,9 @@ _BUBBLE_TEXT = QColor("#e8edf2")
 
 # 시간 눈금 간격. 블랙박스 영상은 대개 20초~2분이라 10초 단위가 기본이고(사이에 5초 보조선),
 # 더 길면 눈금이 10개 안쪽이 되는 간격을 고른다.
-_LONG_TICK_STEPS = (20, 30, 60, 120, 300, 600, 900, 1800, 3600)
+# 10시간을 넘는 구간(며칠짜리 슬랙)도 눈금이 10개 안쪽이 되게 하루·일주일 단위까지 둔다(리뷰 #118).
+_LONG_TICK_STEPS = (20, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 43200, 86400,
+                    172800, 604800)
 
 
 def _time_tick_step(span_sec: float) -> float:
@@ -45,7 +48,7 @@ def _time_tick_step(span_sec: float) -> float:
     for step in _LONG_TICK_STEPS:
         if span_sec / step <= 10:
             return float(step)
-    return float(_LONG_TICK_STEPS[-1])
+    return float(_LONG_TICK_STEPS[-1]) * math.ceil(span_sec / (_LONG_TICK_STEPS[-1] * 10))
 
 
 def _fmt_tick(seconds: float) -> str:
@@ -56,7 +59,10 @@ def _fmt_tick(seconds: float) -> str:
     if m < 60:
         return f"{m}:{sec:02d}"
     h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{sec:02d}"
+    if h < 48:
+        return f"{h:d}:{m:02d}:{sec:02d}"
+    d, h = divmod(h, 24)
+    return f"{d}일 {h:02d}:{m:02d}"
 
 
 class SpeedChartWidget(QWidget):
@@ -67,16 +73,18 @@ class SpeedChartWidget(QWidget):
         self._records: List[TrackPoint] = []
         self._events: List[DrivingEvent] = []
         self._boundaries: List[Tuple[float, str]] = []   # 이어보기 영상 경계 (시각, 이름)
+        self._time_label = "영상"   # 말풍선의 시각 이름("영상 mm:ss"). 슬랙이면 "경과"(리뷰 #119)
         self._accels: List[Optional[float]] = []
         # 마지막으로 화면에 그린 점들의 위치 (원본 인덱스, x, y). 마우스 위치와 맞춰 본다.
         self._screen_pts: List[Tuple[int, float, float]] = []
         self._hover: Optional[int] = None
 
     def set_data(self, records: List[TrackPoint], events: List[DrivingEvent],
-                 boundaries: Optional[List[Tuple[float, str]]] = None) -> None:
+                 boundaries: Optional[List[Tuple[float, str]]] = None, time_label: str = "영상") -> None:
         self._records = records
         self._events = events
         self._boundaries = list(boundaries or [])
+        self._time_label = time_label
         self._accels = compute_point_accelerations(records)
         self._hover = None
         self._screen_pts = []
@@ -95,7 +103,7 @@ class SpeedChartWidget(QWidget):
         if r.start_time_sec is not None:
             total = int(round(r.start_time_sec))
             m, sec = divmod(total, 60)
-            lines.append(f"영상 {m:02d}:{sec:02d}")
+            lines.append(f"{self._time_label} {_fmt_tick(r.start_time_sec) if total >= 3600 else f'{m:02d}:{sec:02d}'}")
         clock = gpstime.format_point(r)
         if clock:
             lines.append(f"GPS 시각 {clock}")
@@ -326,9 +334,11 @@ class SpeedChartWidget(QWidget):
                 else:
                     base.cubicTo(c1, c2, p2)
                 a, b = indices[k], indices[k + 1]
-                ev = next((e for e in self._events if e.covers(a) and e.covers(b)), None)
-                if ev is None:
+                covering = [e for e in self._events if e.covers(a) and e.covers(b)]
+                if not covering:
                     continue
+                # 겹치면 지도·표와 같은 우선순위(급정지·급출발·급가속·급감속)로 고른다(리뷰 #79).
+                ev = min(covering, key=lambda e: _PRIORITY.get(e.kind, 99))
                 path = colored.setdefault(ev.color, QPainterPath())
                 path.moveTo(p1)
                 if c1 is None:
@@ -346,7 +356,9 @@ class SpeedChartWidget(QWidget):
         prev_index: Optional[int] = None
         for index, t, v in pts:
             if prev_index is not None:
+                prev_t = self._records[prev_index].start_time_sec
                 broken = (self._records[index].segment_index != self._records[prev_index].segment_index
+                          or (prev_t is not None and t - prev_t > MAX_GAP_SEC)   # 측정 공백은 잇지 않는다(리뷰 #91)
                           or any(self._records[j].is_dropout for j in range(prev_index + 1, index)))
                 if broken and qpts:
                     runs.append((indices, qpts))

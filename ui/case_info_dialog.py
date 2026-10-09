@@ -54,7 +54,7 @@ class CaseInfoDialog(QDialog):
             self._vehicle.setItemData(self._vehicle.count() - 1,
                                       "\n".join(criteria_lines(code)), Qt.ToolTipRole)
         self._vehicle.setCurrentIndex(VEHICLE_TYPES.index(DEFAULT_VEHICLE))
-        self._vehicle.setToolTip("위험운전 행동(급가속·급감속·급회전 등)을 이 차종의 기준으로 판정합니다.\n"
+        self._vehicle.setToolTip("위험운전 행동(급가속·급출발·급감속·급정지)을 이 차종의 기준으로 판정합니다.\n"
                                  "국토교통부 DTG 위험운전행동 판별 기준(2022), 승용차는 택시 기준")
 
         title = QLabel("Case Information")
