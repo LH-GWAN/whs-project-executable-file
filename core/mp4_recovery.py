@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from bisect import bisect_right
 from fractions import Fraction
@@ -324,7 +324,7 @@ def indexed_frames(buf, track, limit, media, check, stats, forbidden=()):
 RAW_MARKER = re.compile(rb'\x00[\x00-\xff]{3}[\x01\x21\x41\x61\x05\x25\x45\x65\x06\x27\x47\x67\x28\x48\x68\x09]')
 
 
-def carved_frames(buf, track, media, check, stats):
+def carved_frames(buf, track, media, check, stats, *, fixed_parameters=False):
     """Length-prefixed NALs only; PCM/text gaps do not become video bytes."""
     if track.codec == 'hevc':
         from core.hevc_recovery import carved_hevc_frames
@@ -349,6 +349,8 @@ def carved_frames(buf, track, media, check, stats):
             try:
                 kind = nal_kind(nal, 'h264')
                 if kind in (7, 8):
+                    if fixed_parameters and nal not in track.parameters:
+                        raise ValueError('AVC parameters changed inside unindexed media; channel mixing withheld')
                     if kind == 7:
                         s = sps_info(nal)
                         if track.width and (track.width, track.height) != (s['width'], s['height']):
@@ -878,6 +880,7 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                     carved_frames(buf, t, media, lambda: _check(cancel), stats))
                 frames = []
                 orphaned = []
+                withheld_ranges = []
                 try:
                     for frame in iterator:
                         if len(frames) >= MAX_TABLE:
@@ -896,10 +899,30 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                                 if a < stop:
                                     orphaned.append((a, stop))
                         if orphaned:
-                            for frame in carved_frames(buf, t, orphaned, lambda: _check(cancel), stats):
-                                if len(frames) >= MAX_TABLE:
-                                    raise ValueError('프레임 회수 수가 안전 한도를 초과했습니다.')
-                                frames.append(frame)
+                            for a, b in orphaned:
+                                # Carving has weaker channel evidence than source
+                                # tables. Commit a complete range only after its
+                                # settings agree; failed ranges cannot erase indexed
+                                # frames or contaminate their codec configuration.
+                                trial = replace(t, parameters=list(t.parameters))
+                                pending = []
+                                previous_reason = stats.pop('withheld', None)
+                                try:
+                                    for frame in carved_frames(buf, trial, [(a, b)],
+                                            lambda: _check(cancel), stats, fixed_parameters=True):
+                                        if len(frames) + len(pending) >= MAX_TABLE:
+                                            raise ValueError('프레임 회수 수가 안전 한도를 초과했습니다.')
+                                        pending.append(frame)
+                                except (InvalidMP4, ValueError) as exc:
+                                    stats['withheld'] = str(exc)
+                                    pending = []
+                                reason = stats.get('withheld')
+                                if reason:
+                                    withheld_ranges.append(dict(start=a, end=b, reason=reason))
+                                    manifest['diagnostics'].append(f'track {t.id} unindexed [{a}, {b}): {reason}')
+                                elif previous_reason:
+                                    stats['withheld'] = previous_reason
+                                frames.extend(pending)
                         frames.sort(key=lambda f: f.offset)
                 except (InvalidMP4, ValueError) as exc:
                     manifest['diagnostics'].append(f'track {t.id}: {exc}'); frames = []
@@ -915,6 +938,7 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 video['recovery_method'] = ('hybrid_sample_tables_and_bounded_nal_carving' if mixed else
                     'source_sample_tables' if t.samples else raw_method)
                 video['unindexed_media_ranges'] = orphaned
+                video['withheld_unindexed_media_ranges'] = withheld_ranges
                 video['carved_frames'] = sum(f.sample == 0 for f in frames)
                 video['source_sample_number_basis'] = ('surviving_fragment_declarations'
                     if t.samples and any(b.kind == b'moof' for b in boxes) else 'source_stbl_ordinal'
