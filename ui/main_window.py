@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Optional, Set
 
-from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer
+from PySide6.QtCore import QEventLoop, QSettings, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -58,6 +58,7 @@ class MainWindow(QMainWindow):
         os.makedirs(self._cases_root_dir, exist_ok=True)
 
         self._home = HomeView()
+        QTimer.singleShot(0, self._notify_db_recovery)
         self._home.video_selected.connect(self._on_video_selected)
         self._home.sequence_selected.connect(self._on_sequence_selected)
         self._home.history_item_opened.connect(self._on_history_item_opened)
@@ -143,6 +144,8 @@ class MainWindow(QMainWindow):
 
     def _on_keys_notice_action(self) -> None:
         if show_online_keys_notice(self, allow_suppress=False):
+            geocode.reset_block()   # 키를 고쳤으면 이전 차단(401 등)을 풀고 다시 시도한다(리뷰 #104)
+            AddressResolver.instance().reset()
             self._analysis_view.reload_maps()
 
     def _on_map_mode_action(self) -> None:
@@ -150,6 +153,10 @@ class MainWindow(QMainWindow):
         mode = ask_map_mode(self, current)
         if mode != current:
             self._apply_map_mode(mode)
+        else:
+            # 같은 방식을 다시 골라도 차단(한도 초과·키 오류)을 풀어 다시 시도하게 한다(리뷰 #104).
+            geocode.reset_block()
+            AddressResolver.instance().reset()
 
     def _on_reset_map_settings(self) -> None:
         """지도 사용 방식 선택과 '다시 표시하지 않음' 표시를 지우고 첫 실행 절차를 다시 밟는다.
@@ -168,7 +175,10 @@ class MainWindow(QMainWindow):
             self._apply_map_mode(get_map_mode() or MAP_MODE_OFFLINE)
 
     def _apply_map_mode(self, mode: str) -> None:
-        set_map_mode(mode)
+        if not set_map_mode(mode):
+            QMessageBox.warning(self, "설정 저장 실패",
+                                "지도 사용 방식을 settings.json에 저장하지 못했습니다(읽기 전용?). 이번 실행에는 적용되지만\n"
+                                "다음 실행에서 다시 묻습니다.")
         # 방식을 다시 골랐으면 이전 실패(한도 초과 등)를 잊고 다시 시도한다.
         geocode.reset_block()
         AddressResolver.instance().reset()
@@ -340,7 +350,9 @@ class MainWindow(QMainWindow):
         with HistoryStore(self._history_db_path) as store:
             previous = store.find_cases_by_sha256(sha256)
         # 같은 파일이라도 보기 방식(전방만/후방만/같이)이 다르면 다른 분석이다 - 경고하지 않는다.
-        previous = [c for c in previous if same_view(c.track_mode, track_mode) and not c.segments]
+        previous = [c for c in previous
+                    if same_view(c.track_mode, track_mode) and not c.segments
+                    and bool(c.rear_video_filename) == bool(rear_path)]   # 후방 유무도 같아야 같은 분석(리뷰 #141)
         if previous and not self._confirm_reanalysis(previous):
             return
 
@@ -385,22 +397,45 @@ class MainWindow(QMainWindow):
         progress.setWindowTitle(APP_NAME)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
-        worker = TaskWorker(lambda _cancel, _progress: detect_slack(paths), self)
-        result = {"value": None}
+        progress.setAutoClose(False)
+        # 취소하면 cancel_event로 자식 프로세스를 끝낸다(예전엔 끝날 때까지 GUI가 멈췄다, 리뷰 #43).
+        worker = TaskWorker(lambda cancel, _progress: detect_slack(paths, cancel_event=cancel), self)
+        result = {"value": None, "error": ""}
 
         def done(value) -> None:
             result["value"] = value
             progress.close()
 
+        def failed(message: str) -> None:
+            result["error"] = message
+            progress.close()
+
+        def on_cancel() -> None:
+            if result["value"] is None and not result["error"]:
+                worker.cancel()
+                progress.setLabelText("취소하는 중...")
+                progress.show()
+
         worker.finished_task.connect(done)
-        worker.failed.connect(lambda _m: progress.close())
+        worker.failed.connect(failed)
+        progress.canceled.connect(on_cancel)
         worker.start()
         progress.exec()
         worker.wait()
         worker.deleteLater()
+        progress.deleteLater()
+        if worker.is_cancelled():
+            return None
         info = result["value"]
         if info is None:
-            return None if progress.wasCanceled() else False
+            QMessageBox.warning(self, "슬랙 데이터 확인", f"슬랙 데이터를 확인하지 못했습니다:\n{result['error']}\n\n"
+                                "슬랙 추출 없이 계속합니다.")
+            return False
+        errors = [(label, info[p].get("error")) for label, p in targets if info.get(p, {}).get("error")]
+        if errors:
+            QMessageBox.warning(self, "슬랙 데이터 확인",
+                                "일부 영상의 슬랙 데이터를 확인하지 못했습니다:\n"
+                                + "\n".join(f"  · {label}: {err}" for label, err in errors))
         found = [(label, p, info[p]) for label, p in targets if info.get(p, {}).get("has_slack")]
         if not found:
             return False
@@ -422,6 +457,11 @@ class MainWindow(QMainWindow):
 
     def _start_analysis(self, video_path: str, sha256: str, carve_slack: bool = False,
                         **worker_kwargs) -> None:
+        if self._analysis_running():
+            # 취소 직후 워커가 정리 중인 동안 새 분석을 시작하면 이전 QThread 객체가 실행 중에 덮여
+            # abort됐다(리뷰 #15). 끝날 때까지 받지 않는다.
+            QMessageBox.information(self, APP_NAME, "이전 분석이 아직 정리 중입니다. 잠시 뒤 다시 시도하세요.")
+            return
         dialog = CaseInfoDialog(self)
         if dialog.exec() != CaseInfoDialog.Accepted or dialog.result_input is None:
             return
@@ -442,6 +482,7 @@ class MainWindow(QMainWindow):
         self._progress.show()
 
         self._worker = AnalysisWorker(
+            parent=self,
             video_path=video_path,
             case_number=info.case_number,
             examiner=info.examiner,
@@ -458,7 +499,16 @@ class MainWindow(QMainWindow):
         self._worker.finished_ok.connect(self._on_worker_finished)
         self._worker.failed.connect(self._on_worker_failed)
         self._worker.cancelled.connect(self._on_worker_cancelled)
+        self._worker.finished.connect(self._on_worker_done)
         self._worker.start()
+
+    def _on_worker_done(self) -> None:
+        """스레드가 완전히 끝난 뒤 객체를 지운다(실행 중 파괴 금지)."""
+        worker = self.sender()
+        if worker is self._worker:
+            self._worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def _on_worker_progress(self, message: str) -> None:
         if self._progress is not None:
@@ -479,7 +529,8 @@ class MainWindow(QMainWindow):
         self._current_settings = self._pending_settings
         self._analysis_view.load_result(result, self._pending_case_number, self._pending_settings)
         self._stack.setCurrentWidget(self._analysis_view)
-        self._notify_frame_detail(result)
+        if self._pending_settings.get("location", True):
+            self._notify_frame_detail(result)   # Location 탭이 없으면 안내하지 않는다(리뷰 #140)
 
     def _notify_frame_detail(self, result: PipelineResult) -> None:
         """프레임·G센서 단위로 행을 쓰는 영상이면 Location Analysis에 상세보기가 생긴다고 알린다."""
@@ -499,8 +550,11 @@ class MainWindow(QMainWindow):
     def _on_cancel_requested(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
-        if self._progress is not None:
+        if self._progress is not None and self._analysis_running():
+            # QProgressDialog는 취소를 누르면 스스로 숨는다. 워커가 실제로 멈출 때까지(복사 청크·해시
+            # 단위로 취소를 확인한다) 모달을 다시 띄워 홈 조작·새 분석을 막는다(리뷰 #15).
             self._progress.setLabelText("취소하는 중...")
+            self._progress.show()
 
     def _on_worker_cancelled(self) -> None:
         if self._progress is not None:
@@ -534,13 +588,37 @@ class MainWindow(QMainWindow):
             self._current_memo = memo
             self._analysis_view.set_case_number(number)
 
+    def _notify_db_recovery(self) -> None:
+        """history.db가 손상돼 비켜 두고 새로 시작했으면 알린다(리뷰 #67)."""
+        try:
+            with HistoryStore(self._history_db_path):
+                pass
+        except Exception as exc:  # noqa: BLE001 - 옮기지도 못하면(권한) 이력 없이 계속 쓴다
+            QMessageBox.warning(self, "사건 이력", f"사건 이력 DB를 열 수 없습니다:\n{exc}\n\n이력 없이 계속합니다.")
+            return
+        if HistoryStore.recovered_from:
+            aside = HistoryStore.recovered_from
+            HistoryStore.recovered_from = ""
+            QMessageBox.warning(
+                self, "사건 이력 복구",
+                "사건 이력 DB(history.db)가 손상돼 열 수 없어 옆에 옮겨 두고 빈 이력으로 시작했습니다.\n"
+                f"옮긴 파일: {aside}\n\n사건 폴더(cases\\)의 사본·산출물·case.json은 그대로 있습니다.")
+            self._refresh_home()
+
     def _on_history_item_opened(self, case_id: int) -> None:
-        with HistoryStore(self._history_db_path) as store:
-            case = store.get_case(case_id)
-            if case is None:
-                return
-            store.touch_last_opened(case_id)
-        result = reopen_case(case)
+        try:
+            with HistoryStore(self._history_db_path) as store:
+                case = store.get_case(case_id)
+                if case is None:
+                    return
+                try:
+                    store.touch_last_opened(case_id)
+                except Exception:  # noqa: BLE001 - 열람 시각 기록 실패(읽기 전용 DB)는 열기를 막지 않는다
+                    pass
+            result = reopen_case(case)
+        except Exception as exc:  # noqa: BLE001 - 손상된 CSV·DB 등. 조용히 홈에 남지 않게 알린다(리뷰 #68)
+            QMessageBox.critical(self, "사건 열기 실패", f"사건을 열지 못했습니다:\n{type(exc).__name__}: {exc}")
+            return
         self._current_case_id = case.id
         self._current_case_number = case.case_number
         self._current_examiner = case.examiner
@@ -665,16 +743,20 @@ class MainWindow(QMainWindow):
         fmt = self._ask_report_format()
         if not fmt:
             return
-        base = self._current_case_number or "case"
+        if self._report_exporter is not None:
+            QMessageBox.information(self, "Report", "이전 리포트를 아직 만드는 중입니다. 끝난 뒤 다시 시도하세요.")
+            return
+        base = self._report_basename()
         if fmt == "csv":
-            saved = self._save_location_csv(result, f"{base}_location.csv")
+            saved = self._save_location_csv(result, os.path.join(self._report_dir(), f"{base}_location.csv"))
             if saved:
                 QMessageBox.information(self, "Report", f"CSV를 저장했습니다:\n{saved}")
             return
-        default_name = f"{base}_report.pdf"
+        default_name = os.path.join(self._report_dir(), f"{base}_report.pdf")
         out_path, _ = QFileDialog.getSaveFileName(self, "리포트 저장", default_name, "PDF (*.pdf)")
         if not out_path:
             return
+        self._last_report_dir = os.path.dirname(out_path)
         csv_path = ""
         if fmt == "both":
             csv_path = self._save_location_csv(result, os.path.splitext(out_path)[0] + "_location.csv")
@@ -685,22 +767,50 @@ class MainWindow(QMainWindow):
             chart_png=chart_png, map_png=map_png,
         )
 
+        # 완료 콜백은 '그때의' 사건 id와 익스포터를 쓴다. 만드는 동안 사건을 바꾸면 경로가 다른 사건에
+        # 기록되던 문제(리뷰 #121). 만드는 동안 Report 버튼은 잠근다.
+        case_id_at_request = self._current_case_id
+        self._analysis_view.set_report_enabled(False)
+
         def on_done(success: bool, error_message: str) -> None:
             exporter, self._report_exporter = self._report_exporter, None
             if exporter is not None:
                 exporter.deleteLater()
+            self._analysis_view.set_report_enabled(True)
             if not success:
                 QMessageBox.critical(self, "Report", f"리포트 생성에 실패했습니다: {error_message}")
                 return
-            if self._current_case_id is not None:
+            if case_id_at_request is not None:
                 with HistoryStore(self._history_db_path) as store:
-                    store.set_report_path(self._current_case_id, out_path)
+                    store.set_report_path(case_id_at_request, out_path)
             QMessageBox.information(self, "Report", f"리포트를 저장했습니다:\n{out_path}"
                                     + (f"\n{csv_path}" if csv_path else ""))
 
         self._report_exporter = ReportExporter(html_str, out_path, on_done, parent=self)
 
+    def _report_basename(self) -> str:
+        """사건번호에서 파일 이름에 못 쓰는 문자를 걷어낸다."""
+        raw = self._current_case_number or "case"
+        safe = "".join(c if c.isalnum() or c in "-_ ." else "_" for c in raw).strip(" .") or "case"
+        return safe[:60]
+
+    def _report_dir(self) -> str:
+        """리포트 기본 저장 폴더: 마지막으로 저장한 곳 > 문서 폴더. 프로그램 폴더(cwd)는 쓰지 않는다 -
+        dist\\IDAS에 저장된 리포트가 재빌드 때 지워졌다(리뷰 #64)."""
+        last = getattr(self, "_last_report_dir", "")
+        if last and os.path.isdir(last):
+            return last
+        docs = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+        return docs or os.path.expanduser("~")
+
     def closeEvent(self, event):  # noqa: N802
+        # 실행 중인 QThread를 파괴하면 abort된다. 분석 워커는 취소하고 끝날 때까지 기다린다(복사·해시가
+        # 청크 단위로 취소를 확인하므로 곧 끝난다). 무결성 재해시 워커도 같다(리뷰 #15, #25).
+        if self._worker is not None:
+            self._worker.cancel()
+            if self._worker.isRunning():
+                self._worker.wait()
+        self._analysis_view.shutdown()
         AddressResolver.instance().stop()
         MapServer.shutdown_if_running()
         super().closeEvent(event)

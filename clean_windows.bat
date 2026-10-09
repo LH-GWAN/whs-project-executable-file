@@ -11,7 +11,18 @@ REM  come back by copying it in again by hand.
 REM ============================================================
 
 setlocal
-cd /d "%~dp0"
+REM "cd /d" fails silently on a UNC path and the delete loop below would then run in
+REM C:\Windows (review #128). Stop unless we are really in the project folder.
+pushd "%~dp0" || (
+    echo [ERROR] Cannot change to the script folder: %~dp0
+    pause
+    exit /b 1
+)
+if not exist "idas.spec" (
+    echo [ERROR] idas.spec not found in "%CD%". Refusing to delete anything here.
+    pause
+    exit /b 1
+)
 
 tasklist /FI "IMAGENAME eq IDAS.exe" 2>nul | find /I "IDAS.exe" >nul
 if not errorlevel 1 (
@@ -59,9 +70,14 @@ echo The map online/offline choice and notice preferences are stored in
 echo   %LOCALAPPDATA%\IDAS\settings.json  and  HKCU\Software\IDAS
 echo They are NOT deleted by this script. Reset them so the app asks again
 echo at the next start? Case history and evidence folders are kept either way.
+echo (Only the map choice is removed from settings.json; key overrides stay.)
 choice /c YN /d N /t 15 /m "Reset app settings (auto-no in 15s)"
 if not errorlevel 2 (
-    if exist "%LOCALAPPDATA%\IDAS\settings.json" del /q "%LOCALAPPDATA%\IDAS\settings.json"
+    REM Same as the app's own Reset: drop only map_mode. Deleting the whole file
+    REM also threw away re-issued key overrides (review #127).
+    if exist "%LOCALAPPDATA%\IDAS\settings.json" (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Join-Path $env:LOCALAPPDATA 'IDAS\settings.json'; try { $j = Get-Content -Raw -Encoding UTF8 $p | ConvertFrom-Json } catch { exit 0 }; if ($j -and $j.PSObject.Properties['map_mode']) { $j.PSObject.Properties.Remove('map_mode'); $j | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $p }"
+    )
     reg delete "HKCU\Software\IDAS" /f >nul 2>&1
     echo App settings reset. The app will ask online/offline at the next start.
 ) else (

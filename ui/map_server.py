@@ -28,6 +28,8 @@ _MIME = {
 }
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+# 서빙하는 파일 이름은 영문·숫자·._- 만. 'D:파일명' 같은 드라이브 상대 경로를 막는다(리뷰 #71).
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 
 OFFLINE_PAGE = "map.html"        # MapLibre + PMTiles
 ONLINE_PAGE = "map_kakao.html"   # 카카오맵 JavaScript SDK
@@ -49,12 +51,18 @@ class _Handler(BaseHTTPRequestHandler):
         name = url_path.lstrip("/").split("?", 1)[0]
         if not name:
             name = OFFLINE_PAGE
-        if "/" in name or "\\" in name or name.startswith("."):
+        if not _SAFE_NAME_RE.match(name) or name.startswith("."):
             return None
         if name == "basemap.pmtiles":
             return basemap_path()
         for base in (web_dir(), vendor_dir()):
             candidate = os.path.join(base, name)
+            # 이름을 걸렀어도 실제 경로가 서빙 폴더 안인지 한 번 더 확인한다.
+            try:
+                if os.path.commonpath([os.path.realpath(base), os.path.realpath(candidate)]) != os.path.realpath(base):
+                    continue
+            except ValueError:
+                continue
             if os.path.isfile(candidate):
                 return candidate
         return None
@@ -74,7 +82,16 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):  # noqa: N802
         self._serve(head_only=True)
 
+    def _is_own_request(self) -> bool:
+        """우리 지도 페이지(127.0.0.1:포트)에서 온 요청인가. 다른 Host로 들어온 요청에는 키·진단을
+        주지 않는다(리뷰 #72)."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host == f"127.0.0.1:{self.server.server_address[1]}"
+
     def do_GET(self):  # noqa: N802
+        if not self._is_own_request():
+            self.send_error(403)   # 우리 지도 페이지(127.0.0.1:포트)가 아닌 Host의 요청은 받지 않는다
+            return
         route = self.path.split("?", 1)[0]
         if route in ("/basemap-info", "/map-config"):
             payload = {
@@ -82,12 +99,20 @@ class _Handler(BaseHTTPRequestHandler):
                 "mode": get_map_mode() or MAP_MODE_OFFLINE,
                 "origin": self._origin(),
             }
-            payload.update(online_map_config())
+            # 키는 온라인 방식이 켜져 있고 키가 갖춰졌을 때, 우리 페이지에만 준다. 오프라인에서는
+            # 어떤 경로로도 키가 나가지 않는다(리뷰 #3, #72).
+            if is_online_map_ready() and self._is_own_request():
+                payload.update(online_map_config())
             self._send_json(payload)
             return
         if route == "/online-map-diagnose":
             # 지도 페이지에서 SDK 로드가 실패했을 때만 불린다. 브라우저는 실패 이유를
             # 숨기므로 여기서 같은 조건(Referer=우리 출처)으로 받아 보고 원인을 돌려준다.
+            # 오프라인이면 외부 요청을 내지 않는다.
+            if not (is_online_map_ready() and self._is_own_request()):
+                self._send_json({"status": 0, "kind": kakao_api.KIND_DISABLED, "errorType": "",
+                                 "message": "온라인 지도가 꺼져 있어 진단하지 않음"})
+                return
             self._send_json(kakao_api.probe_sdk(online_keys()["js"], self._origin()))
             return
         self._serve()
@@ -105,8 +130,10 @@ class _Handler(BaseHTTPRequestHandler):
         start, end = 0, size - 1
         partial = False
         if rng:
-            m = _RANGE_RE.search(rng)
-            if m:
+            # 단일 범위만 받고, 뒤집힌 범위(bytes=5-2)는 전체 응답(200)으로 처리한다 - 예전엔 206에 음수
+            # Content-Length가 나갔다(리뷰 #107).
+            m = _RANGE_RE.fullmatch(rng.strip())
+            if m and (m.group(1) or m.group(2)):
                 s, e = m.group(1), m.group(2)
                 if s:
                     start = int(s)
@@ -119,7 +146,10 @@ class _Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
                 end = min(end, size - 1)
-                partial = True
+                if end >= start:
+                    partial = True
+                else:
+                    start, end = 0, size - 1
 
         length = end - start + 1
         self.send_response(206 if partial else 200)
@@ -142,12 +172,20 @@ class _Handler(BaseHTTPRequestHandler):
                     break
                 try:
                     self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
+                except ConnectionError:   # Windows의 ConnectionAbortedError 포함(리뷰 #131)
                     return
                 remaining -= len(chunk)
 
 
 class _Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # 끊긴 연결의 트레이스백을 stderr에 쌓지 않는다(리뷰 #131).
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
     # 고정 포트를 쓰므로 주소 재사용(SO_REUSEADDR)을 끈다. 켜 두면 Windows에서 앱을
     # 두 번 띄웠을 때 둘 다 같은 포트에 묶여 요청이 엉뚱한 프로세스로 간다. 대신
     # 재시작 직후 이전 연결이 남아 bind가 거절되면 다음 후보 포트로 넘어간다.

@@ -52,3 +52,15 @@
    - `track_table.csv`의 `is_text_track` 의미 — fragmented 경로는 "이번에 처리한 Track만
      True"라서 나머지를 추가 실행해야 하고, sample table 경로는 "모든 text Track이 True"라
      추가 실행이 필요 없다. 이 규칙이 바뀌면 `engine_adapter._pending_track_ids`도 고칠 것.
+
+## 2026-10-09 코드 리뷰 반영 (whs-project와 동일 내용)
+
+- `integration_avi.py`: `write_avi_timeline(..., decode_summary=)`가 판정(text/record72)된 스트림만 쓰고
+  `gps_trusted` 열을 더한다. 센서는 가장 가까운 시각(1초 이내, `bisect`)으로 붙인다. OpenDML은
+  `first_riff_video_duration`으로 첫 RIFF 길이. `find_embedded_nmea_text`는 RMC 우선·checksum 우선.
+  `parse_finevu_record`는 길이 69~80·전부 0 거부. `resolve_targets`는 hdrl 없을 때 dc/db/wb/pc 청크 제외.
+  출력 폴더는 `unique_out_dir`(끝 공백·점 제거, 같은 stem은 `_2`). CSV는 `_GuardDictWriter`/`_GuardListWriter`
+  (수식 주입 방지).
+- `integration_mp4.py`: `decode_sample_text`가 길이 프리픽스 뒤 패딩·Box를 허용. route가 None이어도 `--slack`이면
+  `run_slack_carve`. 슬랙 카빙은 mmap(`_carve_one_region`/`_finish_slack_carve`). `unique_out_dir`, `_GuardDictWriter`.
+- 앱이 읽는 timeline 열: `gps_status`, `gps_elapsed_sec`, `gps_trusted`, `abs_time`가 추가됐다(engine_adapter.load_timeline).

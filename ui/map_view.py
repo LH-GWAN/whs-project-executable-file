@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from typing import List, Optional
 
-from PySide6.QtCore import QBuffer, QIODevice, QTimer, QUrl, Signal
+from PySide6.QtCore import QBuffer, QIODevice, Qt, QTimer, QUrl, Signal
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
-from core.driving_events import DISPLAY_ORDER, EVENT_KINDS, DrivingEvent
+from core.driving_events import DISPLAY_ORDER, EVENT_PRIORITY, DrivingEvent
 from engine.engine_adapter import TrackPoint
 from ui.map_server import ONLINE_PAGE, MapServer
 
@@ -16,6 +18,8 @@ _ONLINE_POLL_MS = 700
 _ONLINE_POLL_LIMIT_MS = 40000
 _BASELINE_POLL_MS = 500
 _BASELINE_IDLE_WAIT_LIMIT_MS = 8000   # 타일이 이만큼 안 와도 일단 찍는다
+_BASELINE_NO_LIMIT_MS = 30000         # 지도가 이만큼 준비되지 않으면 기준 그림을 포기한다(리뷰 #113)
+_RELOAD_RESET_SEC = 60.0              # 렌더러 크래시 뒤 이만큼 조용하면 재시도 횟수를 되돌린다(리뷰 #81)
 
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -55,11 +59,14 @@ def compute_headings(points: List[TrackPoint]) -> List[Optional[float]]:
 
 
 def _event_line_colors(points: List[TrackPoint], events: List[DrivingEvent]) -> List[Optional[str]]:
-    """행마다 지도 선 색. 여러 위험운전이 겹치면 EVENT_KINDS 앞쪽(급정지·급출발…)이 이긴다."""
-    rank = {k: n for n, k in enumerate(EVENT_KINDS)}
+    """행마다 '이 행으로 들어오는 선분'의 색. 선분(앞 행→이 행)이 이벤트 구간 안에 있을 때만 그 색이다 -
+    구간의 첫 행으로 들어오는 선분은 아직 이벤트가 아니다. 예전엔 행마다 색을 주고 양 끝이 같을 때만
+    칠해서 30→42→27의 급감속 선분이 초록, 기준 미달 선분이 빨강이 됐다(리뷰 #79). 겹치면
+    EVENT_PRIORITY(급정지·급출발·급가속·급감속) 앞쪽이 이긴다 - 표·그래프와 같은 순서다."""
+    rank = {k: n for n, k in enumerate(EVENT_PRIORITY)}
     best: List[Optional[DrivingEvent]] = [None] * len(points)
     for ev in events:
-        for i in range(max(0, ev.start_index), min(len(points), ev.end_index + 1)):
+        for i in range(max(1, ev.start_index + 1), min(len(points), ev.end_index + 1)):
             if best[i] is None or rank.get(ev.kind, 99) < rank.get(best[i].kind, 99):
                 best[i] = ev
     return [ev.color if ev is not None else None for ev in best]
@@ -94,6 +101,21 @@ def _event_legend(events: List[DrivingEvent]) -> List[List[str]]:
     return [[present[k].label, present[k].color] for k in DISPLAY_ORDER if k in present]
 
 
+class _MapPage(QWebEnginePage):
+    """지도 페이지는 우리 로컬 서버의 지도 페이지로만 이동할 수 있다. 뒤로 가기·드롭·링크로 다른
+    페이지(특히 온라인에서 오프라인으로 바꾼 뒤 기록에 남은 카카오 페이지)가 열리면 좌표가 외부로
+    나갈 수 있다(리뷰 #3). 외부 스크립트(SDK)는 하위 자원이라 이 검사에 걸리지 않는다."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.allowed_url = ""
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame) -> bool:  # noqa: N802
+        if not is_main_frame:
+            return True
+        return url.toString().split("?", 1)[0] == self.allowed_url
+
+
 class MapView(QWidget):
     MAX_RELOAD_ATTEMPTS = 3
 
@@ -106,10 +128,18 @@ class MapView(QWidget):
         self._loaded = False
         self._pending_js: List[str] = []
         self._reload_attempts = 0
+        self._last_crash_at = -1e9
         self._last_track_js: Optional[str] = None
         self._last_time_js: Optional[str] = None
 
         self._view = QWebEngineView(self)
+        self._page = _MapPage(self._view)
+        self._view.setPage(self._page)
+        self._view.setContextMenuPolicy(Qt.NoContextMenu)   # 우클릭 '뒤로'·'새로고침' 등 차단
+        try:
+            self._page.settings().setAttribute(QWebEngineSettings.NavigateOnDropEnabled, False)
+        except AttributeError:
+            pass
         self._view.loadFinished.connect(self._on_load_finished)
         self._view.page().renderProcessTerminated.connect(self._on_render_process_gone)
 
@@ -153,7 +183,9 @@ class MapView(QWidget):
         self._loaded = False
         self._load_started = True
         self._online_poll.stop()
-        self._view.load(QUrl(MapServer.instance().map_url()))
+        url = MapServer.instance().map_url()
+        self._page.allowed_url = url
+        self._view.load(QUrl(url))
 
     def is_online_page(self) -> bool:
         return self._view.url().path().endswith("/" + ONLINE_PAGE)
@@ -162,7 +194,14 @@ class MapView(QWidget):
         self._loaded = bool(ok)
         if not ok:
             return
-        self._reload_attempts = 0
+        # 지금 허용된 페이지가 아니면(기록·드롭 등으로 다른 페이지가 열렸으면) 궤적을 주지 않고 되돌린다.
+        if self._view.url().toString().split("?", 1)[0] != self._page.allowed_url:
+            self._loaded = False
+            QTimer.singleShot(0, self._load_page)
+            return
+        self._view.history().clear()   # 뒤로 가기로 이전(온라인) 페이지가 다시 열리지 않게
+        if time.monotonic() - self._last_crash_at > _RELOAD_RESET_SEC:
+            self._reload_attempts = 0   # 로드 성공만으로 되돌리면 궤적이 렌더러를 죽일 때 무한 반복했다(리뷰 #81)
         pending = self._pending_js
         self._pending_js = []
         if pending:
@@ -180,6 +219,8 @@ class MapView(QWidget):
         self._online_poll_elapsed += _ONLINE_POLL_MS
         if self._online_poll_elapsed > _ONLINE_POLL_LIMIT_MS:
             self._online_poll.stop()
+            # 준비도 실패도 안 오면(SDK 콜백 없음) 신호 없이 멈추던 것을 실패로 알린다(리뷰 #83).
+            self.online_map_failed.emit("network", "온라인 지도가 응답하지 않습니다(시간 초과)")
             return
         self._view.page().runJavaScript(
             "(window.__onlineMapState || '') + '|' + (window.__onlineMapError || '')",
@@ -197,7 +238,11 @@ class MapView(QWidget):
 
     def _on_render_process_gone(self, status, exit_code: int) -> None:
         self._loaded = False
+        self._last_crash_at = time.monotonic()
         if self._reload_attempts >= self.MAX_RELOAD_ATTEMPTS:
+            # 같은 궤적에서 계속 죽으면 그 궤적은 다시 넣지 않는다(리뷰 #81).
+            self._last_track_js = None
+            self._pending_js = []
             return
         self._reload_attempts += 1
         QTimer.singleShot(600, self._load_page)
@@ -209,7 +254,10 @@ class MapView(QWidget):
             self._pending_js = [s for s in (self._last_track_js, self._last_time_js) if s]
 
     def set_track(self, points: List[TrackPoint],
-                   events: Optional[List[DrivingEvent]] = None) -> None:
+                   events: Optional[List[DrivingEvent]] = None, baseline: bool = True) -> None:
+        """baseline=False면 리포트용 기준 그림을 건드리지 않는다(Location에서 영상별·슬랙 묶음을
+        볼 때). 기준 그림은 사건의 본(Composed) 궤적에서만 찍는다 - 예전엔 묶음을 바꿀 때마다 다시
+        찍어서 마지막에 본 슬랙 궤적이 '전체 경로'로 리포트에 실렸다(리뷰 #13)."""
         self._pending_js = []
         headings = compute_headings(points)
         events = events or []
@@ -224,8 +272,11 @@ class MapView(QWidget):
                     "v": p.speed_kmh,
                     "d": 1 if p.is_dropout else 0,
                     "o": 1 if p.is_outlier else 0,
+                    # 검증 실패(checksum·불신)로 뺀 좌표. 수신 없음과 구분해 안내한다(리뷰 #111).
+                    "u": 1 if (p.has_coords and not p.is_outlier
+                               and (p.gps_checksum_ok is False or p.gps_trusted is False)) else 0,
                     "h": headings[i],
-                    # 위험운전 구간이면 그 종류의 선 색. 선분 양 끝이 같은 색일 때만 칠한다.
+                    # 이 행으로 들어오는 선분이 위험운전 구간이면 그 종류의 선 색.
                     "e": line_colors[i],
                     # 이어보기의 영상 번호. 영상이 바뀌는 곳은 선을 잇지 않는다.
                     "s": p.segment_index,
@@ -239,10 +290,16 @@ class MapView(QWidget):
         self._last_track_js = f"renderTrack({json.dumps(payload, ensure_ascii=False)});"
         self._last_time_js = None
         self._run_js(self._last_track_js)
-        self._baseline_png = None
+        # 지금 그려진 궤적이 바뀌었으니 진행 중이던 캡처는 무효다. 기준 그림은 본 궤적일 때만 새로 찍고,
+        # 좌표가 하나도 없으면 찍지 않는다(빈 지도나 이전 사건 지역이 '전체 경로'로 실리던 리뷰 #14).
         self._baseline_track_id += 1
+        self._baseline_poll.stop()
+        if not baseline:
+            return
+        self._baseline_png = None
         self._baseline_waited_ms = 0
-        self._baseline_poll.start()
+        if any(p.has_fix for p in points):
+            self._baseline_poll.start()
 
     def baseline_png(self) -> Optional[bytes]:
         """분석 직후(전체 경로가 화면에 맞춰진 상태)의 지도 그림. 아직 못 찍었으면 None."""
@@ -255,6 +312,9 @@ class MapView(QWidget):
         if not self._loaded or not self._view.isVisible():
             return  # 탭이 보일 때까지 기다린다(안 보이는 웹뷰는 빈 그림이 찍힌다)
         self._baseline_waited_ms += _BASELINE_POLL_MS
+        if self._baseline_waited_ms >= _BASELINE_NO_LIMIT_MS:
+            self._baseline_poll.stop()   # 지도가 끝내 준비되지 않으면(온라인 실패 등) 멈춘다(리뷰 #113)
+            return
         self._view.page().runJavaScript(
             "(window.__mapReady && window.__trackDrawn) ? (window.__trackIdle ? 'idle' : 'wait') : 'no'",
             0, self._on_baseline_state)
