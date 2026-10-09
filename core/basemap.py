@@ -61,9 +61,22 @@ def extract_zipped_basemap() -> Optional[str]:
                     continue
                 member = max(members, key=lambda m: zf.getinfo(m).file_size)
                 target = os.path.join(base, os.path.basename(member))
-                with zf.open(member) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst, 1024 * 1024)
+                # '.part'에 풀고 크기를 확인한 뒤 제자리로 옮긴다 - 중단·CRC 오류로 잘린 지도가 최종 이름으로
+                # 남으면 다음부터 다시 풀지 않고 계속 쓰였다(리뷰 #73).
+                part = target + ".part"
+                try:
+                    with zf.open(member) as src, open(part, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+                    if os.path.getsize(part) != zf.getinfo(member).file_size:
+                        raise OSError("압축 해제 결과 크기가 선언과 다름")
+                    os.replace(part, target)
+                finally:
+                    if os.path.exists(part):
+                        try:
+                            os.remove(part)
+                        except OSError:
+                            pass
                 return target
-        except (zipfile.BadZipFile, OSError, PermissionError):
+        except Exception:  # noqa: BLE001 - 암호 걸린 zip(RuntimeError)·미지원 압축(NotImplementedError)도 건너뛴다(리뷰 #74)
             continue
     return None

@@ -170,7 +170,7 @@ def dataset_views(result: PipelineResult, slacks: Optional[List[SlackSet]] = Non
                                segment_labels=labels)
         views = [composed] + [DatasetView(seg.label, seg.points, seg.driving_events) for seg in segs]
     for slack in slacks or []:
-        views.append(DatasetView(slack.label, slack.points, []))
+        views.append(DatasetView(slack.label, slack.points, [], map_points=slack.map_points, is_slack=True))
     return views
 
 
@@ -192,6 +192,7 @@ class AnalysisView(QWidget):
         report_btn = QPushButton("Report")
         report_btn.setProperty("role", "primary")
         report_btn.clicked.connect(self._on_report_clicked)
+        self._report_btn = report_btn
         home_btn = QPushButton("Home")
         home_btn.setProperty("role", "primary")
         home_btn.clicked.connect(self.home_requested.emit)
@@ -254,6 +255,7 @@ class AnalysisView(QWidget):
         self._speed_tab.view_changed.connect(lambda _i: self._refresh_header())
         self._location_tab.view_changed.connect(lambda _i: self._refresh_header())
         self._file_views: List[Dict] = []
+        self._settings: Dict = {}
         self._integrity_results: Dict[str, Tuple[str, str]] = {}
         self._integrity_queue: List[Tuple[str, str]] = []
 
@@ -281,6 +283,7 @@ class AnalysisView(QWidget):
     def load_result(self, result: PipelineResult, case_number: str, settings: dict) -> None:
         self._tracker_tab.release_media()
         self._result = result
+        self._settings = dict(settings)
         self._case_label.setText(f"Case Number : {case_number}")
         extraction = result.extraction
         prefix = f"이어보기 {len(result.segments)}개 영상 · " if result.is_sequence else ""
@@ -290,6 +293,10 @@ class AnalysisView(QWidget):
         self._analysis_status.setText(
             f"{prefix}분석 상태: {extraction.status} · 경고 {len(extraction.warnings)}건{repair} · "
             f"슬랙 GPS {len(extraction.slack_points)}건")
+        if result.artifacts_verified is False:
+            self._analysis_status.setText(self._analysis_status.text() + " · ⚠ 엔진 산출물이 분석 때와 다릅니다(manifest 불일치)")
+        elif result.artifacts_verified is True:
+            self._analysis_status.setText(self._analysis_status.text() + " · 산출물 manifest 일치")
         self._analysis_status.setToolTip(extraction.status_message + "\n" + "\n".join(extraction.warnings))
 
         self._file_views = self._build_file_views(result)
@@ -310,7 +317,7 @@ class AnalysisView(QWidget):
                                  label=seg.label, primary_is_rear=seg.primary_is_rear)
                     for seg in result.segments])
             else:
-                video_path = result.source_copy_path or result.extraction.used_input_path
+                video_path = result.source_copy_path
                 self._tracker_tab.set_duration_hint(result.duration_sec)
                 if video_path and os.path.isfile(video_path):
                     rear = result.rear_copy_path if result.rear_copy_path and os.path.isfile(result.rear_copy_path) else ""
@@ -319,16 +326,23 @@ class AnalysisView(QWidget):
                     self._tracker_tab._on_media_error("사건 영상 파일이 없습니다. 사본 경로를 확인하세요.")
             self._tracker_tab.load_track(result.extraction.points, result.driving_events)
         else:
+            # 탭을 끈 사건: 이전 사건의 궤적·기준 그림이 남지 않게 비운다(리뷰 #1 - 끈 탭의 그림이
+            # 다음 사건 리포트에 들어갔다).
             self._tracker_tab.stop()
+            self._tracker_tab.load_track([], [])
         slacks = slack_sets(result)   # 슬랙을 뽑지 않았거나 GPS가 없으면 빈 목록
         self._rebuild_slack_tabs(slacks)
         views = dataset_views(result, slacks)
         if settings.get("speed", True):
             self._tabs.addTab(self._speed_tab, "Speed Analysis")
             self._speed_tab.load_views(views, result.vehicle_type)
+        else:
+            self._speed_tab.load_views([], result.vehicle_type)
         if settings.get("location", True):
             self._tabs.addTab(self._location_tab, "Location Analysis")
             self._location_tab.load_views(views)
+        else:
+            self._location_tab.load_views([])
 
         for tab in self._slack_tabs:
             self._tabs.addTab(tab, f"Slack · {tab.slack.source_label}" if tab.slack.source_label else "Slack")
@@ -368,7 +382,7 @@ class AnalysisView(QWidget):
             return sum(os.path.getsize(p) for p in paths if p and os.path.isfile(p))
 
         if not result.is_sequence:
-            video_path = result.source_copy_path or result.extraction.used_input_path
+            video_path = result.source_copy_path
             filename = os.path.basename(video_path) if video_path else "-"
             tag = view_tag(result.track_mode, bool(result.rear_copy_path))
             files = [("전방" if result.rear_copy_path else "", video_path, result.sha256)]
@@ -403,12 +417,13 @@ class AnalysisView(QWidget):
                 "files": [(label.split(" ", 1)[1] if len(files) > 1 else "", p, sha)
                           for label, p, sha in files],
                 "summary": False})
-        any_rear = any(seg.rear_copy_path or seg.track_mode for seg in segs)
+        # 구간마다 보기 방식이 다를 수 있다(전방만·후방만·같이). History와 같은 view_tag를 쓴다(리뷰 #138).
+        tags = sorted({view_tag(seg.track_mode, bool(seg.rear_copy_path)) for seg in segs} - {""})
         first = os.path.basename(segs[0].primary_copy_path)
         last = os.path.basename(segs[-1].primary_copy_path)
         views.append({
             "badge": container,
-            "name": f"{first} ~ {last} · 이어보기 {len(segs)}개" + (" - F, B" if any_rear else ""),
+            "name": f"{first} ~ {last} · 이어보기 {len(segs)}개" + (f" - {' / '.join(tags)}" if tags else ""),
             "tip": "\n".join(f"{v['name']}" for v in per_segment),
             "size": _format_size(size_of(*[p for _l, p, _s in all_files])),
             "duration": _format_duration(result.duration_sec),
@@ -462,8 +477,22 @@ class AnalysisView(QWidget):
         return "none", detail
 
     def release_media(self) -> None:
-        """보고 있던 사건이 삭제될 때 영상 파일 잠금을 푼다."""
+        """보고 있던 사건이 삭제될 때 영상 파일 잠금을 푼다. 무결성 재해시가 사본을 열어 두고 있으면
+        Windows에서는 폴더 삭제가 실패하므로 그 워커도 멈춘다(리뷰 #26)."""
         self._tracker_tab.release_media()
+        self.shutdown()
+
+    def shutdown(self) -> None:
+        """무결성 재해시 워커를 멈추고 끝날 때까지 기다린다. 창을 닫을 때·사건을 지울 때 부른다 -
+        실행 중인 QThread가 파괴되면 abort된다(리뷰 #25)."""
+        self._integrity_queue = []
+        worker = self._integrity_worker
+        if worker is not None:
+            self._integrity_worker = None
+            worker.cancel()
+            if worker.isRunning():
+                worker.wait()
+            worker.deleteLater()
 
     def reload_maps(self) -> None:
         """지도 사용 방식(오프라인/온라인)이 바뀐 뒤 이미 떠 있는 지도를 새 방식으로 다시 띄운다."""
@@ -491,9 +520,7 @@ class AnalysisView(QWidget):
 
     def _start_integrity_checks(self, files) -> None:
         """사본을 하나씩 다시 읽어 분석 때 기록한 원본 해시와 비교한다(전방·후방·이어보기 영상 모두)."""
-        if self._integrity_worker is not None:
-            self._integrity_worker.cancel()
-            self._integrity_worker = None
+        self.shutdown()   # 이전 사건의 재해시가 돌고 있으면 끝내고 치운다
         self._integrity_results: Dict[str, Tuple[str, str]] = {}
         queue = []
         for _label, path, expected in files:
@@ -547,23 +574,36 @@ class AnalysisView(QWidget):
         지도는 분석 직후 전체 경로에 맞춰 찍어 둔 기준 그림(baseline)을 쓴다. 기준 그림이
         아직 없으면(지도 탭을 한 번도 안 열었거나 타일이 늦게 온 경우) 현재 화면을 잡는다.
         """
+        settings = getattr(self, "_settings", {})
         chart = None
-        try:
-            chart = self._speed_tab.grab_chart_png()
-        except Exception:
-            chart = None
+        if settings.get("speed", True):
+            try:
+                chart = self._speed_tab.grab_chart_png()
+            except Exception:
+                chart = None
 
-        # 분석 직후 전체 경로에 맞춰진 기준 지도를 우선 쓴다. 사용자가 확대·축소한 현재
-        # 화면은 기준 그림이 없을 때만 대신 쓴다.
+        # 좌표가 없는 사건은 지도 절을 넣지 않는다(기본 화면이나 이전 사건 지역이 찍힌다 - 리뷰 #14).
+        if self._result is None or self._result.extraction.fix_count == 0:
+            return chart, None
+        # 분석 직후 전체 경로에 맞춰진 기준 지도를 우선 쓴다. 켜진 탭의 지도만 본다(끈 탭에는 그림이
+        # 없다). 사용자가 확대·축소한 현재 화면은 기준 그림이 없을 때만 대신 쓰되, Location이 영상별·슬랙
+        # 묶음을 보여 주고 있으면 본 궤적이 아니라서 쓰지 않는다(리뷰 #1, #13).
+        tabs = []
+        if settings.get("tracker", True):
+            tabs.append(self._tracker_tab)
+        if settings.get("location", True):
+            tabs.append(self._location_tab)
         map_png = None
-        for tab in (self._tracker_tab, self._location_tab):
+        for tab in tabs:
             try:
                 map_png = tab.map_view().baseline_png()
             except Exception:
                 map_png = None
             if map_png:
                 return chart, map_png
-        for tab in (self._location_tab, self._tracker_tab):
+        for tab in tabs:
+            if tab is self._location_tab and self._location_tab.current_view() != 0:
+                continue
             try:
                 map_png = tab.grab_map_png()
             except Exception:
@@ -571,6 +611,9 @@ class AnalysisView(QWidget):
             if map_png:
                 break
         return chart, map_png
+
+    def set_report_enabled(self, enabled: bool) -> None:
+        self._report_btn.setEnabled(enabled)
 
     def _on_report_clicked(self) -> None:
         if self._result is not None:

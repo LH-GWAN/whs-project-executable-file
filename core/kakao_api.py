@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.parse
+import http.client
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
@@ -57,7 +58,7 @@ def _request(url: str, headers: Dict[str, str], timeout: float) -> HttpResult:
         except Exception:  # noqa: BLE001
             body = b""
         return HttpResult(e.code, body)
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:   # IncompleteRead 등(리뷰 #106)
         reason = getattr(e, "reason", None)
         return HttpResult(0, b"", str(reason if reason is not None else e))
 

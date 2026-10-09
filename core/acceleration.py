@@ -16,6 +16,9 @@ MAX_GAP_SEC = 5.0
 RATE_WINDOW_SEC = 1.0
 # 기기 시계가 1초보다 조금 짧게 도는 경우(0.986초 간격 등)도 1초 창으로 본다.
 RATE_WINDOW_TOLERANCE_SEC = 0.15
+# 판정에 쓰는 창의 상한. 기준은 '초당' 변화라 1초 안팎의 창만 판정한다 - 5초 창의 평균(47→5)을 초당
+# 값으로 보면 1초 자료에는 없는 급정지가 생겼다(리뷰 #44). 더 긴 간격은 말풍선에 간격을 적어 보인다.
+EVENT_MAX_WINDOW_SEC = 1.5
 
 
 def _time_of(point: TrackPoint) -> Optional[float]:
@@ -23,10 +26,7 @@ def _time_of(point: TrackPoint) -> Optional[float]:
 
 
 def _fix_key(point: TrackPoint):
-    utc = (point.gps_utc_time or "").strip()
-    if utc:
-        return ("utc", point.gps_date or "", utc)
-    return ("val", point.latitude, point.longitude, point.speed_kmh)
+    return point.record_key()
 
 
 def _distinct_fix_indices(points: List[TrackPoint]) -> List[int]:
@@ -62,6 +62,8 @@ def speed_rate_pairs(points: List[TrackPoint],
         if dt < min_window or dt > max_gap_sec:
             continue  # 시간이 거꾸로 가거나 너무 멀다
         prev_i, cur_i = usable[j], usable[k]
+        if points[prev_i].segment_index != points[cur_i].segment_index:
+            continue  # 이어보기 영상 경계는 잇지 않는다(가상의 간격, 리뷰 #45)
         out.append((prev_i, cur_i, dt, (points[cur_i].speed_kmh - points[prev_i].speed_kmh) / dt))
     return out
 

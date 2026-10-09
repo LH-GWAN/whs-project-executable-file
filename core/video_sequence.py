@@ -118,7 +118,8 @@ def _gps_start(points) -> Optional[_dt.datetime]:
     offsets = []
     seen = set()
     for p in points:
-        if not p.has_gps_record or p.start_time_sec is None:
+        # 측위 전(V) 기록이나 체크섬이 깨진 문장의 시각(1980년 등)은 근거로 쓰지 않는다(리뷰 #37).
+        if not p.has_fix or p.start_time_sec is None or p.gps_checksum_ok is False:
             continue
         d, t = gpstime.parse_date(p.gps_date), gpstime.parse_time(p.gps_utc_time)
         if d is None or t is None or (d, t) in seen:
@@ -162,6 +163,9 @@ def probe_clip(path: str, workdir: str, cancel_event: Optional[threading.Event] 
         probe.duration = _duration.get_duration_sec(path, routing.container)
         out_dir = tempfile.mkdtemp(prefix="clip-", dir=workdir)
         result = _ea.run_full_extraction(path, out_dir, cancel_event=cancel_event)
+        if result.status not in ("ok", "no_gps"):
+            probe.error = result.status_message   # 엔진 실패를 'GPS 없음'으로 안내하지 않는다(리뷰 #100)
+            return probe
         outliers.mark_outliers(result.points)
         probe.points = result.points
         if probe.duration is None:

@@ -5,6 +5,17 @@ import sys
 
 
 def _ensure_std_streams() -> None:
+    if sys.platform == "win32" and "--diagnose" in sys.argv and getattr(sys, "stdout", None) is None:
+        # console=False exe를 cmd에서 --diagnose로 띄우면 출력이 메모리 버퍼로 사라졌다(리뷰 #42).
+        # 부모 콘솔에 붙어 그쪽으로 쓴다.
+        try:
+            import ctypes
+            if ctypes.windll.kernel32.AttachConsole(-1):
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+                sys.stderr = sys.stdout
+                sys.stdout.write("\n")
+        except Exception:  # noqa: BLE001
+            pass
     for name in ("stdout", "stderr"):
         if getattr(sys, name, None) is None:
             setattr(sys, name, io.TextIOWrapper(

@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QVBoxLayout,
@@ -66,11 +67,15 @@ class MapModeDialog(QDialog):
 
         ok = QPushButton("확인")
         ok.setProperty("role", "primary")
-        ok.clicked.connect(self.accept)
+        ok.clicked.connect(self._on_ok)
+        cancel = QPushButton("취소")
+        cancel.clicked.connect(self.reject)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
+        buttons.addWidget(cancel)
         buttons.addWidget(ok)
+        self._current = current
 
         layout = QVBoxLayout(self)
         layout.addWidget(title)
@@ -86,10 +91,25 @@ class MapModeDialog(QDialog):
     def selected_mode(self) -> str:
         return MAP_MODE_ONLINE if self._online.isChecked() else MAP_MODE_OFFLINE
 
+    def _on_ok(self) -> None:
+        # 온라인으로 바꾸는 건 외부 전송을 켜는 결정이라 한 번 더 묻는다.
+        if self.selected_mode() == MAP_MODE_ONLINE and self._current != MAP_MODE_ONLINE:
+            answer = QMessageBox.question(
+                self, "온라인 지도", "온라인 지도를 켜면 사건의 GPS 좌표가 지도·주소 조회를 위해\n"
+                "카카오 서버로 전송됩니다. 계속할까요?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        self.accept()
+
 
 def ask_map_mode(parent=None, current: str | None = None) -> str:
+    """고른 방식을 저장하고 돌려준다. 확인을 눌렀을 때만 저장한다 - Esc·X로 닫으면 누른 라디오
+    값을 버린다(예전엔 그대로 저장돼 온라인이 켜졌다, 리뷰 #21). 취소하면 기존 값(처음 실행이면
+    오프라인, 저장하지 않음)을 돌려준다."""
     dialog = MapModeDialog(parent, current)
-    dialog.exec()
+    if dialog.exec() != QDialog.Accepted:
+        return current or MAP_MODE_OFFLINE
     mode = dialog.selected_mode()
     set_map_mode(mode)
     return mode

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import os
+import tempfile
 from core.acceleration import _distinct_fix_indices
 from typing import List, Optional
 
@@ -96,7 +97,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
             + "</tr>"
         )
 
-    body_rows = "".join(rows_html) if rows_html else '<tr><td colspan="{8 if sequence else 7}">추출된 좌표가 없습니다.</td></tr>'
+    body_rows = "".join(rows_html) if rows_html else f'<tr><td colspan="{8 if sequence else 7}">추출된 좌표가 없습니다.</td></tr>'
     extraction = pipeline_result.extraction
     routing = extraction.routing
     video_filename = os.path.basename(pipeline_result.source_copy_path or "")
@@ -116,7 +117,11 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     )
     outlier_count = extraction.outlier_count
     warning_html = "".join(f"<li>{_esc(w)}</li>" for w in extraction.warnings)
-    failed_checks = sum(p.gps_checksum_ok is False or p.gps_trusted is False for p in records)
+    failed_checks = sum((p.gps_checksum_ok is False or p.gps_trusted is False) and not (p.is_dropout and not p.has_coords)
+                        for p in records)
+    # 미기록은 GPS 기록이 전혀 없는 행만 직접 센다. 예전엔 전체-수신-끊김으로 계산해 이상치·검증 실패가
+    # 미기록에 섞여 이중으로 집계됐다(리뷰 #89).
+    unrecorded_count = sum(1 for p in records if not p.has_gps_record and not p.has_coords)
     ok_checks = sum(p.gps_checksum_ok is True and p.gps_trusted is not False for p in records)
     unknown_checks = len(records) - failed_checks - ok_checks
     speeds = [records[i].speed_kmh for i in _distinct_fix_indices(records)]
@@ -149,11 +154,26 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
                 f'\n  <div class="kv"><b>후방 SHA-256</b>{_esc(pipeline_result.rear_sha256 or "-")}</div>')
     vehicle_type = pipeline_result.vehicle_type
     criteria_html = "".join(f"<li>{_esc(line)}</li>" for line in criteria_lines(vehicle_type)[1:])
+    seg_starts = []
+    base = 0
+    for seg in pipeline_result.segments:
+        seg_starts.append((base, seg))
+        base += len(seg.points)
+
+    def _event_where(ev) -> str:
+        """이어보기면 '영상 N (영상 기준 시각)'까지 적는다(리뷰 #90)."""
+        if not sequence:
+            return ""
+        seg = next((s for b, s in reversed(seg_starts) if ev.start_index >= b), None)
+        if seg is None:
+            return "<td>-</td>"
+        return (f"<td>{_esc(seg.label)} "
+                f"{_esc(f'{ev.start_time_sec - seg.offset_sec:.1f} ~ {ev.end_time_sec - seg.offset_sec:.1f}')}</td>")
     event_rows = "".join(
         f'<tr style="background: {ev.color}33"><td>{_esc(ev.label)}</td>'
-        f"<td>{_esc(f'{ev.start_time_sec:.1f} ~ {ev.end_time_sec:.1f}')}</td>"
+        f"<td>{_esc(f'{ev.start_time_sec:.1f} ~ {ev.end_time_sec:.1f}')}</td>{_event_where(ev)}"
         f"<td>{_esc(ev.detail)}</td></tr>" for ev in events
-    ) or '<tr><td colspan="3">해당 기준에 걸린 위험운전 행동이 없습니다.</td></tr>'
+    ) or f'<tr><td colspan="{4 if sequence else 3}">해당 기준에 걸린 위험운전 행동이 없습니다.</td></tr>'
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -174,6 +194,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   th {{ background: #f2f2f2; }}
   table.files {{ margin: 4px 0 6px; }}
   table.files td {{ word-break: break-all; }}
+  .memo {{ white-space: pre-wrap; display: inline-block; max-width: calc(100% - 130px); vertical-align: top; }}
   ul.criteria {{ font-size: 11px; color: #333; margin: 4px 0 6px; padding-left: 18px; }}
   tr.outlier td {{ color: #b36b00; }}
   tr.gap td {{ text-align: center; color: #999; border: none; }}
@@ -186,18 +207,20 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <h2>기본 정보</h2>
   <div class="kv"><b>사건번호</b>{_esc(case_number)}</div>
   <div class="kv"><b>담당자</b>{_esc(examiner)}</div>
-  <div class="kv"><b>메모</b>{_esc(memo)}</div>
+  <div class="kv"><b>메모</b><span class="memo">{_esc(memo)}</span></div>
   {files_html}
   <div class="kv"><b>재생시간</b>{_esc(_fmt_duration(pipeline_result.duration_sec))}</div>
   <div class="kv"><b>탐지 컨테이너</b>{_esc(routing.container.upper())}</div>
   <div class="kv"><b>시간축 근거</b>{_esc(extraction.time_source or "-")}</div>
   <div class="kv"><b>추출 지점</b>{_esc(len(records))}개 (GPS 수신 {_esc(fix_count)}개 /
-      수신 끊김 {_esc(dropout_count)}개 / GPS 미기록 {_esc(len(records) - fix_count - dropout_count)}개)</div>
+      수신 끊김 {_esc(dropout_count)}개 / GPS 미기록 {_esc(unrecorded_count)}개 / 이상치 {_esc(outlier_count)}개 /
+      검증 실패 {_esc(failed_checks)}개)</div>
   <div class="kv"><b>차종 기준</b>{_esc(vehicle_label(vehicle_type))} (국토교통부 DTG 위험운전행동 판별 기준, 2022)</div>
   <div class="kv"><b>위험운전 행동</b>{_esc(len(events))}건 ({_esc(summarize_counts(events))})</div>
   <div class="kv"><b>이상치 제외</b>{_esc(outlier_count)}개 지점 (좌표 급변·비정상 속도, 원본 CSV에는 보존)</div>
 
   <div class="kv"><b>분석 상태</b>{_esc(extraction.status)} — {_esc(extraction.status_detail)}</div>
+  <div class="kv"><b>산출물 검증</b>{_esc({True: "엔진 산출물 manifest 일치", False: "불일치 - 산출물이 분석 때와 다름(변조·손상 의심)", None: "manifest 없음(새 분석 직후 또는 옛 사건)"}[pipeline_result.artifacts_verified])}</div>
   {avi_repair_html}
   <div class="kv"><b>GPS 검증(행)</b>정상 {ok_checks} / 실패 {failed_checks} / 미제공 {unknown_checks}</div>
   <p>검증 실패·이상치·비유한 수치는 지도·속도 계산에서 제외합니다. 미제공은 검증 성공을 뜻하지 않습니다.</p>
@@ -208,9 +231,10 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <h2>분석 경고 ({len(extraction.warnings)}건)</h2><ul>{warning_html}</ul>
   <h2>위험운전 행동 ({_esc(vehicle_label(vehicle_type))} 기준, {len(events)}건)</h2>
   <ul class="criteria">{criteria_html}</ul>
-  <p>과속·장기과속(도로 제한속도 필요)과 급앞지르기는 판정하지 않습니다. 승용차는 택시 기준을 적용합니다.</p>
+  <p>속도 변화로 정해지는 네 유형(급가속·급출발·급감속·급정지)만 판정합니다. 방향 계열(급진로변경·급앞지르기·급좌우회전·급U턴)과
+  과속·장기과속(도로 제한속도 필요)은 판정하지 않습니다. 승용차는 택시 기준을 적용합니다.</p>
   <table>
-    <thead><tr><th>종류</th><th>영상 시각(초)</th><th>판정 근거</th></tr></thead>
+    <thead><tr><th>종류</th><th>{"누적 시각(초)" if sequence else "영상 시각(초)"}</th>{"<th>영상 (영상 기준 초)</th>" if sequence else ""}<th>판정 근거</th></tr></thead>
     <tbody>{event_rows}</tbody>
   </table>
   {visuals_html}
@@ -233,7 +257,24 @@ class ReportExporter(QObject):
         self._view = QWebEngineView()
         self._view.loadFinished.connect(self._on_load_finished)
         self._view.page().pdfPrintingFinished.connect(self._on_pdf_finished)
-        self._view.setHtml(html_str, QUrl("about:blank"))
+        # setHtml은 data: URL 2MiB 한도가 있어 고해상도 지도 PNG가 든 리포트는 로드가 실패했다
+        # (리뷰 #22). 임시 파일에 써서 file:// 로 연다. 파일은 PDF가 끝나면 지운다.
+        self._tmp_path = ""
+        try:
+            fd, self._tmp_path = tempfile.mkstemp(prefix="idas-report-", suffix=".html")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(html_str)
+            self._view.load(QUrl.fromLocalFile(self._tmp_path))
+        except OSError:
+            self._view.setHtml(html_str, QUrl("about:blank"))
+
+    def _cleanup(self) -> None:
+        if self._tmp_path:
+            try:
+                os.remove(self._tmp_path)
+            except OSError:
+                pass
+            self._tmp_path = ""
 
     # A4에 글 쓸 때처럼 양쪽에 여백을 둔다. printToPdf의 기본 레이아웃은 여백 0이다.
     PAGE_LAYOUT = QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait,
@@ -241,9 +282,11 @@ class ReportExporter(QObject):
 
     def _on_load_finished(self, ok: bool) -> None:
         if not ok:
+            self._cleanup()
             self._on_done(False, "리포트 HTML 로드 실패")
             return
         self._view.page().printToPdf(self._out_path, self.PAGE_LAYOUT)
 
     def _on_pdf_finished(self, file_path: str, success: bool) -> None:
+        self._cleanup()
         self._on_done(success, "" if success else "PDF 저장 실패")

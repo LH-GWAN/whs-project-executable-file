@@ -56,7 +56,7 @@ class SlackTab(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(splitter)
-        self._map.set_track(slack.points, [])
+        self._map.set_track(slack.map_points, [])
 
     def map_view(self) -> MapView:
         return self._map

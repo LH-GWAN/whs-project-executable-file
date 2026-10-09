@@ -54,29 +54,58 @@ def _config_path() -> str:
     return os.path.join(_app_data_dir(), _CONFIG_FILENAME)
 
 
-def load_config() -> Dict[str, Any]:
-    global _config_cache
-    if _config_cache is None:
+def _decode_text(raw: bytes) -> str:
+    """BOM으로 인코딩을 가린다. PowerShell이 만든 UTF-16 파일도 읽는다(리뷰 #75, #136)."""
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16")
+    return raw.decode("utf-8-sig")
+
+
+def _read_config_file() -> Dict[str, Any]:
+    path = _config_path()
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {}
+    try:
+        data = json.loads(_decode_text(raw))
+    except (UnicodeDecodeError, UnicodeError, json.JSONDecodeError):
+        # 읽을 수 없는 설정 파일은 덮어쓰지 않도록 옆에 보관한다(키 덮어쓰기까지 잃지 않게).
         try:
-            with open(_config_path(), encoding="utf-8") as f:
-                data = json.load(f)
-            _config_cache = data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            _config_cache = {}
+            os.replace(path, path + ".bad")
+        except OSError:
+            pass
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_config(force: bool = False) -> Dict[str, Any]:
+    global _config_cache
+    if _config_cache is None or force:
+        _config_cache = _read_config_file()
     return dict(_config_cache)
 
 
-def save_config(data: Dict[str, Any]) -> None:
+def save_config(data: Dict[str, Any]) -> bool:
+    """settings.json에 쓴다. 실패하면 False - 호출 쪽이 알리고 다음 실행에서 다시 묻는다(리뷰 #70).
+    쓰기 전에 파일을 다시 읽어 합친다 - 실행 중 직접 고친 값이 메모리 캐시에 덮이지 않게(리뷰 #108)."""
     global _config_cache, _keys_cache
     path = _config_path()
+    merged = _read_config_file()
+    merged.update(data)
+    ok = True
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
     except OSError:
-        pass
-    _config_cache = dict(data)
+        ok = False
+    _config_cache = dict(merged)
     _keys_cache = None
+    return ok
 
 
 def get_map_mode() -> Optional[str]:
@@ -85,12 +114,11 @@ def get_map_mode() -> Optional[str]:
     return mode if mode in (MAP_MODE_OFFLINE, MAP_MODE_ONLINE) else None
 
 
-def set_map_mode(mode: str) -> None:
+def set_map_mode(mode: str) -> bool:
+    """저장 성공 여부를 돌려준다."""
     if mode not in (MAP_MODE_OFFLINE, MAP_MODE_ONLINE):
-        return
-    data = load_config()
-    data["map_mode"] = mode
-    save_config(data)
+        return False
+    return save_config({"map_mode": mode})
 
 
 def reset_map_mode() -> None:
@@ -169,7 +197,8 @@ def _keys_from_text(text: str) -> tuple:
     if not js:
         if js_raw in (None, ""):
             return js, rest, "kakao_js_key 값이 비어 있습니다"
-        return js, rest, f"kakao_js_key 값이 키 형식(영문 소문자·숫자 32자)이 아닙니다: {str(js_raw)[:40]!r}"
+        # 원문을 그대로 보이면 'appkey=' 접두어가 붙은 키 전체가 안내 창·진단 출력에 노출된다(리뷰 #105).
+        return js, rest, f"kakao_js_key 값이 키 형식(영문 소문자·숫자 32자)이 아닙니다 (길이 {len(str(js_raw))})"
     if not rest:
         # 지도는 뜨고 주소만 안 되는 상태. 문제로 막지 않고 이유만 남긴다.
         return js, rest, ""
@@ -208,7 +237,11 @@ def scan_key_files() -> List[KeyFileInfo]:
         except OSError as exc:
             infos.append(KeyFileInfo(path, problem=f"읽지 못했습니다: {exc}"))
             continue
-        text = raw.decode("utf-8-sig", errors="replace")
+        try:
+            text = _decode_text(raw)
+        except (UnicodeDecodeError, UnicodeError) as exc:
+            infos.append(KeyFileInfo(path, problem=f"텍스트로 읽지 못했습니다: {exc}"))
+            continue
         if "kakao" not in text.lower():
             continue
         js, rest, problem = _keys_from_text(text)
@@ -253,14 +286,20 @@ def online_keys(force: bool = False) -> Dict[str, str]:
         if force or _keys_cache is None or sig != _keys_signature_cache:
             _keys_signature_cache = sig
             cfg = load_config()
+            # 키마다 따로 settings.json 을 우선하고 없으면 파일 값을 쓴다. 예전엔 JS 키가 있을 때만 파일을
+            # 안 보고, 파일의 REST 키가 settings 값을 덮었다(리뷰 #76).
             js = _clean_key(cfg.get("kakao_js_key"))
             rest = _clean_key(cfg.get("kakao_rest_key"))
             source = "settings.json" if js else ""
-            if not js:
-                for info in scan_key_files():
-                    if info.usable:
-                        js, rest, source = info.js, (info.rest or rest), info.path
-                        break
+            file_js = file_rest = ""
+            for info in scan_key_files():
+                if info.usable:
+                    file_js, file_rest = info.js, info.rest
+                    if not js:
+                        source = info.path
+                    break
+            js = js or file_js
+            rest = rest or file_rest
             _keys_cache = {"js": js, "rest": rest, "source": source}
     return dict(_keys_cache)
 

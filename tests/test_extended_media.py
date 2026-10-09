@@ -66,11 +66,11 @@ def test_rear_copy_mismatch_rolls_back(case_env, monkeypatch):
     from core import pipeline
     src, store, run, extract = case_env
     rear=src.parent/'rear.mp4';rear.write_bytes(b'rear evidence')
-    original=pipeline.shutil.copy2
-    def copy(a,b):
-        original(a,b)
+    original=pipeline._copy_cancellable
+    def copy(a,b,cancel_event=None):
+        original(a,b,cancel_event)
         if str(a)==str(rear):Path(b).write_bytes(b'corrupted')
-    monkeypatch.setattr(pipeline.shutil,'copy2',copy)
+    monkeypatch.setattr(pipeline,'_copy_cancellable',copy)
     with pytest.raises(ValueError,match='후방 사본'):run(rear_video_path=str(rear))
     assert not store.list_cases()
     assert not list((src.parent/'cases').glob('*'))

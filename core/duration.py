@@ -14,19 +14,21 @@ import integration_mp4 as _mp4  # noqa: E402
 from core.format_sniffer import CONTAINER_AVI, CONTAINER_MP4  # noqa: E402
 
 
+MAX_PLAUSIBLE_DURATION_SEC = 7 * 24 * 3600.0
+
+
 def get_duration_sec(path: str, container: str,
                       engine_output_dir: Optional[str] = None) -> Optional[float]:
     try:
         if container == CONTAINER_AVI:
             return _avi_duration(path)
         if container == CONTAINER_MP4:
-            duration = _mp4_mvhd_duration(path)
-            if duration:
-                return duration
-            # 조각(moof/mdat) MP4는 mvhd duration이 0이다(INAVI QXD8000 등). 조각을 훑어 계산한다.
-            duration = _mp4_fragment_duration(path)
-            if duration:
-                return duration
+            # 조각(moof/mdat) MP4는 mvhd duration이 0이거나(INAVI QXD8000 등) 첫 구간 길이만 적혀
+            # 있다(moov에 sample이 든 혼합 파일 - 리뷰 #60). 둘 다 구해 큰 쪽을 쓴다. 조각 계산은
+            # 헤더만 읽어 빠르다.
+            candidates = [d for d in (_mp4_mvhd_duration(path), _mp4_fragment_duration(path)) if d]
+            if candidates:
+                return max(candidates)
             if engine_output_dir:
                 return _timeline_fallback(engine_output_dir)
     except (OSError, struct.error, ValueError, IndexError):
@@ -95,7 +97,12 @@ def _mp4_mvhd_duration(path: str) -> Optional[float]:
     _ctime, timescale, duration = fields
     if not timescale or not duration:
         return None
-    return duration / timescale
+    # all-1s는 '길이 모름'이다(ISO 14496-12). 그대로 나누면 49.7일이 되어 재생 막대 setRange가
+    # int32를 넘겨 사건 화면이 뜨지 않았다(리뷰 #24). 7일 넘는 값도 블랙박스 영상으로는 비정상.
+    if duration in (0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF):
+        return None
+    seconds = duration / timescale
+    return seconds if seconds <= MAX_PLAUSIBLE_DURATION_SEC else None
 
 
 def _mp4_fragment_duration(path: str) -> Optional[float]:
