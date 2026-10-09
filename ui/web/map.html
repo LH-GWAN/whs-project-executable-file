@@ -77,6 +77,7 @@ const EMPTY_STYLE = {
 let map = null;
 let trackData = null;
 let pendingTrack = null;
+let pendingTime = null;   // 지도 준비 전에 들어온 재생 시각(리뷰 #109)
 let followEnabled = true;
 let selfMove = false;
 let fallbackNote = "";
@@ -170,7 +171,7 @@ async function addBasemapIfAvailable() {
 }
 
 function buildFeatures(points) {
-  // 위험운전 선 색은 점마다 Python이 정해 준다(p.e). 선분 양 끝이 같은 색일 때만 칠한다.
+  // 위험운전 선 색은 Python이 '이 점으로 들어오는 선분' 단위로 정해 준다(p.e).
   const solid = [], dashed = [], eventLines = [];
 
   let prev = null;
@@ -188,8 +189,7 @@ function buildFeatures(points) {
     }
     if (prev !== null) {
       const seg = [[points[prev].lon, points[prev].lat], [p.lon, p.lat]];
-      // 두 끝점이 같은 위험운전 색일 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
-      if (p.e && p.e === points[prev].e) eventLines.push({ coords: seg, color: p.e });
+      if (p.e) eventLines.push({ coords: seg, color: p.e });
       else if (sawDropout) dashed.push(seg);
       else solid.push(seg);
     }
@@ -297,13 +297,27 @@ function renderTrack(payload) {
       + (outliers ? ` · 이상치 ${outliers}개 제외` : "")
       + (window.__hasBasemap ? "" : " · 배경지도 없음(궤적만 표시)") + fallbackNote);
   } else {
-    setStatus(pts.length ? "GPS 수신이 없는 구간뿐이라 표시할 좌표가 없습니다."
-                          : "표시할 GPS 좌표가 없습니다.");
+    setStatus(noFixStatus(pts));
   }
 }
 
+// 좌표를 하나도 못 그릴 때의 사유. 이상치·검증 실패로 뺀 것과 수신 자체가 없는 것을 구분한다(리뷰 #111).
+function noFixStatus(pts) {
+  if (!pts.length) return "표시할 GPS 좌표가 없습니다.";
+  const outliers = pts.reduce((n, p) => n + (p.o ? 1 : 0), 0);
+  const untrusted = pts.reduce((n, p) => n + (p.u ? 1 : 0), 0);
+  if (outliers || untrusted) {
+    const why = [];
+    if (outliers) why.push(`이상치 ${outliers}개`);
+    if (untrusted) why.push(`검증 실패 ${untrusted}개`);
+    return `좌표가 모두 제외돼(${why.join(" · ")}) 표시할 좌표가 없습니다.`;
+  }
+  return "GPS 수신이 없는 구간뿐이라 표시할 좌표가 없습니다.";
+}
+
 function setPlaybackTime(sec) {
-  if (!trackData || !map || !map.getSource("trk-pos")) return;
+  if (!window.__mapReady || !map || !map.getSource("trk-pos")) { pendingTime = sec; return; }
+  if (!trackData) return;
   const pts = trackData.points || [];
   let best = null;
   for (const p of pts) {
@@ -416,7 +430,8 @@ async function initOnce() {
     window.__mapReady = true;
     window.__hasBasemap = hasBasemap;
     if (pendingTrack) { const t = pendingTrack; pendingTrack = null; renderTrack(t); }
-    else setStatus((hasBasemap ? "지도 준비 완료" : "배경지도 없음 · 궤적만 표시합니다") + fallbackNote);
+    if (pendingTime !== null) { const t = pendingTime; pendingTime = null; setPlaybackTime(t); }
+    if (!trackData) setStatus((hasBasemap ? "지도 준비 완료" : "배경지도 없음 · 궤적만 표시합니다") + fallbackNote);
   } catch (e) {
 
     window.__mapError = String((e && e.stack) || e);

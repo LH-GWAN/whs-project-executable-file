@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from core.acceleration import speed_rate_pairs
+from core.acceleration import EVENT_MAX_WINDOW_SEC, speed_rate_pairs
 from engine.engine_adapter import TrackPoint
 
 VEHICLE_CAR = "car"
@@ -32,8 +32,10 @@ EV_START = "rapid_start"
 EV_DECEL = "rapid_decel"
 EV_STOP = "rapid_stop"
 
-# 표시 순서 겸 지도 선 색 우선순위(앞쪽이 이긴다).
-EVENT_KINDS = (EV_STOP, EV_START, EV_ACCEL, EV_DECEL)
+# 겹칠 때의 우선순위(앞쪽이 이긴다) - 지도 선 색, 그래프 선 색, 표의 나열 순서가 모두 이 하나를 쓴다(리뷰 #79).
+EVENT_PRIORITY = (EV_STOP, EV_START, EV_ACCEL, EV_DECEL)
+EVENT_KINDS = EVENT_PRIORITY
+# 범례·통계의 나열 순서.
 DISPLAY_ORDER = (EV_ACCEL, EV_START, EV_DECEL, EV_STOP)
 SPEED_EVENT_KINDS = DISPLAY_ORDER
 
@@ -42,7 +44,6 @@ EVENT_LABELS = {EV_ACCEL: "급가속", EV_START: "급출발", EV_DECEL: "급감�
 # 현재 위치(파랑)와 겹치지 않게 골랐다.
 EVENT_COLORS = {EV_ACCEL: "#e03131", EV_START: "#d6336c", EV_DECEL: "#f08c00", EV_STOP: "#7048e8"}
 
-ACCEL_MIN_SPEED = 6.0         # 급가속: 이 속도 이상에서
 START_MAX_SPEED = 5.0         # 급출발: 이 속도 이하에서 출발
 DECEL_MIN_END_SPEED = 6.0     # 급감속: 감속 후 속도가 이 이상
 STOP_MAX_END_SPEED = 5.0      # 급정지: 감속 후 속도가 이 이하
@@ -114,7 +115,7 @@ def summarize_counts(events: List[DrivingEvent], kinds=DISPLAY_ORDER) -> str:
 def events_by_row(events: List[DrivingEvent], row_count: int) -> List[List[DrivingEvent]]:
     """행마다 걸친 위험운전 목록(표시 순서대로)."""
     rows: List[List[DrivingEvent]] = [[] for _ in range(row_count)]
-    order = {k: i for i, k in enumerate(DISPLAY_ORDER)}
+    order = {k: i for i, k in enumerate(EVENT_PRIORITY)}
     for ev in sorted(events, key=lambda e: order.get(e.kind, 99)):
         for i in range(max(0, ev.start_index), min(row_count, ev.end_index + 1)):
             if ev not in rows[i]:
@@ -147,10 +148,9 @@ def classify_speed_change(v0: float, v1: float, rate: float, c: Criteria) -> Opt
     if rate > 0:
         if v0 <= START_MAX_SPEED:
             return EV_START if rate >= c.start else None
-        if v0 >= ACCEL_MIN_SPEED:
-            limit = c.accel[0] if v0 <= 10 else c.accel[1] if v0 <= 20 else c.accel[2]
-            return EV_ACCEL if rate >= limit else None
-        return None
+        # 5~6 km/h는 표에 없는 틈이다. 급출발(5 이하)이 아니면 첫 구간(6~10) 기준으로 본다(리뷰 #97).
+        limit = c.accel[0] if v0 <= 10 else c.accel[1] if v0 <= 20 else c.accel[2]
+        return EV_ACCEL if rate >= limit else None
     if rate < 0:
         drop = -rate
         if v1 <= STOP_MAX_END_SPEED:
@@ -163,7 +163,9 @@ def classify_speed_change(v0: float, v1: float, rate: float, c: Criteria) -> Opt
 
 def _speed_events(points: List[TrackPoint], c: Criteria) -> List[DrivingEvent]:
     hits = []
-    for prev_i, cur_i, _dt, rate in speed_rate_pairs(points):
+    for prev_i, cur_i, dt, rate in speed_rate_pairs(points):
+        if dt > EVENT_MAX_WINDOW_SEC:
+            continue   # 긴 창의 평균은 '초당' 판정이 아니다(리뷰 #44)
         kind = classify_speed_change(points[prev_i].speed_kmh, points[cur_i].speed_kmh, rate, c)
         if kind:
             hits.append((kind, prev_i, cur_i, rate))

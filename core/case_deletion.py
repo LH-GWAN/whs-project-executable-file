@@ -160,7 +160,14 @@ def delete_cases(store: HistoryStore, cases_root_dir: str, case_ids: Iterable[in
                 result.error = (f"파일 일부를 지우지 못해 남아 있습니다: {staging}\n({exc})\n"
                                 "다음 삭제 때 다시 시도하며, 직접 지우셔도 됩니다.")
 
-        store.delete_case(case_id)
-        result.record_removed = True
+        elif remove_folders and folder and not os.path.lexists(folder):
+            # 폴더가 없는데 '폴더도 삭제'를 골랐으면 성공으로 보고하지 않는다(사본이 어딘가 남아 있을 수
+            # 있다 - 데이터 폴더 이전 뒤 옛 경로 등, 리뷰 #16).
+            result.error = f"사건 폴더를 찾지 못했습니다(기록된 경로: {folder}). 이력만 지웁니다."
+        try:
+            store.delete_case(case_id)
+            result.record_removed = True
+        except Exception as exc:  # noqa: BLE001 - DB가 읽기 전용이어도 나머지 사건은 계속(리뷰 #69)
+            result.error = (result.error + "\n" if result.error else "") + f"이력을 지우지 못했습니다: {exc}"
         results.append(result)
     return results

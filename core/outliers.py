@@ -16,6 +16,7 @@ from engine.engine_adapter import TrackPoint
 MAX_SPEED_KMH = 300.0        # 이 위는 차량 속도로 볼 수 없다
 MAX_JUMP_MPS = 100.0         # 두 측정 사이 이동 속도가 360 km/h를 넘으면 위치가 튄 것
 MIN_JUMP_M = 150.0           # 아주 짧은 dt로 나눠 커진 값이 아니라 실제로 멀리 튄 경우만
+MAX_SPEED_JUMP_KMH_S = 60.0  # 1초에 이만큼 넘게 속도가 튀었다가 되돌아오면 측정 오류(리뷰 #48)
 _EARTH_R = 6371000.0
 
 
@@ -93,12 +94,27 @@ def mark_outliers(points: List[TrackPoint]) -> int:
         p.is_outlier = False
         p.outlier_reason = ""
 
-    # 1) 값 자체가 불가능한 행
+    # 1) 값 자체가 불가능한 행. 좌표가 없는 행(측위 전 V 문장 등)은 속도만으로 이상치로 보지 않는다 -
+    #    표가 위경도를 포맷하다 죽었다(리뷰 #46).
     for i, p in enumerate(points):
         if p.latitude is not None and p.longitude is not None and not _coords_valid(p):
             _mark(points, [i], f"좌표가 유효 범위 밖 ({p.latitude}, {p.longitude})")
-        elif p.speed_kmh is not None and (not math.isfinite(p.speed_kmh) or p.speed_kmh > MAX_SPEED_KMH or p.speed_kmh < 0):
+        elif (p.has_coords and p.speed_kmh is not None
+              and (not math.isfinite(p.speed_kmh) or p.speed_kmh > MAX_SPEED_KMH or p.speed_kmh < 0)):
             _mark(points, [i], f"속도 비정상 ({p.speed_kmh:.0f} km/h)")
+
+    # 1b) 속도 한 점 튐: 앞뒤 측정과 맞지 않게 치솟았다가 돌아오면(30→150→30) 측정 오류다. 그대로 두면
+    #     가짜 급가속·급감속이 두 건 확정된다(리뷰 #48).
+    speed_groups = [g for g in _groups(points) if points[g.indices[0]].speed_kmh is not None]
+    for gi in range(1, len(speed_groups) - 1):
+        a, b, c = speed_groups[gi - 1], speed_groups[gi], speed_groups[gi + 1]
+        va, vb, vc = (points[g.indices[0]].speed_kmh for g in (a, b, c))
+        dt_ab, dt_bc = b.t - a.t, c.t - b.t
+        if dt_ab <= 0 or dt_bc <= 0:
+            continue
+        up, down = (vb - va) / dt_ab, (vb - vc) / dt_bc
+        if abs(up) > MAX_SPEED_JUMP_KMH_S and abs(down) > MAX_SPEED_JUMP_KMH_S and up * down > 0:
+            _mark(points, b.indices, f"속도 급변 ({va:.0f}→{vb:.0f}→{vc:.0f} km/h, 앞뒤와 맞지 않음)")
 
     # 2) 위치가 튄 측정: 직전 정상 측정에서 불가능한 속도로 멀어졌다가(그리고 다음 측정이
     #    다시 원래 자리 근처면) 그 한 점만 이상치로 본다. 다음 측정도 멀리 있으면 실제로

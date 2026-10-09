@@ -46,13 +46,22 @@ one-file(단일 exe) 대신 one-dir(폴더)로 만든 이유는 `idas.spec` 상�
 
 ---
 
+### 재빌드해도 남는 것 (2026-10-09)
+
+`build_windows.bat`은 `dist\`를 지우기 전에 `dist\IDAS\_internal\assets\`(빌드 뒤에 넣은 키 파일·배경지도)를
+`build_keep_assets\`에 복사했다가 빌드가 끝나면 되돌린다. 또 `assets\*.zip`으로 받은 배경지도는 빌드 전에
+풀어서(`core.basemap.extract_zipped_basemap`) `.pmtiles`가 번들되게 한다. 가상환경은 `activate.bat` 대신
+`.venv\Scripts\python.exe`를 직접 불러 폴더를 옮겨도 시스템 Python으로 빌드되지 않는다. 두 스크립트는
+UNC 경로(`\\server\share`)에서는 중단하고, `idas.spec`이 없는 폴더에서는 아무것도 지우지 않는다.
+
 ### clean 해도 남는 것
 
 `clean_windows.bat`은 `.venv\`, `dist\`, `build\`, 바로가기, `__pycache__\`만 지운다.
 지도 온라인/오프라인 선택(`%LOCALAPPDATA%\IDAS\settings.json`)과 안내 창의 "다시
 표시하지 않음"(레지스트리 `HKCU\Software\IDAS`)은 사용자 데이터라 남고, 그래서
 재빌드 후에도 처음처럼 묻지 않는다. 스크립트 끝에서 "Reset app settings"에 Y를 답하거나
-앱의 **설정 > 지도 설정 초기화**를 쓰면 다시 묻는다. 사건 이력(`history.db`)과 증거
+앱의 **설정 > 지도 설정 초기화**를 쓰면 다시 묻는다(둘 다 `settings.json`에서 `map_mode`만 지우고
+키 덮어쓰기는 남긴다). 사건 이력(`history.db`)과 증거
 폴더(`cases\`)는 어느 쪽도 지우지 않는다.
 
 ---

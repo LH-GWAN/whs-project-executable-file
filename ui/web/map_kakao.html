@@ -85,17 +85,19 @@ const SDK_URL = "https://dapi.kakao.com/v2/maps/sdk.js";
 const SDK_TIMEOUT_MS = 15000;
 
 const FAIL_MESSAGES = {
-  quota: "온라인 지도 사용 한도 초과 · 오늘은 사용할 수 없습니다 (궤적만 표시)",
+  quota: "온라인 지도 사용 한도 초과 · 오늘은 사용할 수 없습니다 (지도 사용 방식을 오프라인으로 바꾸면 궤적을 볼 수 있습니다)",
   domain: "온라인 지도 사용 불가 · 카카오 디벨로퍼스에 이 프로그램 주소가 등록되지 않음",
   disabled: "온라인 지도 사용 불가 · 카카오 디벨로퍼스 앱에서 카카오맵 사용 설정이 꺼짐",
   key: "온라인 지도 사용 불가 · JavaScript 키 오류",
-  network: "인터넷에 연결할 수 없어 온라인 지도를 불러오지 못했습니다 (궤적만 표시)",
-  unknown: "온라인 지도를 불러오지 못했습니다 (궤적만 표시)",
+  network: "인터넷에 연결할 수 없어 온라인 지도를 불러오지 못했습니다 (지도 사용 방식을 오프라인으로 바꾸면 궤적을 볼 수 있습니다)",
+  unknown: "온라인 지도를 불러오지 못했습니다 (지도 사용 방식을 오프라인으로 바꾸면 궤적을 볼 수 있습니다)",
 };
 
 let map = null;
 let trackData = null;
 let pendingTrack = null;
+let pendingTime = null;   // 지도 준비 전에 들어온 재생 시각(리뷰 #109)
+let zoomControl = null;
 let followEnabled = true;
 let polylines = [];
 let eventOverlays = [];
@@ -122,7 +124,8 @@ function setState(state, message) {
 function fail(kind, message) {
   setState("error:" + kind, message);
   setStatus(FAIL_MESSAGES[kind] || FAIL_MESSAGES.unknown);
-  // 궤적 데이터는 받아 두되 그릴 지도가 없다. 상태 문구가 사용자에게 사유를 알린다.
+  // 이 페이지에는 대체 렌더러가 없어 궤적을 그리지 못한다. 문구가 '궤적만 표시'라고 하던 것을 고쳤다(리뷰 #80).
+  // Python(main_window)이 online_map_failed 신호를 받아 오프라인 전환을 안내한다.
 }
 
 async function fetchJson(path) {
@@ -146,7 +149,12 @@ function loadSdk(key) {
 
 async function boot() {
   const cfg = await fetchJson("map-config");
-  if (!cfg || !cfg.kakaoJsKey) {
+  if (!cfg || cfg.mode !== "online") {
+    // 오프라인으로 바뀐 뒤 이 페이지가 어떤 경로로든 열려도 외부(SDK)로 나가지 않는다.
+    fail("disabled", "지도 사용 방식이 오프라인이라 온라인 지도를 불러오지 않음");
+    return;
+  }
+  if (!cfg.kakaoJsKey) {
     fail("key", "JavaScript 키가 설정되지 않았습니다");
     return;
   }
@@ -168,7 +176,13 @@ async function boot() {
     return;
   }
   try {
-    window.kakao.maps.load(initMap);
+    // 콜백이 영영 안 오면(CDN 차단 등) '준비 중'에 멈춰 안내도 없었다(리뷰 #83).
+    const loadTimer = setTimeout(function () {
+      if (!window.__mapReady && window.__onlineMapState === "loading") {
+        fail("network", "kakao.maps.load 콜백이 " + (SDK_TIMEOUT_MS / 1000) + "초 안에 오지 않음");
+      }
+    }, SDK_TIMEOUT_MS);
+    window.kakao.maps.load(function () { clearTimeout(loadTimer); initMap(); });
   } catch (e) {
     fail("unknown", String(e.message || e));
   }
@@ -216,7 +230,8 @@ function initMap() {
       center: new kakao.maps.LatLng(37.5, 127.0),
       level: 8,
     });
-    map.addControl(new kakao.maps.ZoomControl(), kakao.maps.ControlPosition.TOPLEFT);
+    zoomControl = new kakao.maps.ZoomControl();
+    map.addControl(zoomControl, kakao.maps.ControlPosition.TOPLEFT);
     // 사용자가 끌면 따라가기를 끈다. 우리가 panTo로 움직인 건 dragstart를 내지 않는다.
     kakao.maps.event.addListener(map, "dragstart", function () { viewTouched = true; setFollow(false); });
     kakao.maps.event.addListener(map, "zoom_changed", function () { if (!fitting) viewTouched = true; });
@@ -249,6 +264,7 @@ function initMap() {
     } else {
       setStatus("온라인 지도 준비 완료");
     }
+    if (pendingTime !== null) { const t = pendingTime; pendingTime = null; setPlaybackTime(t); }
   } catch (e) {
     fail("unknown", String((e && e.message) || e));
   }
@@ -260,7 +276,7 @@ function latLng(p) {
 
 // 연속된 같은 종류의 구간을 하나의 선으로 묶는다. 지점이 수천 개라 구간마다 객체를
 // 만들면 무겁다. 종류가 바뀌는 지점은 양쪽 선이 공유해 끊김이 없게 한다.
-// 종류: "solid" / "dashed" / 위험운전 선 색("#e03131" 등, 점마다 Python이 정해 준 p.e).
+// 종류: "solid" / "dashed" / 위험운전 선 색("#e03131" 등, Python이 '이 점으로 들어오는 선분' 단위로 정해 준 p.e).
 function buildRuns(points) {
   const runs = { solid: [], dashed: [] };
   let current = null, currentKind = null;
@@ -280,8 +296,7 @@ function buildRuns(points) {
     }
     if (prev !== null) {
       let kind;
-      // 두 끝점이 같은 위험운전 색일 때만 그 색을 칠한다(급가속→급감속 경계 선분은 일반 주행).
-      if (p.e && p.e === points[prev].e) kind = p.e;
+      if (p.e) kind = p.e;
       else if (sawDropout) kind = "dashed";
       else kind = "solid";
       if (current === null || kind !== currentKind) {
@@ -365,14 +380,15 @@ function renderTrack(payload) {
   renderEvents(payload.events);
 
   posOverlay.setMap(null);
+  // 이전 사건의 영상 경계 점은 좌표가 없는 사건으로 바꿔도 지워야 한다(리뷰 #82).
+  segEndOverlays.forEach((o) => o.setMap(null));
+  segEndOverlays = [];
   if (fixes.length) {
     startOverlay.setPosition(latLng(fixes[0]));
     startOverlay.setMap(map);
     endOverlay.setPosition(latLng(fixes[fixes.length - 1]));
     endOverlay.setMap(map);
     // 이어보기: 영상마다 끝나는 곳에 검은 점(마지막 영상의 끝점은 위에서 찍었다).
-    segEndOverlays.forEach((o) => o.setMap(null));
-    segEndOverlays = [];
     (payload.segEnds || []).slice(0, -1).forEach(([lat, lon]) => {
       const o = makeDot("trk-end");
       o.setPosition(new kakao.maps.LatLng(lat, lon));
@@ -396,9 +412,22 @@ function renderTrack(payload) {
   } else {
     startOverlay.setMap(null);
     endOverlay.setMap(null);
-    setStatus(pts.length ? "GPS 수신이 없는 구간뿐이라 표시할 좌표가 없습니다."
-                          : "표시할 GPS 좌표가 없습니다.");
+    setStatus(noFixStatus(pts));
   }
+}
+
+// 좌표를 하나도 못 그릴 때의 사유. 이상치·검증 실패로 뺀 것과 수신 자체가 없는 것을 구분한다(리뷰 #111).
+function noFixStatus(pts) {
+  if (!pts.length) return "표시할 GPS 좌표가 없습니다.";
+  const outliers = pts.reduce((n, p) => n + (p.o ? 1 : 0), 0);
+  const untrusted = pts.reduce((n, p) => n + (p.u ? 1 : 0), 0);
+  if (outliers || untrusted) {
+    const why = [];
+    if (outliers) why.push(`이상치 ${outliers}개`);
+    if (untrusted) why.push(`검증 실패 ${untrusted}개`);
+    return `좌표가 모두 제외돼(${why.join(" · ")}) 표시할 좌표가 없습니다.`;
+  }
+  return "GPS 수신이 없는 구간뿐이라 표시할 좌표가 없습니다.";
 }
 
 function fitToTrack(payload) {
@@ -423,7 +452,8 @@ function fitToTrack(payload) {
 }
 
 function setPlaybackTime(sec) {
-  if (!trackData || !map || !posOverlay) return;
+  if (!window.__mapReady || !map || !posOverlay) { pendingTime = sec; return; }
+  if (!trackData) return;
   const pts = trackData.points || [];
   let best = null;
   for (const p of pts) {
@@ -467,7 +497,16 @@ document.getElementById("followBtn").addEventListener("click", function () {
 
 boot();
 
-function setCaptureMode(on) { document.body.classList.toggle("capture", !!on); }
+function setCaptureMode(on) {
+  document.body.classList.toggle("capture", !!on);
+  // 카카오 줌 컨트롤은 지도 안의 요소라 CSS로 못 가린다. 캡처 동안 떼었다 붙인다(리뷰 #110).
+  if (map && zoomControl) {
+    try {
+      if (on) map.removeControl(zoomControl);
+      else map.addControl(zoomControl, kakao.maps.ControlPosition.TOPLEFT);
+    } catch (e) { /* 이미 떼어졌거나 붙어 있음 */ }
+  }
+}
 
 window.renderTrack = renderTrack;
 window.setPlaybackTime = setPlaybackTime;

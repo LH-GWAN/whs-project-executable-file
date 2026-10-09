@@ -130,7 +130,12 @@ def _fmt_offset(seconds: float) -> str:
 def _fmt_epoch(epoch: Optional[float]) -> str:
     if epoch is None:
         return "알 수 없음"
-    return _dt.datetime.fromtimestamp(epoch, _dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    try:
+        # Windows의 fromtimestamp는 음수(1970년 이전)를 거부한다(리뷰 #135). epoch+timedelta로 센다.
+        when = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(seconds=epoch)
+    except (OverflowError, ValueError):
+        return "알 수 없음"
+    return when.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 # ---------- 기기 정보(컨테이너 서명) ----------
@@ -266,6 +271,16 @@ def parse_filename_timestamp(path: str) -> Optional[_dt.datetime]:
     return None
 
 
+def _same_file(a: str, b: str) -> bool:
+    """경로 문자열이 달라도(대소문자·링크·상대경로) 같은 파일이면 True."""
+    try:
+        if os.path.samefile(a, b):
+            return True
+    except OSError:
+        pass
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
 def compare_pair(front_path: str, rear_path: str) -> PairCheck:
     """빠른 검사(파일만 읽음): 컨테이너 종류·기기 정보, 길이, 컨테이너 녹화 시각, 파일명 시각.
     허용치를 넘으면 problems에 적힌다. 파일명 짝·같은 폴더 여부는 참고 문구다(기기마다 규칙이
@@ -274,7 +289,7 @@ def compare_pair(front_path: str, rear_path: str) -> PairCheck:
     from core.format_sniffer import CONTAINER_MP4, sniff
 
     check = PairCheck(front_path=front_path, rear_path=rear_path)
-    if os.path.abspath(front_path) == os.path.abspath(rear_path):
+    if _same_file(front_path, rear_path):
         check.problems.append("전방으로 고른 파일과 같은 파일입니다.")
         return check
     check.same_folder = os.path.dirname(os.path.abspath(front_path)) == os.path.dirname(os.path.abspath(rear_path))
@@ -286,6 +301,11 @@ def compare_pair(front_path: str, rear_path: str) -> PairCheck:
         컨테이너에만 있으므로 AVI에는 MP4 파서를 돌리지 않는다(엉뚱한 경고만 난다)."""
         try:
             routing = sniff(path)
+            if not routing.supported:
+                # 0바이트·권한 없음·손상은 실제 이유를 적는다. 예전엔 'UNSUPPORTED'끼리 종류가 다르다고만
+                # 나왔다(리뷰 #133).
+                check.problems.append(f"{'전방' if path == front_path else '후방'} 파일을 읽을 수 없습니다: {routing.reason}")
+                return None, None, {}
             dur = _duration.get_duration_sec(path, routing.container)
             rec = _duration.mp4_recorded_at_epoch(path) if routing.container == CONTAINER_MP4 else None
             return dur, rec, device_signature(path, routing.container)
@@ -294,6 +314,17 @@ def compare_pair(front_path: str, rear_path: str) -> PairCheck:
 
     check.front_duration, check.front_recorded_at, check.front_signature = probe(front_path)
     check.rear_duration, check.rear_recorded_at, check.rear_signature = probe(rear_path)
+    if check.problems:
+        return check
+    # 내용이 같은 사본(복사본·링크)을 후방으로 고르면 좌표 중앙값 0 m로 통과했다(리뷰 #35).
+    try:
+        if os.path.getsize(front_path) == os.path.getsize(rear_path):
+            from core import hashing
+            if hashing.sha256_file(front_path) == hashing.sha256_file(rear_path):
+                check.problems.append("후방으로 고른 파일이 전방과 내용(SHA-256)이 같습니다 - 같은 영상의 사본입니다.")
+                return check
+    except OSError:
+        pass
 
     fs, rs = check.front_signature, check.rear_signature
     if fs.get("container") and rs.get("container") and fs["container"] != rs["container"]:
@@ -348,14 +379,21 @@ def _gps_records(points) -> List[Tuple[_dt.datetime, Optional[float], Optional[f
         if not p.has_gps_record or p.start_time_sec is None:
             continue
         d, t = gpstime.parse_date(p.gps_date), gpstime.parse_time(p.gps_utc_time)
-        if d is None or t is None:
+        if d is not None and t is not None:
+            when = _dt.datetime.combine(d, t, tzinfo=_dt.timezone.utc)
+        else:
+            # UTC가 없는 기기(FineVu): 기기가 파일명 시각 + 경과 초로 만든 절대 시각으로 대조한다.
+            # 전·후방이 같은 기준이라 비교에는 충분하다(리뷰 #36).
+            try:
+                when = _dt.datetime.strptime((p.gps_abs_time or "").strip(), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            when = when.replace(tzinfo=_dt.timezone.utc)
+        if when in seen:
             continue
-        key = (d, t)
-        if key in seen:
-            continue
-        seen.add(key)
+        seen.add(when)
         lat, lon = (p.latitude, p.longitude) if p.has_coords else (None, None)
-        out.append((_dt.datetime.combine(d, t, tzinfo=_dt.timezone.utc), lat, lon))
+        out.append((when, lat, lon))
     out.sort(key=lambda r: r[0])
     return out
 
@@ -426,8 +464,13 @@ def compare_pair_full(front_path: str, rear_path: str, workdir: Optional[str] = 
             out_dir = os.path.join(base, "front" if label == "전방" else "rear")
             os.makedirs(out_dir, exist_ok=True)
             results[label] = _ea.run_full_extraction(path, out_dir, cancel_event=cancel_event)
+            if results[label].status not in ("ok", "no_gps"):
+                # 엔진 실패·시간 초과는 'GPS 기록 없음'이 아니다(리뷰 #100).
+                check.problems.append(f"{label} 영상 분석 실패: {results[label].status_message}")
         if cancel_event is not None and cancel_event.is_set():
             check.cancelled = True
+            return check
+        if check.problems:
             return check
         if progress:
             progress("GPS 시각과 좌표를 대조하는 중...")

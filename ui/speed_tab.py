@@ -58,6 +58,13 @@ class SpeedTab(QWidget):
         self._views = list(views)
         self._vehicle_type = vehicle_type
         fill_view_bar(self._view_bar, self._views)
+        if not self._views:
+            # 끈 탭에 이전 사건 그래프가 남아 리포트에 실리지 않게 비운다(리뷰 #1).
+            self._chart.set_data([], [], [])
+            self._avg_label.setText("평균 속도: -")
+            self._max_label.setText("최고 속도: -")
+            self._flag_label.setText("위험운전: -")
+            return
         self._show_view(0)
 
     def current_view(self) -> int:
@@ -69,7 +76,8 @@ class SpeedTab(QWidget):
         view = self._views[index]
         records = view.points
         speed_events = _speed_only(view.events)
-        self._chart.set_data(records, speed_events, view.boundaries)
+        self._chart.set_data(records, speed_events, view.boundaries,
+                             time_label="경과" if view.is_slack else "영상")
         indices = _distinct_fix_indices(records)
         speeds = [records[i].speed_kmh for i in indices]
         excluded = sum(r.speed_kmh is not None for r in records) - len(indices)
@@ -81,9 +89,12 @@ class SpeedTab(QWidget):
         else:
             self._avg_label.setText("평균 속도: -")
             self._max_label.setText("최고 속도: -")
-        self._flag_label.setText(
-            f"위험운전({vehicle_label(self._vehicle_type)} 기준): "
-            f"{summarize_counts(speed_events, SPEED_EVENT_KINDS)}")
+        if view.is_slack:
+            self._flag_label.setText("위험운전: 판정 안 함 (슬랙 - 시간축이 영상이 아님)")
+        else:
+            self._flag_label.setText(
+                f"위험운전({vehicle_label(self._vehicle_type)} 기준): "
+                f"{summarize_counts(speed_events, SPEED_EVENT_KINDS)}")
         self._flag_label.setToolTip("\n".join(criteria_lines(self._vehicle_type)[:5]))
         self.view_changed.emit(index)
 

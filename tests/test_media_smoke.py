@@ -104,7 +104,7 @@ def test_case_without_video_releases_previous_source(qapp, monkeypatch, video):
     from engine.engine_adapter import ExtractionResult
     class MapStub(QWidget):
         online_map_failed = Signal(str, str)
-        def set_track(self, *args): pass
+        def set_track(self, *args, **kwargs): pass
         def set_playback_time(self, *args): pass
         def ensure_loaded(self): pass
     monkeypatch.setattr(tracker_tab, 'MapView', MapStub)

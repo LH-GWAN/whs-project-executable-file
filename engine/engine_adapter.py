@@ -6,6 +6,7 @@ import math
 import os
 import json
 import subprocess
+import time
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -47,6 +48,10 @@ class TrackPoint:
     gps_utc_time: str = ""
     gps_checksum_ok: Optional[bool] = None
     gps_trusted: Optional[bool] = None
+    # UTC가 없는 기기(FineVu)의 기록 근거: 측위 상태(A/V), 파일명 기준 절대 시각, 레코드 경과 초.
+    gps_status: str = ""
+    gps_abs_time: str = ""
+    gps_elapsed: Optional[float] = None
 
     latitude_last: Optional[float] = None
     longitude_last: Optional[float] = None
@@ -81,7 +86,22 @@ class TrackPoint:
 
     @property
     def has_gps_record(self) -> bool:
-        return bool((self.gps_utc_time or "").strip() or (self.gps_date or "").strip())
+        return bool((self.gps_utc_time or "").strip() or (self.gps_date or "").strip()
+                    or (self.gps_status or "").strip() or (self.gps_abs_time or "").strip()
+                    or self.gps_elapsed is not None)
+
+    def record_key(self):
+        """같은 GPS 측정인지 가르는 열쇠. UTC가 있으면 UTC, 없으면 기기가 준 절대 시각·경과 초, 그것도
+        없으면 값(좌표·속도). 값으로만 묶으면 정차 중 같은 값이 한 측정이 되어 급출발을 놓치고 그래프가
+        왜곡된다(리뷰 #7). 반복 기록 판정·급가감속·1초 표·Tracker 정보 줄이 모두 이 열쇠를 쓴다."""
+        utc = (self.gps_utc_time or "").strip()
+        if utc:
+            return ("utc", self.gps_date or "", utc)
+        if (self.gps_abs_time or "").strip():
+            return ("abs", self.gps_abs_time.strip())
+        if self.gps_elapsed is not None:
+            return ("elapsed", self.gps_elapsed)
+        return ("val", self.latitude, self.longitude, self.speed_kmh)
 
     @property
     def is_dropout(self) -> bool:
@@ -107,6 +127,12 @@ class TrackPoint:
     def display_longitude(self) -> Optional[float]:
         return self.longitude if self.longitude is not None else self.longitude_last
 
+
+# NMEA 뒤에 128KB 넘는 문자열이 붙은 조작 파일에서 csv 기본 한도(131072)에 걸려 분석 전체가 실패했다
+# (리뷰 #63). 행 하나가 커도 읽고, 슬랙 로드 실패는 본 분석과 분리한다.
+csv.field_size_limit(min(2 ** 31 - 1, 256 * 1024 * 1024))
+
+_MAX_CAPTURED_OUTPUT = 2 * 1024 * 1024
 
 STATUS_OK = "ok"
 STATUS_UNSUPPORTED = "unsupported"
@@ -189,6 +215,7 @@ def run_engine(input_path: str, output_dir: str, slack: bool = False,
 
     argv = build_subprocess_argv(engine_args)
     started_at = datetime.now()
+    started_mono = time.monotonic()   # 제한 시간은 벽시계가 아니라 단조 시계로 잰다(리뷰 #94)
     timed_out = False
     cancelled = False
 
@@ -208,8 +235,7 @@ def run_engine(input_path: str, output_dir: str, slack: bool = False,
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 break
-            if timeout_sec is not None and \
-                    (datetime.now() - started_at).total_seconds() > timeout_sec:
+            if timeout_sec is not None and time.monotonic() - started_mono > timeout_sec:
                 timed_out = True
                 break
     finally:
@@ -230,6 +256,12 @@ def run_engine(input_path: str, output_dir: str, slack: bool = False,
         stderr += "\n[engine_adapter] 사용자가 취소함"
 
     finished_at = datetime.now()
+    # 경고가 수백만 건인 조작 파일은 stdout이 수백 MB가 된다. 앞·뒤만 남긴다(리뷰 #62).
+    if len(stdout) > _MAX_CAPTURED_OUTPUT:
+        stdout = (stdout[:_MAX_CAPTURED_OUTPUT // 2] + "\n… (출력이 길어 가운데를 생략함) …\n"
+                  + stdout[-_MAX_CAPTURED_OUTPUT // 2:])
+    if len(stderr) > _MAX_CAPTURED_OUTPUT:
+        stderr = stderr[:_MAX_CAPTURED_OUTPUT // 2] + "\n… (생략) …\n" + stderr[-_MAX_CAPTURED_OUTPUT // 2:]
     result = EngineRunResult(
         argv=argv, exit_code=exit_code, stdout=stdout, stderr=stderr,
         started_at=started_at, finished_at=finished_at, timed_out=timed_out, note=note,
@@ -264,7 +296,9 @@ def _b(value: Optional[str]) -> Optional[bool]:
 
 
 def find_csvs(output_dir: str, filename: str) -> List[str]:
-    return sorted(glob.glob(os.path.join(output_dir, "**", filename), recursive=True))
+    # 경로에 '[ ]'가 있으면(clip[1].mp4 폴더) glob이 문자 집합으로 읽어 CSV를 못 찾았다 - 그러면
+    # 신뢰도 사이드카(coordinates.csv)를 못 붙여 status=V 좌표가 정상 좌표가 됐다(리뷰 #4).
+    return sorted(glob.glob(os.path.join(glob.escape(output_dir), "**", filename), recursive=True))
 
 
 def _count_fixes(csv_path: str) -> int:
@@ -299,6 +333,9 @@ def load_timeline(csv_path: str) -> List[TrackPoint]:
                 gps_utc_time=(row.get("gps_utc_time") or "").strip(),
                 gps_checksum_ok=_b(row.get("gps_checksum_ok")),
                 gps_trusted=_b(row.get("gps_trusted")),
+                gps_status=(row.get("gps_status") or "").strip(),
+                gps_abs_time=(row.get("abs_time") or "").strip(),
+                gps_elapsed=_f(row.get("gps_elapsed_sec")),
                 latitude_last=_f(row.get("latitude_last")),
                 longitude_last=_f(row.get("longitude_last")),
                 speed_kmh_last=_f(row.get("speed_kmh_last")),
@@ -348,6 +385,9 @@ def load_coordinates_as_points(csv_path: str) -> List[TrackPoint]:
                 gps_checksum_ok=_b(row.get("checksum_ok")),
                 gps_trusted=(False if _b(row.get("status_valid")) is False
                              else _b(row.get("trusted"))),
+                gps_status=(row.get("status") or "").strip(),
+                gps_abs_time=(row.get("abs_time") or "").strip(),
+                gps_elapsed=_f(row.get("elapsed_delta_sec")),
                 source_file=csv_path,
             ))
     _fill_last_known(points)
@@ -364,15 +404,65 @@ def _fill_last_known(points: List[TrackPoint]) -> None:
         p.speed_kmh_last = last_speed
 
 
-def _collect_warnings(output_dir: str) -> List[str]:
-    messages: List[str] = []
+MAX_WARNINGS_KEPT = 300
+
+
+def _preserve_warning_logs(output_dir: str, tag: str) -> None:
     for log_path in find_csvs(output_dir, "warnings.log"):
         try:
+            os.replace(log_path, os.path.join(os.path.dirname(log_path), f"warnings_{tag}.log"))
+        except OSError:
+            pass
+
+
+def _collect_warnings(output_dir: str) -> List[str]:
+    """엔진 경고. 종류별로 앞부분만 남기고 나머지는 '외 n건'으로 접는다 - 조작된 작은 파일 하나가
+    경고 100만 건을 만들어 메모리 1.2GB를 쓰고 리포트가 실패했다(리뷰 #62)."""
+    messages: List[str] = []
+    dropped = 0
+    paths = sorted(set(find_csvs(output_dir, "warnings.log") + find_csvs(output_dir, "warnings_*.log")))
+    for log_path in paths:
+        try:
             with open(log_path, encoding="utf-8", errors="replace") as f:
-                messages.extend(line.rstrip() for line in f if line.strip())
+                for line in f:
+                    if not line.strip():
+                        continue
+                    if len(messages) < MAX_WARNINGS_KEPT:
+                        messages.append(line.rstrip()[:500])
+                    else:
+                        dropped += 1
         except OSError:
             continue
+    if dropped:
+        messages.append(f"… 외 경고 {dropped}건 (engine_output 의 warnings 로그 참조)")
     return messages
+
+
+def _out_of_range_samples(output_dir: str) -> int:
+    """index.csv에서 파일 범위를 벗어난(잘린) GPS sample 수(리뷰 #40)."""
+    n = 0
+    for path in find_csvs(output_dir, "index.csv"):
+        try:
+            with open(path, newline="", encoding="utf-8", errors="replace") as f:
+                for row in csv.DictReader(f):
+                    if (row.get("validation") or "").strip().upper() == "OUT_OF_RANGE":
+                        n += 1
+        except (OSError, csv.Error):
+            continue
+    return n
+
+
+# 엔진이 'GPS 메타데이터가 없는 정상 영상'을 알리는 문구들. 경로마다 문구가 달라 하나만 보면 나머지가
+# '엔진 실패'로 표시됐다(리뷰 #38).
+_NO_GPS_MARKERS = (
+    "text track도 없고 udta 안에 mamt도 없음",
+    "text track도 없고 moov 안에 udta Box도 없음",
+    "text/sbtl/subt handler를 가진 Track을 찾지 못함",
+    "지원 text/subtitle handler(text/sbtl/subt) Track을 하나도 찾지 못함",
+    "선택된 스트림이 없습니다",
+)
+# 엔진이 처리를 중단했다고 알리는 문구들(산출물이 일부 있어도 실패다, 리뷰 #39).
+_FAILURE_MARKERS = ("종료 코드", "예외:", "Traceback (most recent call last)", "처리할 수 없습니다", "No space left")
 
 
 def _pending_track_ids(output_dir: str) -> List[int]:
@@ -412,6 +502,9 @@ def run_full_extraction(input_path: str, output_dir: str, slack: bool = False,
                               timeout_sec=timeout_sec, cancel_event=cancel_event)]
 
     for track_id in _pending_track_ids(output_dir):
+        # 같은 out_dir에 다시 돌리면 엔진이 warnings.log를 새로 써서 주 트랙의 경고가 사라졌다
+        # (리뷰 #41). 실행마다 이름을 바꿔 보존한다.
+        _preserve_warning_logs(output_dir, f"run{len(engine_runs)}")
         engine_runs.append(run_engine(
             input_path, output_dir, slack=slack,
             extra_args=[f"--mp4-opt=--track-id {track_id}"],
@@ -447,21 +540,28 @@ def load_slack_points(output_dir: str) -> List[TrackPoint]:
     시간축이나 재생 위치 동기화에 쓸 수 없다."""
     out: List[TrackPoint] = []
     for path in find_csvs(output_dir, "slack_coordinates.csv"):
-        with open(path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                out.append(TrackPoint(
-                    latitude=_f(row.get("latitude")),
-                    longitude=_f(row.get("longitude")),
-                    speed_kmh=_f(row.get("speed_kmh")),
-                    track_deg=_f(row.get("track_deg")),
-                    gps_date=(row.get("date") or "").strip(),
-                    gps_utc_time=(row.get("utc_time") or "").strip(),
-                    gps_checksum_ok=_b(row.get("checksum_ok")),
+        try:
+            _read_slack_csv(path, out)
+        except (OSError, csv.Error, UnicodeDecodeError):
+            continue   # 슬랙 한 파일이 깨져도 본 분석은 계속(리뷰 #63)
+    return out
+
+
+def _read_slack_csv(path: str, out: List[TrackPoint]) -> None:
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            out.append(TrackPoint(
+                latitude=_f(row.get("latitude")),
+                longitude=_f(row.get("longitude")),
+                speed_kmh=_f(row.get("speed_kmh")),
+                track_deg=_f(row.get("track_deg")),
+                gps_date=(row.get("date") or "").strip(),
+                gps_utc_time=(row.get("utc_time") or "").strip(),
+                gps_checksum_ok=_b(row.get("checksum_ok")),
                 gps_trusted=(False if _b(row.get("status_valid")) is False
                              else _b(row.get("trusted"))),
-                    source_file=path,
-                ))
-    return out
+                source_file=path,
+            ))
 
 
 def _classify_outcome(engine_runs: List[EngineRunResult], output_dir: str,
@@ -480,18 +580,39 @@ def _classify_outcome(engine_runs: List[EngineRunResult], output_dir: str,
     #   좌표 있음            -> 정상
     #   좌표는 없지만 다른 산출물은 있음 -> 엔진은 돌았고 이 영상에 GPS가 없는 것
     #   산출물이 아예 없음    -> 엔진이 파일을 처리하지 못한 것
+    # 단, 엔진이 stdout에 중단·예외를 명시했으면 산출물이 일부 있어도 실패다(리뷰 #39).
+    failure_line = _explicit_failure_line(engine_runs)
+    if failure_line and not any(p.has_fix for p in points):
+        return STATUS_ENGINE_FAILED, failure_line
+    out_of_range = _out_of_range_samples(output_dir)
     if any(p.has_fix for p in points):
+        if failure_line:
+            return STATUS_ENGINE_FAILED, f"일부만 추출됨: {failure_line}"
         return STATUS_OK, ""
+    if out_of_range:
+        # 파일이 잘려 GPS sample이 범위 밖인 경우는 'GPS 미기록'이 아니다(리뷰 #40).
+        return STATUS_ENGINE_FAILED, f"파일이 잘려 GPS sample {out_of_range}개가 파일 범위 밖입니다."
 
     if any(p.has_coords or p.gps_checksum_ok is False or p.gps_trusted is False for p in points):
         return STATUS_GPS_UNTRUSTED, "GPS 검증 실패 또는 유효 범위 밖 좌표"
 
     ran = any(find_csvs(output_dir, name) for name in
-              ("stream_table.csv", "track_table.csv", "index.csv", "warnings.log"))
+              ("stream_table.csv", "track_table.csv", "index.csv", "warnings.log", "warnings_run1.log"))
     if ran:
         return STATUS_NO_GPS, ""
+    if any(marker in (run.stdout or "") for run in engine_runs for marker in _NO_GPS_MARKERS):
+        return STATUS_NO_GPS, "지원하는 GPS 메타데이터 트랙이 없습니다."
     return STATUS_ENGINE_FAILED, (_first_failure_line(engine_runs)
                                    or "엔진이 산출물을 만들지 못했습니다.")
+
+
+def _explicit_failure_line(engine_runs: List[EngineRunResult]) -> str:
+    for run in engine_runs:
+        for line in (run.stdout or "").splitlines():
+            stripped = line.strip()
+            if any(marker in stripped for marker in _FAILURE_MARKERS):
+                return stripped[:300]
+    return ""
 
 
 def _first_failure_line(engine_runs: List[EngineRunResult]) -> str:
@@ -533,19 +654,42 @@ def load_existing_results(output_dir: str) -> tuple[List[TrackPoint], Optional[s
     return points, primary, time_source
 
 
-def detect_slack(paths: List[str], timeout_sec: float = 300) -> Dict[str, dict]:
+def detect_slack(paths: List[str], timeout_sec: float = 300,
+                 cancel_event: Optional[threading.Event] = None) -> Dict[str, dict]:
     """영상마다 슬랙(컨테이너가 참조하지 않는 영역) 유무·크기. 엔진 `--detect-slack`(추출 없음)을
-    서브프로세스로 돌리고 `SLACK_JSON …` 줄을 읽는다. 못 읽은 파일은 has_slack=False, error."""
+    서브프로세스로 돌리고 `SLACK_JSON …` 줄을 읽는다. 못 읽은 파일은 has_slack=False, error.
+    cancel_event가 서면 자식 프로세스를 끝내고 CancelledError(리뷰 #43: 예전엔 취소를 눌러도
+    끝날 때까지 GUI가 멈췄다)."""
     out: Dict[str, dict] = {}
     if not paths:
         return out
     argv = build_subprocess_argv(["--detect-slack", *paths])
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout_sec)
-        stdout = proc.stdout or ""
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {p: {"path": p, "has_slack": False, "error": str(exc)} for p in paths}
+    deadline = time.monotonic() + timeout_sec
+    stdout = ""
+    try:
+        while True:
+            try:
+                stdout, _stderr = proc.communicate(timeout=0.3)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.kill()
+                    proc.communicate()
+                    raise CancelledError("슬랙 확인이 취소되었습니다.")
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    proc.communicate()
+                    return {p: {"path": p, "has_slack": False, "error": "슬랙 확인 시간 초과"} for p in paths}
+    except CancelledError:
+        raise
     except (OSError, subprocess.SubprocessError) as exc:
         return {p: {"path": p, "has_slack": False, "error": str(exc)} for p in paths}
+    stdout = stdout or ""
     for line in stdout.splitlines():
         if not line.startswith("SLACK_JSON "):
             continue
