@@ -591,7 +591,7 @@ def audit_mp4(path, source, track, frames, cancel):
                 b = box_at(data, p, len(data)); boxes.append(b); p = b.end
             if [b.kind for b in boxes] != [b'ftyp', b'mdat', b'moov']:
                 raise InvalidMP4('unexpected recovered container layout')
-            tracks, _, errors = parse_moov(data, boxes[2])
+            tracks, _, errors = parse_moov(data, boxes[2], lambda: _check(cancel))
             if errors or len(tracks) != 1 or tracks[0].handler != b'vide':
                 raise InvalidMP4('recovered container must have exactly one video track')
             actual = tracks[0]
@@ -791,7 +791,7 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 rmoov = next((b for b in rb if b.kind == b'moov'), None)
                 if rmoov is None:
                     raise ValueError('참조 MP4에 유효한 moov가 없습니다.')
-                reference_tracks, reference_defaults, _ = parse_moov(ref, rmoov)
+                reference_tracks, reference_defaults, _ = parse_moov(ref, rmoov, lambda: _check(cancel))
                 if any(b.kind == b'moof' for b in rb):
                     # A fragmented reference has an empty stts in its init
                     # moov. Derive only its actual cadence before discarding
@@ -814,7 +814,8 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
             moov = next((b for b in boxes if b.kind == b'moov'), None)
             tracks, defaults = [], {}
             if moov:
-                tracks, defaults, errors = parse_moov(buf, moov); manifest['diagnostics'].extend(errors)
+                tracks, defaults, errors = parse_moov(buf, moov, lambda: _check(cancel))
+                manifest['diagnostics'].extend(errors)
             elif reference_tracks:
                 tracks, defaults = reference_tracks, reference_defaults
             if tracks and any(b.kind == b'moof' for b in boxes):

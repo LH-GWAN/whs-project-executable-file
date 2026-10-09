@@ -56,9 +56,32 @@ def box_at(data, pos, end, *, truncated_mdat=False):
     return Box(kind, pos, pos + header, min(stop, end), truncated)
 
 
-def children(data, start, end):
+def checked_range(count, check):
+    """Keep large declared tables interruptible without checking every integer."""
+    check()
+    for i in range(count):
+        if i and i % 1024 == 0:
+            check()
+        yield i
+
+
+def scanned_matches(pattern, data, start, end, check):
+    """Scan four-byte box markers in bounded windows, including split markers."""
+    for begin in range(start, end, 1024 * 1024):
+        check()
+        stop = min(end, begin + 1024 * 1024)
+        for match in pattern.finditer(data, begin, min(end, stop + 3)):
+            if match.start() >= stop:
+                break
+            yield match
+
+
+def children(data, start, end, check=lambda: None):
     result = []
+    check()
     while start < end:
+        if len(result) % 1024 == 0:
+            check()
         if len(result) >= MAX_BOXES:
             raise InvalidMP4('too many boxes')
         b = box_at(data, start, end)
@@ -67,8 +90,8 @@ def children(data, start, end):
     return result
 
 
-def child(data, parent, kind):
-    found = [b for b in children(data, parent.payload, parent.end) if b.kind == kind]
+def child(data, parent, kind, check=lambda: None):
+    found = [b for b in children(data, parent.payload, parent.end, check) if b.kind == kind]
     if len(found) != 1:
         raise InvalidMP4('missing or duplicate ' + kind.decode('ascii', 'replace'))
     return found[0]
@@ -155,8 +178,8 @@ class Track:
     durations: list[int] = field(default_factory=list)
 
 
-def sample_sizes(data, stbl):
-    sizes = [b for b in children(data, stbl.payload, stbl.end) if b.kind in (b'stsz', b'stz2')]
+def sample_sizes(data, stbl, check=lambda: None):
+    sizes = [b for b in children(data, stbl.payload, stbl.end, check) if b.kind in (b'stsz', b'stz2')]
     if len(sizes) != 1:
         raise InvalidMP4('missing/duplicate sample sizes')
     sz = sizes[0]; p = sz.payload
@@ -169,23 +192,24 @@ def sample_sizes(data, stbl):
         fixed = u32(data, p + 4)
         if p + 12 + (0 if fixed else count * 4) != sz.end:
             raise InvalidMP4('invalid sample size extent')
-        return [fixed] * count if fixed else [u32(data, p + 12 + i * 4) for i in range(count)]
+        return [fixed if fixed else u32(data, p + 12 + i * 4) for i in checked_range(count, check)]
     width = data[p + 7]
     if (bytes(data[p+4:p+7]) != bytes(3) or width not in (4, 8, 16)
             or p + 12 + (count * width + 7) // 8 != sz.end):
         raise InvalidMP4('invalid compact sample sizes')
     if width == 4:
-        return [(data[p+12+i//2] >> (4 if i % 2 == 0 else 0)) & 15 for i in range(count)]
-    return [int.from_bytes(data[p+12+i*(width//8):p+12+(i+1)*(width//8)], 'big') for i in range(count)]
+        return [(data[p+12+i//2] >> (4 if i % 2 == 0 else 0)) & 15 for i in checked_range(count, check)]
+    return [int.from_bytes(data[p+12+i*(width//8):p+12+(i+1)*(width//8)], 'big')
+            for i in checked_range(count, check)]
 
 
-def parse_track(data, trak):
-    tkhd = child(data, trak, b'tkhd')
+def parse_track(data, trak, check=lambda: None):
+    tkhd = child(data, trak, b'tkhd', check)
     p = tkhd.payload + (20 if data[tkhd.payload] == 1 else 12)
     if p + 4 > tkhd.end:
         raise InvalidMP4('short tkhd')
-    mdia = child(data, trak, b'mdia')
-    hdlr, mdhd = child(data, mdia, b'hdlr'), child(data, mdia, b'mdhd')
+    mdia = child(data, trak, b'mdia', check)
+    hdlr, mdhd = child(data, mdia, b'hdlr', check), child(data, mdia, b'mdhd', check)
     if hdlr.payload + 12 > hdlr.end:
         raise InvalidMP4('short handler')
     t = Track(u32(data, p), bytes(data[hdlr.payload + 8:hdlr.payload + 12]))
@@ -195,18 +219,18 @@ def parse_track(data, trak):
     t.timescale = u32(data, p)
     if not 0 < t.timescale <= 1_000_000_000:
         raise InvalidMP4('invalid timescale')
-    minf = child(data, mdia, b'minf')
+    minf = child(data, mdia, b'minf', check)
     # A reference URL must never cause the recovery process to read another file.
-    dinf = child(data, minf, b'dinf'); dref = child(data, dinf, b'dref')
+    dinf = child(data, minf, b'dinf', check); dref = child(data, dinf, b'dref', check)
     p, count = dref.payload + 8, u32(data, dref.payload + 4)
-    refs = children(data, p, dref.end)
+    refs = children(data, p, dref.end, check)
     if count != len(refs) or not refs or any(
             r.kind not in (b'url ', b'alis') or r.end - r.payload != 4 or u32(data, r.payload) != 1 for r in refs):
         raise InvalidMP4('external or unsupported data reference')
-    stbl = child(data, minf, b'stbl'); stsd = child(data, stbl, b'stsd')
+    stbl = child(data, minf, b'stbl', check); stsd = child(data, stbl, b'stsd', check)
     if stsd.payload + 8 > stsd.end or u32(data, stsd.payload + 4) != 1:
         raise InvalidMP4('multiple/invalid sample descriptions')
-    descs = children(data, stsd.payload + 8, stsd.end)
+    descs = children(data, stsd.payload + 8, stsd.end, check)
     if len(descs) != 1:
         raise InvalidMP4('invalid sample description')
     desc = descs[0]
@@ -218,7 +242,7 @@ def parse_track(data, trak):
         if not t.codec or desc.payload + 78 > desc.end:
             raise InvalidMP4('unsupported video codec/entry')
         t.width, t.height = struct.unpack_from('>HH', data, desc.payload + 24)
-        cc = [b for b in children(data, desc.payload + 78, desc.end)
+        cc = [b for b in children(data, desc.payload + 78, desc.end, check)
               if b.kind == (b'avcC' if t.codec == 'h264' else b'hvcC')]
         if len(cc) != 1:
             raise InvalidMP4('missing codec configuration')
@@ -227,15 +251,16 @@ def parse_track(data, trak):
     if t.handler not in (b'vide', b'text', b'sbtl', b'subt', b'meta'):
         return t
     try:
-        sizes = sample_sizes(data, stbl); count = len(sizes)
-        stsc = child(data, stbl, b'stsc'); p, n = table(data, stsc, 12)
-        mapping = [struct.unpack_from('>III', data, p + i * 12) for i in range(n)]
-        offsets = [b for b in children(data, stbl.payload, stbl.end) if b.kind in (b'stco', b'co64')]
+        sizes = sample_sizes(data, stbl, check); count = len(sizes)
+        stsc = child(data, stbl, b'stsc', check); p, n = table(data, stsc, 12)
+        mapping = [struct.unpack_from('>III', data, p + i * 12) for i in checked_range(n, check)]
+        offsets = [b for b in children(data, stbl.payload, stbl.end, check) if b.kind in (b'stco', b'co64')]
         if len(offsets) != 1:
             raise InvalidMP4('missing/duplicate chunk offsets')
         off = offsets[0]; width = 4 if off.kind == b'stco' else 8
         p, n = table(data, off, width)
-        chunks = [int.from_bytes(data[p + i * width:p + (i + 1) * width], 'big') for i in range(n)]
+        chunks = [int.from_bytes(data[p + i * width:p + (i + 1) * width], 'big')
+                  for i in checked_range(n, check)]
         if count and (not mapping or mapping[0][0] != 1 or not chunks):
             raise InvalidMP4('missing chunk mapping')
         if any(a[0] >= b[0] for a, b in zip(mapping, mapping[1:])) or any(
@@ -245,6 +270,8 @@ def parse_track(data, trak):
         i, m = 0, 0
         previous_end = -1
         for c, pos in enumerate(chunks, 1):
+            if c % 1024 == 1:
+                check()
             while m + 1 < len(mapping) and mapping[m + 1][0] <= c:
                 m += 1
             if pos < previous_end:
@@ -253,23 +280,25 @@ def parse_track(data, trak):
             if i + number > count:
                 raise InvalidMP4('sample count mismatch')
             for size in sizes[i:i + number]:
+                if i % 1024 == 0:
+                    check()
                 if not 0 < size <= 64 * 1024 * 1024:
                     raise InvalidMP4('invalid media sample size')
                 t.samples.append((pos, size, i + 1)); pos += size; i += 1
             previous_end = pos
         if i != count:
             raise InvalidMP4('incomplete sample mapping')
-        stts = child(data, stbl, b'stts'); p, n = table(data, stts, 8)
-        runs = [struct.unpack_from('>II', data, p + i * 8) for i in range(n)]
+        stts = child(data, stbl, b'stts', check); p, n = table(data, stts, 8)
+        runs = [struct.unpack_from('>II', data, p + i * 8) for i in checked_range(n, check)]
         if sum(a for a, _ in runs) != count or any(not a or not b for a, b in runs):
             raise InvalidMP4('invalid sample durations')
         if count:
             t.fps = Fraction(count * t.timescale, sum(a * b for a, b in runs))
         ticks = 0
         for number, duration in runs:
-            for _ in range(number):
+            for _ in checked_range(number, check):
                 t.decode_times.append(ticks); t.durations.append(duration); ticks += duration
-        ctts = [b for b in children(data, stbl.payload, stbl.end) if b.kind == b'ctts']
+        ctts = [b for b in children(data, stbl.payload, stbl.end, check) if b.kind == b'ctts']
         if ctts:
             ct = ctts[0]; p = ct.payload
             if len(ctts) != 1 or p + 8 > ct.end or data[p] not in (0, 1):
@@ -277,7 +306,7 @@ def parse_track(data, trak):
             n = u32(data, p + 4)
             if n > MAX_TABLE or p + 8 + n * 8 != ct.end:
                 raise InvalidMP4('invalid composition table extent')
-            for i in range(n):
+            for i in checked_range(n, check):
                 first = p + 8 + i * 8
                 repeat = u32(data, first)
                 value = int.from_bytes(data[first + 4:first + 8], 'big', signed=data[p] == 1)
@@ -291,10 +320,10 @@ def parse_track(data, trak):
     return t
 
 
-def parse_moov(data, box):
+def parse_moov(data, box, check=lambda: None):
     if box.end - box.start > MAX_MOOV:
         raise InvalidMP4('moov exceeds recovery limit')
-    parts = children(data, box.payload, box.end)
+    parts = children(data, box.payload, box.end, check)
     mvhd = [b for b in parts if b.kind == b'mvhd']
     tracks, errors = [], []
     if len(mvhd) != 1 or mvhd[0].end - mvhd[0].payload < 96:
@@ -302,10 +331,11 @@ def parse_moov(data, box):
         # playback rate. Intact, independently checked tracks can survive it.
         errors.append('invalid movie header; independently validated track tables used')
     for b in parts:
+        check()
         if b.kind != b'trak':
             continue
         try:
-            tracks.append(parse_track(data, b))
+            tracks.append(parse_track(data, b, check))
         except (InvalidMP4, struct.error, IndexError) as exc:
             errors.append(str(exc))
     if not tracks or len(tracks) > 32 or len({t.id for t in tracks}) != len(tracks):
@@ -313,7 +343,7 @@ def parse_moov(data, box):
     defaults = {}
     for b in parts:
         if b.kind == b'mvex':
-            for tr in children(data, b.payload, b.end):
+            for tr in children(data, b.payload, b.end, check):
                 if tr.kind == b'trex' and tr.end - tr.payload == 24:
                     tid, desc, duration, size, flags = struct.unpack_from('>IIIII', data, tr.payload + 4)
                     if desc == 1:
@@ -324,8 +354,8 @@ def parse_moov(data, box):
 SIGNATURE = re.compile(rb'ftyp|moov|moof|mdat')
 
 
-def valid_fragment(data, box):
-    parts = children(data, box.payload, box.end)
+def valid_fragment(data, box, check=lambda: None):
+    parts = children(data, box.payload, box.end, check)
     return (any(x.kind == b'mfhd' and x.end-x.payload == 8 for x in parts)
             and any(x.kind == b'traf' for x in parts))
 
@@ -347,9 +377,9 @@ def discover(data, cancel_check=lambda: None):
                               b'sidx', b'mfra', b'pdin', b'uuid', b'prft', b'emsg', b'styp'):
                 raise InvalidMP4('unknown top-level box in recovery')
             if b.kind == b'moov':
-                parse_moov(data, b)
+                parse_moov(data, b, cancel_check)
             elif b.kind == b'moof':
-                if not valid_fragment(data, b):
+                if not valid_fragment(data, b, cancel_check):
                     raise InvalidMP4('invalid fragment header')
             elif b.kind == b'ftyp' and (b.end - b.payload < 8 or (b.end - b.payload) % 4):
                 raise InvalidMP4('invalid ftyp')
@@ -357,11 +387,11 @@ def discover(data, cancel_check=lambda: None):
                 # A corrupted oversized mdat must not hide the source's intact
                 # moov. Accept only a complete movie whose live sample extent
                 # lies before it, then use that independently checked boundary.
-                for match in re.compile(b'moov').finditer(data, b.payload, b.end):
+                for match in scanned_matches(re.compile(b'moov'), data, b.payload, b.end, cancel_check):
                     cancel_check()
                     try:
                         candidate = box_at(data, match.start() - 4, end)
-                        ts, _, _ = parse_moov(data, candidate)
+                        ts, _, _ = parse_moov(data, candidate, cancel_check)
                         video = [t for t in ts if t.handler == b'vide' and t.samples]
                         if video and all(b.payload <= a and a + n <= candidate.start
                                          for t in video for a, n, _ in t.samples):
@@ -378,14 +408,14 @@ def discover(data, cancel_check=lambda: None):
                 broken = box_at(data, p, end)
                 anchored = any(x.end == p for x in boxes)
                 if anchored and broken.kind in (b'moof', bytes(4)) and 16 <= broken.end-p <= 1024*1024:
-                    if valid_fragment(data, broken):
+                    if valid_fragment(data, broken, cancel_check):
                         boxes.append(Box(b'moof', broken.start, broken.payload, broken.end))
                         gaps.append((p+4, p+8)); p = broken.end; continue
                     following = box_at(data, broken.end, end, truncated_mdat=True)
                     if following.kind == b'mdat':
                         next_box = box_at(data, following.end, end) if following.end < end else None
                         if (next_box is None or next_box.kind in (b'free', b'skip')
-                                or next_box.kind == b'moof' and valid_fragment(data, next_box)):
+                                or next_box.kind == b'moof' and valid_fragment(data, next_box, cancel_check)):
                             boxes.append(following); gaps.append((p, broken.end)); p = following.end; continue
             except (InvalidMP4, struct.error, IndexError):
                 pass
@@ -395,9 +425,9 @@ def discover(data, cancel_check=lambda: None):
                 try:
                     b = box_at(data, q, end, truncated_mdat=True)
                     if b.kind == b'moov':
-                        parse_moov(data, b)
+                        parse_moov(data, b, cancel_check)
                     elif b.kind == b'moof':
-                        if not valid_fragment(data, b):
+                        if not valid_fragment(data, b, cancel_check):
                             continue
                     elif b.kind == b'ftyp':
                         if b.end - b.payload < 8 or (b.end - b.payload) % 4:
@@ -411,7 +441,7 @@ def discover(data, cancel_check=lambda: None):
             q = found if found is not None else min(end, p + 1024 * 1024 - 8)
             gaps.append((p, q)); p = q
     ftyps, embedded = [], []
-    for match in re.finditer(b'ftyp', data):
+    for match in scanned_matches(re.compile(b'ftyp'), data, 0, end, cancel_check):
         cancel_check()
         try:
             b = box_at(data, match.start() - 4, end)
@@ -440,10 +470,10 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
     broken_tracks = set()
     for moof in (b for b in boxes if b.kind == b'moof'):
         check(); previous_end = moof.start
-        for traf in (b for b in children(data, moof.payload, moof.end) if b.kind == b'traf'):
+        for traf in (b for b in children(data, moof.payload, moof.end, check) if b.kind == b'traf'):
             tid = None
             try:
-                tfhd = child(data, traf, b'tfhd'); p = tfhd.payload
+                tfhd = child(data, traf, b'tfhd', check); p = tfhd.payload
                 if p + 8 > tfhd.end or data[p] != 0:
                     raise InvalidMP4('invalid tfhd')
                 flags, tid = u32(data, p) & 0xFFFFFF, u32(data, p + 4); p += 8
@@ -469,7 +499,7 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                 number = sample_numbers.get(tid, 0)
                 pending_composition, pending_times, pending_durations, kept_durations = [], [], [], Counter()
                 excluded = 0
-                timing = [b for b in children(data, traf.payload, traf.end) if b.kind == b'tfdt']
+                timing = [b for b in children(data, traf.payload, traf.end, check) if b.kind == b'tfdt']
                 dts = None
                 if timing:
                     td = timing[0]
@@ -478,7 +508,8 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                             or data[td.payload] not in (0, 1)):
                         raise InvalidMP4('invalid fragment decode time')
                     dts = int.from_bytes(data[td.payload + 4:td.end], 'big')
-                for run in (b for b in children(data, traf.payload, traf.end) if b.kind == b'trun'):
+                for run in (b for b in children(data, traf.payload, traf.end, check) if b.kind == b'trun'):
+                    check()
                     p = run.payload
                     if p + 8 > run.end or data[p] not in (0, 1):
                         raise InvalidMP4('invalid trun')
@@ -489,7 +520,10 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                         cursor = base + struct.unpack_from('>i', data, p)[0]; p += 4
                     if rf & 4:
                         p += 4
-                    for _ in range(count):
+                    width = 4 * sum(bool(rf & flag) for flag in (0x100, 0x200, 0x400, 0x800))
+                    if p + count * width != run.end:
+                        raise InvalidMP4('invalid trun extent')
+                    for _ in checked_range(count, check):
                         sd, ss = duration, size
                         if rf & 0x100:
                             sd = u32(data, p); p += 4
