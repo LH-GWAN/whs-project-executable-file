@@ -54,6 +54,7 @@ class RecoveryDialog(QDialog):
         self._notice.setText(
             ('MP4/fMP4의 남아 있는 H.264/HEVC 영상과 GPS·G센서를 회수합니다.\n'
              'moov가 사라졌으면 동일 기기·코덱·해상도·FPS의 정상 MP4를 지정하세요.\n'
+             'MP4 복원은 전체 180초 이내로 실행하며 취소할 수 있습니다.\n'
              '전체 재생 검증에는 PATH에 FFmpeg가 필요합니다. 없으면 미검증 후보로 저장합니다.') if mp4 else
             ('AVI의 남아 있는 MJPEG/H.264 영상과 NMEA GPS를 회수합니다.\n'
              '헤더가 소실됐으면 동일 기기·해상도·코덱·FPS·채널 순서의 정상 AVI를 지정하세요.\n'

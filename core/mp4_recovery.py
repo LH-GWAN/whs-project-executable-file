@@ -31,11 +31,46 @@ from core.mp4_structure import (InvalidMP4, MAX_TABLE, Track, box_at, discover,
 
 MAX_FILE = 16 * 1024**3
 MAX_NAL = 32 * 1024**2
+DEFAULT_TIMEOUT = 180
 TIMING_WARNING = ('회수된 프레임을 빈 구간 없이 이어 붙인 검토용 영상입니다. 원래 시각·길이, '
                   'GPS 동기화, 사고 시각·급가감속 판정에 사용하지 마세요. GPS·G센서는 파일 '
                   '전체에서 별도로 회수하며 슬랙/과거 녹화가 포함될 수 있습니다.')
 NMEA = re.compile(rb'(?<![A-Za-z])\$?[A-Z]{2}(?:RMC|GGA),[\x20-\x7e]{10,180}?\*[0-9A-Fa-f]{2}')
 SENSOR = re.compile(rb'gsensor[a-z]*,-?\d{1,8},\d{1,8},-?\d{1,8},-?\d{1,8},-?\d{1,8}(?=[;\r\n\x00])', re.I)
+
+
+class RecoveryTimedOut(TimeoutError):
+    pass
+
+
+class RecoveryDeadline:
+    """A shared wall-clock budget, including hashing, parsing and all children."""
+    def __init__(self, cancel, seconds):
+        self.cancel = cancel
+        self.deadline = time.monotonic() + seconds
+
+    def is_set(self):
+        if self.cancel is not None and self.cancel.is_set():
+            return True
+        if self.remaining <= 0:
+            raise RecoveryTimedOut('MP4 복원 전체 시간 제한에 도달했습니다. 임시 결과를 정리했습니다.')
+        return False
+
+    @property
+    def remaining(self):
+        return self.deadline - time.monotonic()
+
+
+def bounded_matches(pattern, buf, check):
+    """Check cancellation/deadline even when a huge region has no matches."""
+    previous_end = 0
+    for begin in range(0, len(buf), 1024*1024):
+        check(); end = min(len(buf), begin+1024*1024)
+        for match in pattern.finditer(buf, max(begin, previous_end), min(len(buf), end+256)):
+            if match.start() >= end:
+                break
+            previous_end = match.end()
+            yield match
 
 
 class Bits:
@@ -241,6 +276,7 @@ def indexed_frames(buf, track, limit, media, check, stats, forbidden=()):
             p, end = offset, offset + size; frame = Frame(offset, size, sample)
             starts = 0
             while p < end:
+                check()
                 if p + track.length_size > end:
                     raise InvalidMP4('incomplete sample NAL length')
                 n = int.from_bytes(buf[p:p + track.length_size], 'big'); p += track.length_size
@@ -289,7 +325,11 @@ RAW_MARKER = re.compile(rb'\x00[\x00-\xff]{3}[\x01\x21\x41\x61\x05\x25\x45\x65\x
 
 
 def carved_frames(buf, track, media, check, stats):
-    """AVC length-prefixed NALs only; PCM/text gaps do not become video bytes."""
+    """Length-prefixed NALs only; PCM/text gaps do not become video bytes."""
+    if track.codec == 'hevc':
+        from core.hevc_recovery import carved_hevc_frames
+        yield from carved_hevc_frames(buf, track, media, check, stats)
+        return
     if track.codec != 'h264' or track.length_size != 4:
         stats['withheld'] = 'moov 없는 NAL 카빙은 4바이트 길이 H.264만 지원합니다.'
         return
@@ -383,7 +423,7 @@ def carve_metadata(buf, work, cancel, boxes=(), limit=None, tracks=()):
         w = csv.writer(gf)
         w.writerow(['source_offset', 'gps_date_utc', 'gps_time_utc', 'latitude', 'longitude',
                     'speed_kmh', 'scope', 'raw_nmea', 'source_region', 'idas_outlier_reason'])
-        for m in NMEA.finditer(buf):
+        for m in bounded_matches(NMEA, buf, lambda: _check(cancel)):
             _check(cancel); raw = m.group().decode('ascii'); rec = try_parse_nmea(raw)
             if (not rec or rec['checksum_ok'] is not True or not rec['status_valid'] or rec.get('mode') == 'N'
                     or rec['parse_warnings'] or rec['lat'] is None or rec['lon'] is None
@@ -407,7 +447,7 @@ def carve_metadata(buf, work, cancel, boxes=(), limit=None, tracks=()):
         w = csv.writer(sf)
         w.writerow(['source_offset', 'x_raw', 'y_raw', 'z_raw', 'scale', 'x_g', 'y_g', 'z_g',
                     'scope', 'raw_sensor', 'source_region'])
-        for m in SENSOR.finditer(buf):
+        for m in bounded_matches(SENSOR, buf, lambda: _check(cancel)):
             _check(cancel); raw = m.group().decode('ascii'); kind, rec = classify_segment(raw)
             values = [rec.get(k) for k in ('x_g', 'y_g', 'z_g')]
             if kind != 'gsensor' or not rec.get('scale') or not all(
@@ -422,6 +462,9 @@ def carve_metadata(buf, work, cancel, boxes=(), limit=None, tracks=()):
 
 def run_command(args, cancel, timeout=120, *, capture_stdout=False):
     """No shell/network, cancellable, bounded log/progress files on disk."""
+    _check(cancel)
+    if isinstance(cancel, RecoveryDeadline):
+        timeout = min(timeout, cancel.remaining)
     with tempfile.TemporaryFile() as log, tempfile.TemporaryFile() as output:
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output, stderr=log)
         start = time.monotonic(); reason = ''
@@ -695,7 +738,8 @@ def publish_result(work, output, cancel):
         raise
 
 
-def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, *, fps=None):
+def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, *, fps=None,
+                timeout=DEFAULT_TIMEOUT):
     """New result directory, verified evidence copy, reference CONFIGURATION ONLY.
 
     Compressed source pictures are remuxed without encoding, sound, or GPS. The
@@ -713,6 +757,10 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
     requested_fps = Fraction(str(fps)) if fps is not None else None
     if requested_fps is not None and not 1 <= requested_fps <= 240:
         raise ValueError('FPS는 1~240 범위로 지정하세요.')
+    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
+        raise ValueError('전체 복원 시간 제한은 0초 초과, 3600초 이하여야 합니다.')
+    started = time.monotonic()
+    cancel = RecoveryDeadline(cancel, timeout)
     _check(cancel); output.parent.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='.mp4-recovery-', dir=output.parent))
     report = progress or (lambda _: None)
@@ -731,6 +779,8 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
             verification_tools=verification_tools(cancel),
             reference=None, videos=[], jpeg_stills=0, diagnostics=[], video_boundary_verified=False,
             video_withheld_reason=None)
+        manifest['execution_limits'] = dict(total_timeout_seconds=timeout, command_timeout_seconds=120,
+            max_decode_attempts_per_track=256, metadata_scan_chunk_bytes=1024*1024)
         reference_tracks, reference_defaults = [], {}
         if reference:
             if not 8 <= reference.stat().st_size <= MAX_FILE:
@@ -742,6 +792,12 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 if rmoov is None:
                     raise ValueError('참조 MP4에 유효한 moov가 없습니다.')
                 reference_tracks, reference_defaults, _ = parse_moov(ref, rmoov)
+                if any(b.kind == b'moof' for b in rb):
+                    # A fragmented reference has an empty stts in its init
+                    # moov. Derive only its actual cadence before discarding
+                    # every reference position, picture and timestamp.
+                    fragment_samples(ref, rb, reference_tracks, reference_defaults,
+                                     lambda: _check(cancel))
                 reference_tracks = [t for t in reference_tracks if t.handler == b'vide']
                 if not reference_tracks:
                     raise ValueError('참조 영상에 지원하는 H.264/HEVC 영상 트랙이 없습니다.')
@@ -790,11 +846,13 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 videos = []
                 manifest['video_withheld_reason'] = '현재 영상의 본문 경계를 확인할 수 없어 슬랙 혼입 방지를 위해 영상 생성을 보류했습니다.'
                 manifest['video_scan_range'] = dict(end=limit, basis='unverified', media_ranges=[])
-            if indexed and reference_tracks:
+            if reference_tracks:
                 for t in videos:
                     r = next((r for r in reference_tracks if r.id == t.id), None)
                     if r and (r.codec, r.width, r.height, r.parameters) != (t.codec, t.width, t.height, t.parameters):
                         raise ValueError('참조 코덱 설정이 손상 파일의 살아 있는 설정과 다릅니다.')
+                    if r:
+                        t.fps = t.fps or r.fps
             all_rows, nal_rows = [], []
             for t in videos:
                 _check(cancel); stats = dict(damaged_samples=0, waiting_for_idr=0, prediction_breaks=0)
@@ -818,11 +876,30 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 iterator = indexed_frames(buf, t, limit, media, lambda: _check(cancel), stats, forbidden) if t.samples else (
                     carved_frames(buf, t, media, lambda: _check(cancel), stats))
                 frames = []
+                orphaned = []
                 try:
                     for frame in iterator:
                         if len(frames) >= MAX_TABLE:
                             raise ValueError('프레임 회수 수가 안전 한도를 초과했습니다.')
                         frames.append(frame)
+                    # A missing moof/trun does not imply that its mdat pictures
+                    # are gone. Only a single verified video channel may carve
+                    # media with no declarations; never scan free/slack bytes.
+                    if t.samples and len(videos) == 1:
+                        starts = sorted(a for a, _, _ in t.samples)
+                        for a, b in media:
+                            j = bisect_right(starts, a-1)
+                            if j == len(starts) or starts[j] >= b:
+                                stop = min([b]+[x.start for x in boxes
+                                    if x.kind == b'ftyp' and a <= x.start < b])
+                                if a < stop:
+                                    orphaned.append((a, stop))
+                        if orphaned:
+                            for frame in carved_frames(buf, t, orphaned, lambda: _check(cancel), stats):
+                                if len(frames) >= MAX_TABLE:
+                                    raise ValueError('프레임 회수 수가 안전 한도를 초과했습니다.')
+                                frames.append(frame)
+                        frames.sort(key=lambda f: f.offset)
                 except (InvalidMP4, ValueError) as exc:
                     manifest['diagnostics'].append(f'track {t.id}: {exc}'); frames = []
                 if not frames:
@@ -832,7 +909,12 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 report(f'{t.id}번 영상: {len(frames)}개 후보 MP4 생성·전체 디코딩 검증 중...')
                 frames, video = export_video(work, buf, t, frames, cancel, report)
                 video['exclusions'] = stats; video['width'], video['height'] = t.width, t.height
-                video['recovery_method'] = 'source_sample_tables' if t.samples else 'bounded_avc_nal_carving'
+                raw_method = 'bounded_hevc_nal_carving' if t.codec == 'hevc' else 'bounded_avc_nal_carving'
+                mixed = bool(t.samples and any(f.sample == 0 for f in frames))
+                video['recovery_method'] = ('hybrid_sample_tables_and_bounded_nal_carving' if mixed else
+                    'source_sample_tables' if t.samples else raw_method)
+                video['unindexed_media_ranges'] = orphaned
+                video['carved_frames'] = sum(f.sample == 0 for f in frames)
                 video['source_sample_number_basis'] = ('surviving_fragment_declarations'
                     if t.samples and any(b.kind == b'moof' for b in boxes) else 'source_stbl_ordinal'
                     if t.samples else 'unknown')
@@ -844,8 +926,10 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                     dts = t.decode_times[number] if 0 <= number < len(t.decode_times) else None
                     duration = t.durations[number] if 0 <= number < len(t.durations) else None
                     pts = dts + (t.composition[number] if number < len(t.composition) else 0) if dts is not None else None
-                    all_rows.append([t.id, i, frame.offset, frame.size, frame.sample, video['recovery_method'],
-                        video['source_sample_number_basis'], dts, pts, duration, t.timescale if dts is not None else None])
+                    all_rows.append([t.id, i, frame.offset, frame.size, frame.sample,
+                        'source_sample_tables' if frame.sample else raw_method,
+                        video['source_sample_number_basis'] if frame.sample else 'unknown',
+                        dts, pts, duration, t.timescale if dts is not None else None])
                     for p, n in frame.nals:
                         nal_rows.append([t.id, i, p, n])
             report('체크섬이 유효한 GPS 및 G센서 별도 회수 중...')
@@ -892,6 +976,7 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
             'idas_outlier_reason이 있는 GPS는 이상치입니다. 모든 회수 메타데이터를 지도·통계·위험운전 판정에 '
             '자동 사용하지 않습니다. GGA의 날짜는 미상으로 남깁니다.\n' + (manifest['video_withheld_reason'] or ''), encoding='utf-8')
         manifest['artifact_sha256']['READ_ME.txt'] = _hash(work/'READ_ME.txt', cancel)
+        manifest['elapsed_seconds'] = round(time.monotonic()-started, 3)
         (work / 'recovery.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
         for name, expected in manifest['artifact_sha256'].items():
             if _hash(work/name, cancel) != expected:
@@ -913,8 +998,14 @@ def main():
     p.add_argument('source'); p.add_argument('output', help='존재하지 않는 새 결과 폴더')
     p.add_argument('--reference', help='같은 기기/설정의 정상 MP4 (코덱 설정만 사용)')
     p.add_argument('--fps', help='실제 촬영 FPS를 아는 경우만 지정 (예: 30000/1001)')
+    p.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT,
+                   help='전체 복원 시간 제한(초), 기본 180초. 최대 3600초')
     args = p.parse_args()
-    result = recover_mp4(args.source, args.output, args.reference, progress=print, fps=args.fps)
+    try:
+        result = recover_mp4(args.source, args.output, args.reference, progress=print, fps=args.fps,
+                             timeout=args.timeout)
+    except (RecoveryTimedOut, RecoveryCancelled) as exc:
+        p.exit(2, str(exc)+'\n')
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

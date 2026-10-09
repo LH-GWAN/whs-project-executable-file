@@ -324,6 +324,12 @@ def parse_moov(data, box):
 SIGNATURE = re.compile(rb'ftyp|moov|moof|mdat')
 
 
+def valid_fragment(data, box):
+    parts = children(data, box.payload, box.end)
+    return (any(x.kind == b'mfhd' and x.end-x.payload == 8 for x in parts)
+            and any(x.kind == b'traf' for x in parts))
+
+
 def discover(data, cancel_check=lambda: None):
     """Walk intact extents, resync validated boxes only through damaged gaps.
 
@@ -343,9 +349,7 @@ def discover(data, cancel_check=lambda: None):
             if b.kind == b'moov':
                 parse_moov(data, b)
             elif b.kind == b'moof':
-                parts = children(data, b.payload, b.end)
-                if not any(x.kind == b'mfhd' and x.end - x.payload == 8 for x in parts) or not any(
-                        x.kind == b'traf' for x in parts):
+                if not valid_fragment(data, b):
                     raise InvalidMP4('invalid fragment header')
             elif b.kind == b'ftyp' and (b.end - b.payload < 8 or (b.end - b.payload) % 4):
                 raise InvalidMP4('invalid ftyp')
@@ -367,6 +371,24 @@ def discover(data, cancel_check=lambda: None):
                         continue
             boxes.append(b); p = b.end
         except (InvalidMP4, struct.error, IndexError):
+            # At a previously established box boundary, a damaged fragment
+            # header can still delimit its following media. Do not accept
+            # arbitrary 'mdat' words encountered in audio/free/slack payloads.
+            try:
+                broken = box_at(data, p, end)
+                anchored = any(x.end == p for x in boxes)
+                if anchored and broken.kind in (b'moof', bytes(4)) and 16 <= broken.end-p <= 1024*1024:
+                    if valid_fragment(data, broken):
+                        boxes.append(Box(b'moof', broken.start, broken.payload, broken.end))
+                        gaps.append((p+4, p+8)); p = broken.end; continue
+                    following = box_at(data, broken.end, end, truncated_mdat=True)
+                    if following.kind == b'mdat':
+                        next_box = box_at(data, following.end, end) if following.end < end else None
+                        if (next_box is None or next_box.kind in (b'free', b'skip')
+                                or next_box.kind == b'moof' and valid_fragment(data, next_box)):
+                            boxes.append(following); gaps.append((p, broken.end)); p = following.end; continue
+            except (InvalidMP4, struct.error, IndexError):
+                pass
             found = None
             for match in SIGNATURE.finditer(data, p + 5, min(end, p + 1024 * 1024)):
                 q = match.start() - 4
@@ -375,9 +397,7 @@ def discover(data, cancel_check=lambda: None):
                     if b.kind == b'moov':
                         parse_moov(data, b)
                     elif b.kind == b'moof':
-                        parts = children(data, b.payload, b.end)
-                        if not any(x.kind == b'mfhd' and x.end - x.payload == 8 for x in parts) or not any(
-                                x.kind == b'traf' for x in parts):
+                        if not valid_fragment(data, b):
                             continue
                     elif b.kind == b'ftyp':
                         if b.end - b.payload < 8 or (b.end - b.payload) % 4:

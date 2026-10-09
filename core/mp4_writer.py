@@ -37,7 +37,7 @@ def composition_offsets(track, frames, tick, scale):
     from core.mp4_recovery import AVC
     avc = AVC(track.parameters)
     # A missing ctts must not invent B-picture display order. Indexed non-B
-    # HEVC uses zero above; raw HEVC is explicitly unsupported by the carver.
+    # HEVC uses zero above; raw HEVC requires zero SPS picture reordering.
     if not avc.sps or any(s['poc'] != 0 or not s['frame_only'] for s in avc.sps.values()):
         raise InvalidMP4('ctts 없는 카빙 MP4는 progressive AVC POC type 0만 지원합니다.')
     result, start = [], 0

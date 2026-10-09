@@ -992,12 +992,15 @@ Home의 **손상 AVI/MP4 복원**에서 **MP4 / fMP4**를 선택한다. 일반 U
   참조의 코덱 설정/FPS/fragment 기본 설정만 사용한다. 참조의 영상·음성·GPS·샘플 표·
   composition 표를 복사하지 않는다. 참조가 없어도 본문에 유효한 SPS/PPS가 살아 있으면
   가능한 H.264를 회수한다. 설정이나 실제 FPS를 확인할 수 없으면 MP4 생성을 보류한다.
-- 샘플 표 없는 본문 카빙은 **4바이트 길이 접두사의 H.264**를 지원한다. 카메라 트랙을
-  구별할 수 없거나 다른 해상도의 SPS가 나타나면 생성을 보류한다. HEVC는 원본의 샘플
-  표 또는 살아 있는 fMP4 fragment 위치 정보가 필요하다. 임의 코덱·독자 암호화 형식·
+- 샘플 표 없는 본문 카빙은 **4바이트 길이 접두사의 H.264 및 표시 순서 재정렬이 없는 HEVC**를
+  지원한다. HEVC는 살아 있는/정상 참조의 VPS/SPS/PPS와 실제 FPS가 필요하며, SPS의 모든
+  하위 계층에서 재정렬 수가 0인지 확인한다. 샘플 표 없는 HEVC B프레임은 보류한다.
+  카메라 트랙을 구별할 수 없거나 다른 코덱 설정이 나타나면 생성을 보류한다. 임의 코덱·독자 암호화 형식·
   삭제된 데이터 전체 복원·음성 복원은 지원하지 않는다.
 - `moof/traf/tfhd/trun/tfdt`를 검증해 분할 MP4의 샘플을 찾는다. 손상된 fragment 뒤의
   정상 `moof`를 다시 탐색하며, 초기화 헤더 소실 시 정상 참조를 사용할 수 있다.
+  단일 영상 트랙의 fragment 표만 소실됐으면 경계가 확인된 `mdat`에서 NAL을 회수하고
+  정상 샘플 표 결과와 결합한다. 카빙한 프레임의 원래 샘플 번호·DTS/PTS는 미상으로 기록한다.
 - 긴 0 채움·잘못된 NAL 길이·손실된 예측 연결을 만나면 다음 독립 IDR부터 재개한다.
   처음 생성한 영상의 검증이 실패하면 독립 GOP별로 재검증해 실패한 GOP를 제외한다.
   실제 영상에서 쓰는 짧은 CABAC/정렬용 0 패딩은 중간 덮어쓰기와 구분한다.
@@ -1020,6 +1023,12 @@ Home의 **손상 AVI/MP4 복원**에서 **MP4 / fMP4**를 선택한다. 일반 U
 원본/참조가 복원 중 변경되면 결과를 폐기하며 취소·오류 시 임시 결과를 정리한다.
 이미 존재하는 결과 폴더는 덮어쓰지 않는다.
 
+MP4 복원 전체에 기본 **180초**의 공유 실행 제한을 적용한다. 해시·사본·탐색·반복 디코딩에
+같은 제한을 사용하며, FFmpeg/FFprobe도 남은 전체 시간을 넘겨 실행하지 않는다. 시간 초과와
+취소 시 실행 중인 자식 프로세스를 종료하고 임시 결과를 정리한다. GPS/G센서 스캔은 1MB마다
+취소·시간을 확인하며 블록 경계에 걸친 문장을 중복 없이 회수한다. CLI `--timeout`으로 실제
+긴 녹화에 필요한 시간만 지정할 수 있다(0초 초과, 최대 3600초).
+
 MP4 생성은 표준 라이브러리로 수행한다. FFmpeg가 PATH에 있으면 **전체 영상 디코딩**을
 수행해 오류 로그가 없고 실제 디코딩 수가 회수 프레임 수와 일치하는지 확인한다.
 `decode_check.status=passed`만 검증된 결과다. FFmpeg가 없으면 `not_run`인 후보로 저장한다.
@@ -1031,6 +1040,7 @@ MP4 생성은 표준 라이브러리로 수행한다. FFmpeg가 PATH에 있으�
 python -m core.mp4_recovery damaged.mp4 recovery_output
 python -m core.mp4_recovery damaged.mp4 recovery_output --reference same_device_normal.mp4
 python -m core.mp4_recovery damaged.mp4 recovery_output --reference same_device_normal.mp4 --fps 30000/1001
+python -m core.mp4_recovery damaged.mp4 recovery_output --timeout 300
 python -m pytest -q tests
 ```
 
@@ -1061,5 +1071,5 @@ REC는 `REC_2025_08_10_09_09_23_F.MP4`다. 위 **11개 조건 모두** MP4 생�
 
 회귀 테스트는 AVC/HEVC, B프레임, fMP4 재탐색, 표·헤더 손상, 슬랙, 다중 트랙, 정상 참조
 내용 혼입 방지, 실제 Qt 재생, GPS/G센서 유효성, 사본 해시와 취소 정리를 검증한다.
-기존 AVI·GUI·사건 처리 테스트를 포함해 Linux/Windows workflow에서 최소 177개 테스트와
+기존 AVI·GUI·사건 처리 테스트를 포함해 Linux/Windows workflow에서 최소 237개 테스트와
 실패·오류·스킵 0개를 요구한다.
