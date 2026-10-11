@@ -598,7 +598,7 @@ def _cut_scenarios():
     return out
 
 
-@pytest.mark.parametrize("name,data", _cut_scenarios())
+@pytest.mark.parametrize("name,data", _cut_scenarios(), ids=[n for n, _ in _cut_scenarios()])   # 바이트를 id로 쓰면 Windows tmp_path 이름이 깨진다
 def test_recording_cut_matches_engine(tmp_path, name, data):
     movi = data.find(b"movi")
     gaps_e: list = []

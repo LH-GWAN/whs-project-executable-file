@@ -517,7 +517,7 @@ def test_command_timeout_comes_from_the_remaining_total_budget():
     assert command_timeout(RecoveryDeadline(None, 600)) > 120
     assert command_timeout(RecoveryDeadline(None, 600), 5) <= 5
     assert command_timeout(None) == 120 and command_timeout(None, 7) == 7
-    assert command_timeout(RecoveryDeadline(None, .05)) <= .05
+    assert command_timeout(RecoveryDeadline(None, .05)) <= .05 + 1e-6   # 부동소수 오차(Windows 타이머)
 
 
 # ---- #90 / #91 ---------------------------------------------------------------

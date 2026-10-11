@@ -146,7 +146,9 @@ def test_save_config_aborts_when_existing_file_unreadable(config_dir):
     from core import appconfig
     assert appconfig.save_config({"map_mode": "offline", "kakao_js_key": "keep-me"})
     path = config_dir / "settings.json"
-    if os.geteuid() == 0:
+    if os.name == "nt":
+        pytest.skip("Windows는 chmod(0)으로 읽기를 막을 수 없다")
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
         pytest.skip("root는 권한 검사를 거치지 않는다")
     original = path.read_bytes()
     os.chmod(path, 0)

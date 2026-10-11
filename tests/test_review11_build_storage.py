@@ -335,7 +335,7 @@ def test_rewrites_old_prefix_paths_even_when_folder_was_moved_earlier(data_base)
     old_prefix = str(data_base / "GPSTracer")
     conn = sqlite3.connect(new / "history.db")
     conn.execute("UPDATE cases SET output_folder = ?, report_pdf_path = ?",
-                 (old_prefix + "/cases/case0", old_prefix + "/cases/case0/report.pdf"))
+                 (os.path.join(old_prefix, "cases", "case0"), os.path.join(old_prefix, "cases", "case0", "report.pdf")))
     conn.commit()
     conn.close()
     assert appinfo.migrate_legacy_app_data() == ""
