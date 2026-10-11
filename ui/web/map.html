@@ -172,15 +172,17 @@ async function addBasemapIfAvailable() {
 
 function buildFeatures(points) {
   // 위험운전 선 색은 Python이 '이 점으로 들어오는 선분' 단위로 정해 준다(p.e).
-  const solid = [], dashed = [], eventLines = [];
+  const solid = [], dashed = [], eventLines = [], interp = [], damaged = [];
 
   let prev = null;
   let sawDropout = false;
+  let sawDamage = false;
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
     if (p.lat === null || p.lon === null) {
       // 이상치(o)는 좌표를 지도에 쓰지 않되 끊김으로도 치지 않는다 - 앞뒤 정상 지점을 실선으로 잇는다.
       if (p.d) sawDropout = true;
+      if (p.r === "damaged") sawDamage = true;   // 손상 구간의 빈 행: 앞뒤를 빨간 점선으로 잇는다
       continue;
     }
     if (prev !== null && (p.s || 0) !== (points[prev].s || 0)) {
@@ -189,12 +191,15 @@ function buildFeatures(points) {
     }
     if (prev !== null) {
       const seg = [[points[prev].lon, points[prev].lat], [p.lon, p.lat]];
-      if (p.e) eventLines.push({ coords: seg, color: p.e });
+      if (p.r === "interpolated" || points[prev].r === "interpolated") interp.push(seg);
+      else if (sawDamage) damaged.push(seg);
+      else if (p.e) eventLines.push({ coords: seg, color: p.e });
       else if (sawDropout) dashed.push(seg);
       else solid.push(seg);
     }
     prev = i;
     sawDropout = false;
+    sawDamage = false;
   }
   const fc = (coords) => ({
     type: "FeatureCollection",
@@ -205,7 +210,7 @@ function buildFeatures(points) {
     features: eventLines.map((l) => ({ type: "Feature", properties: { color: l.color },
       geometry: { type: "LineString", coordinates: l.coords } })),
   };
-  return { solid: fc(solid), dashed: fc(dashed), events: events };
+  return { solid: fc(solid), dashed: fc(dashed), events: events, interp: fc(interp), damaged: fc(damaged) };
 }
 
 function renderLegend(legend) {
@@ -254,6 +259,8 @@ function renderTrack(payload) {
   setData("trk-solid", f.solid);
   setData("trk-dashed", f.dashed);
   setData("trk-events", f.events);
+  setData("trk-interp", f.interp);
+  setData("trk-damaged", f.damaged);
   renderLegend(payload.legend);
   renderEvents(payload.events);
 
@@ -381,7 +388,7 @@ function makeArrowImage(size) {
 
 function addTrackLayers() {
   const empty = { type: "FeatureCollection", features: [] };
-  for (const id of ["trk-solid", "trk-dashed", "trk-events", "trk-ends", "trk-pos"]) {
+  for (const id of ["trk-solid", "trk-dashed", "trk-events", "trk-interp", "trk-damaged", "trk-ends", "trk-pos"]) {
     map.addSource(id, { type: "geojson", data: empty });
   }
   if (!map.hasImage("pos-arrow")) map.addImage("pos-arrow", makeArrowImage(64), { pixelRatio: 2 });
@@ -393,6 +400,11 @@ function addTrackLayers() {
   map.addLayer({ id: "l-events", type: "line", source: "trk-events",
     layout: { "line-cap": "round", "line-join": "round" },
     paint: { "line-color": ["get", "color"], "line-width": 6 } });
+  // 손상 파일: 임의 복구(추정 좌표)는 보라 점선, 복구하지 않은 손상 구간은 빨간 점선.
+  map.addLayer({ id: "l-interp", type: "line", source: "trk-interp",
+    paint: { "line-color": "#9c36b5", "line-width": 4, "line-dasharray": [1, 1.2] } });
+  map.addLayer({ id: "l-damaged", type: "line", source: "trk-damaged",
+    paint: { "line-color": "#e03131", "line-width": 3, "line-dasharray": [2, 2] } });
   map.addLayer({ id: "l-ends", type: "circle", source: "trk-ends",
     paint: {
       "circle-radius": 7,

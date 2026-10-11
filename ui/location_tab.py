@@ -82,6 +82,12 @@ class LocationTab(QWidget):
         table_layout = QVBoxLayout(table_panel)
         table_layout.setContentsMargins(0, 0, 0, 0)
         table_layout.setSpacing(2)
+        # 손상 파일: 어느 구간이 손상이고 어떻게 처리했는지(임의복구/복구하지 않음) 표 위에 적는다.
+        self._damage_label = QLabel("")
+        self._damage_label.setWordWrap(True)
+        self._damage_label.setStyleSheet("color: #c92a2a; padding: 2px 4px;")
+        self._damage_label.hide()
+        table_layout.addWidget(self._damage_label)
         table_layout.addWidget(self._selected_label)
         table_layout.addWidget(self._table, 1)
 
@@ -183,6 +189,11 @@ class LocationTab(QWidget):
                             baseline=(index == 0))
         self._selected_label.setText("")
         self._selected_key = None
+        if view.damage_notes:
+            self._damage_label.setText("손상 구간: " + " / ".join(view.damage_notes))
+            self._damage_label.show()
+        else:
+            self._damage_label.hide()
         self._table.setColumnHidden(_SEGMENT_COLUMN, not view.segment_labels)
 
         detail = has_frame_detail(records)
@@ -210,6 +221,14 @@ class LocationTab(QWidget):
             elif texts[COL_LAT] == "(GPS 끊김)":
                 lat_item.setForeground(_DROPOUT_COLOR)
                 lon_item.setForeground(_DROPOUT_COLOR)
+            elif rec.recovery_state == "damaged":
+                for it in items:
+                    it.setForeground(QColor("#c92a2a"))
+                    it.setToolTip("손상 구간: 파일의 이 부분을 읽을 수 없어 기록이 없습니다.")
+            elif rec.recovery_state == "interpolated":
+                for it in (lat_item, lon_item, items[COL_CHECK]):
+                    it.setForeground(QColor("#9c36b5"))
+                    it.setToolTip("임의 복구: 손상 직전 좌표와 손상 뒤 첫 좌표를 직선으로 이은 추정값입니다. 측정값이 아닙니다.")
             g = rec.g_magnitude
             if g is not None and g >= _IMPACT_G:
                 items[COL_G].setForeground(_IMPACT_COLOR)

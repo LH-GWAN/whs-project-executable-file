@@ -47,8 +47,13 @@ class AnalysisWorker(QThread):
                  settings: Dict, cases_root_dir: str, history_db_path: Optional[str],
                  vehicle_type: str, carve_slack: bool = False,
                  sha256: str = "", rear_video_path: str = "", track_mode: str = "",
-                 sequence=None, sequence_sha256: Optional[Dict[str, str]] = None, parent=None):
+                 sequence=None, sequence_sha256: Optional[Dict[str, str]] = None, parent=None,
+                 damage_report=None, recovery_mode: str = "none", reference_path: str = ""):
         super().__init__(parent)
+        # 손상 파일: 검사 결과(core/damage.DamageReport), 복구 방식, 헤더 참조 영상.
+        self._damage_report = damage_report
+        self._recovery_mode = recovery_mode
+        self._reference_path = reference_path
         # 연속 영상 이어보기(core/video_sequence.SequenceItem 목록). 있으면 video_path 대신 쓴다.
         self._sequence = sequence
         self._sequence_sha256 = sequence_sha256 or {}
@@ -93,6 +98,9 @@ class AnalysisWorker(QThread):
                     precomputed_sha256=self._sha256,
                     rear_video_path=self._rear_video_path,
                     track_mode=self._track_mode,
+                    damage_report=self._damage_report,
+                    recovery_mode=self._recovery_mode,
+                    reference_path=self._reference_path,
                 )
             self.finished_ok.emit(result)
         except CancelledError:

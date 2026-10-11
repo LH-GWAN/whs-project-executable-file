@@ -22,6 +22,8 @@ class DatasetView:
     map_points: Optional[list] = None
     # 슬랙 묶음: 위험운전을 판정하지 않고 시간축이 영상이 아니다(리뷰 #119).
     is_slack: bool = False
+    # 손상 파일: 구간별 안내 문구("12.0~15.0초: 손상으로 인한 임의복구"). 없으면 빈 목록.
+    damage_notes: List[str] = field(default_factory=list)
 
 
 def make_view_bar(on_change) -> QTabBar:

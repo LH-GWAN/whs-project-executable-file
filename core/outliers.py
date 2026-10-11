@@ -90,6 +90,11 @@ def _mark(points: List[TrackPoint], indices: List[int], reason: str) -> None:
 
 def mark_outliers(points: List[TrackPoint]) -> int:
     """이상치를 표시하고 개수를 돌려준다. 다시 부르면 이전 표시를 지우고 새로 판정한다."""
+    # 손상 처리로 만든 행(빈 행·임의 복구 좌표)은 측정이 아니다 - 이상치 판정에서 뺀다.
+    synthetic = [p for p in points if p.recovery_state in ("damaged", "interpolated")]
+    if synthetic:
+        real = [p for p in points if p.recovery_state not in ("damaged", "interpolated")]
+        return mark_outliers(real)
     for p in points:
         p.is_outlier = False
         p.outlier_reason = ""

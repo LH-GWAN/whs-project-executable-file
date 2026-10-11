@@ -95,6 +95,21 @@ def _segment_ends(points: List[TrackPoint]) -> List[List[float]]:
     return [last[k] for k in sorted(last)] if len(last) > 1 else []
 
 
+DAMAGED_COLOR = "#e03131"
+INTERPOLATED_COLOR = "#9c36b5"
+
+
+def _damage_legend(points: List[TrackPoint]) -> List[List[str]]:
+    """손상 파일에서만 범례에 올린다."""
+    states = {p.recovery_state for p in points}
+    out = []
+    if "interpolated" in states:
+        out.append(["임의 복구 구간(추정 좌표)", INTERPOLATED_COLOR])
+    if "damaged" in states:
+        out.append(["손상 구간(복구 안 함)", DAMAGED_COLOR])
+    return out
+
+
 def _event_legend(events: List[DrivingEvent]) -> List[List[str]]:
     """이 궤적에 나온 위험운전 종류만 범례에 올린다([이름, 색])."""
     present = {ev.kind: ev for ev in events}
@@ -280,12 +295,14 @@ class MapView(QWidget):
                     "e": line_colors[i],
                     # 이어보기의 영상 번호. 영상이 바뀌는 곳은 선을 잇지 않는다.
                     "s": p.segment_index,
+                    # 손상 파일 처리 상태: "damaged"(빈 행) / "interpolated"(임의 복구) / "gap_carved" / "".
+                    "r": p.recovery_state,
                 }
                 for i, p in enumerate(points)
             ],
             "segEnds": _segment_ends(points),
             "events": _event_markers(points, events),
-            "legend": _event_legend(events),
+            "legend": _event_legend(events) + _damage_legend(points),
         }
         self._last_track_js = f"renderTrack({json.dumps(payload, ensure_ascii=False)});"
         self._last_time_js = None

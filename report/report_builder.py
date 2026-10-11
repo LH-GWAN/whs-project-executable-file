@@ -81,7 +81,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     for idx in row_indices:
         rec = records[idx]
         here = row_events[idx]
-        row_class = "outlier" if rec.is_outlier else ""
+        row_class = ("outlier" if rec.is_outlier else "damaged" if rec.recovery_state == "damaged"
+                     else "interpolated" if rec.recovery_state == "interpolated" else "")
         # 위험운전 행은 종류 색을 옅게 깐다(화면 Location 표와 같은 색). 칸 글자도 화면 표와 같다.
         row_style = f' style="background: {here[0].color}33"' if here else ""
         cells = row_texts(rec, here)
@@ -128,6 +129,19 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
     speed_summary = f"평균 {sum(speeds)/len(speeds):.1f} / 최고 {max(speeds):.1f} km/h" if speeds else "-"
     avi_repair_html = (f'<div class="kv"><b>AVI 복구</b>{"적용" if extraction.avi_repaired else "없음"}</div>'
                        if (routing.container or "").lower() == "avi" else "")
+    damage = pipeline_result.damage or {}
+    damage_html = ""
+    if damage:
+        from core.damage_marks import MODE_LABELS
+        mode = MODE_LABELS.get(str(damage.get("mode")), str(damage.get("mode")))
+        items = "".join(f"<li>{_esc(line)}</li>" for line in (damage.get("summary") or []))
+        items += "".join(f"<li>{_esc(line)}</li>" for line in (damage.get("interval_lines") or []))
+        if damage.get("repair_note"):
+            items += f"<li>{_esc(damage['repair_note'])}</li>"
+        if damage.get("time_estimated"):
+            items += "<li>재생 시각은 GPS UTC로 추정한 값입니다(헤더 소실).</li>"
+        damage_html = (f'<div class="kv"><b>손상 파일</b>{_esc(mode)} - 손상된 파일을 분석했습니다. '
+                       f'임의 복구 좌표는 추정값이며 측정값이 아닙니다.</div>\n<ul class="criteria">{items}</ul>')
     # 일시는 한국 시간(UTC+9)으로 적는다. 분석 일시는 사건을 만든(엔진으로 추출한) 시각이다.
     generated = gpstime.now_display()
     analyzed = gpstime.format_local_iso(pipeline_result.analyzed_at) if pipeline_result.analyzed_at else "-"
@@ -198,6 +212,8 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   ul.criteria {{ font-size: 11px; color: #333; margin: 4px 0 6px; padding-left: 18px; }}
   tr.outlier td {{ color: #b36b00; }}
   tr.gap td {{ text-align: center; color: #999; border: none; }}
+  tr.damaged td {{ color: #c92a2a; }}
+  tr.interpolated td {{ color: #9c36b5; }}
   /* 긴 경로·해시가 종이 폭을 넘지 않게 아무 데서나 줄을 바꾼다(예전엔 경로가 잘려 나갔다). */
   .kv, p, td {{ overflow-wrap: anywhere; word-break: break-all; }}
   .kv {{ font-size: 12px; margin: 2px 0; }}
@@ -222,6 +238,7 @@ def render_report_html(pipeline_result: PipelineResult, case_number: str, examin
   <div class="kv"><b>분석 상태</b>{_esc(extraction.status)} — {_esc(extraction.status_detail)}</div>
   <div class="kv"><b>산출물 검증</b>{_esc({True: "엔진 산출물 manifest 일치", False: "불일치 - 산출물이 분석 때와 다름(변조·손상 의심)", None: "manifest 없음(새 분석 직후 또는 옛 사건)"}[pipeline_result.artifacts_verified])}</div>
   {avi_repair_html}
+  {damage_html}
   <div class="kv"><b>GPS 검증(행)</b>정상 {ok_checks} / 실패 {failed_checks} / 미제공 {unknown_checks}</div>
   <p>검증 실패·이상치·비유한 수치는 지도·속도 계산에서 제외합니다. 미제공은 검증 성공을 뜻하지 않습니다.</p>
   <div class="kv"><b>속도 통계</b>{speed_summary} (유효 GPS 측정 산술평균, 반복 기록 제외)</div>

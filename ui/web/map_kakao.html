@@ -282,11 +282,13 @@ function buildRuns(points) {
   let current = null, currentKind = null;
   let prev = null;
   let sawDropout = false;
+  let sawDamage = false;
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
     if (p.lat === null || p.lon === null) {
       // 이상치(o)는 좌표를 쓰지 않되 끊김으로도 치지 않는다.
       if (p.d) sawDropout = true;
+      if (p.r === "damaged") sawDamage = true;
       continue;
     }
     if (prev !== null && (p.s || 0) !== (points[prev].s || 0)) {
@@ -296,7 +298,9 @@ function buildRuns(points) {
     }
     if (prev !== null) {
       let kind;
-      if (p.e) kind = p.e;
+      if (p.r === "interpolated" || points[prev].r === "interpolated") kind = "interp";
+      else if (sawDamage) kind = "damaged";
+      else if (p.e) kind = p.e;
       else if (sawDropout) kind = "dashed";
       else kind = "solid";
       if (current === null || kind !== currentKind) {
@@ -309,6 +313,7 @@ function buildRuns(points) {
     }
     prev = i;
     sawDropout = false;
+    sawDamage = false;
   }
   return runs;
 }
@@ -316,6 +321,9 @@ function buildRuns(points) {
 const LINE_STYLES = {
   dashed: { strokeWeight: 3, strokeColor: "#9aa4ad", strokeOpacity: 0.9, strokeStyle: "dashed", zIndex: 1 },
   solid: { strokeWeight: 5, strokeColor: "#1a9e5c", strokeOpacity: 0.9, strokeStyle: "solid", zIndex: 2 },
+  // 손상 파일: 임의 복구(추정 좌표)는 보라 점선, 복구하지 않은 손상 구간은 빨간 점선.
+  interp: { strokeWeight: 5, strokeColor: "#9c36b5", strokeOpacity: 0.9, strokeStyle: "shortdash", zIndex: 2 },
+  damaged: { strokeWeight: 3, strokeColor: "#e03131", strokeOpacity: 0.9, strokeStyle: "dashed", zIndex: 1 },
 };
 function lineStyle(kind) {
   return LINE_STYLES[kind] ||

@@ -64,3 +64,17 @@
 - `integration_mp4.py`: `decode_sample_text`가 길이 프리픽스 뒤 패딩·Box를 허용. route가 None이어도 `--slack`이면
   `run_slack_carve`. 슬랙 카빙은 mmap(`_carve_one_region`/`_finish_slack_carve`). `unique_out_dir`, `_GuardDictWriter`.
 - 앱이 읽는 timeline 열: `gps_status`, `gps_elapsed_sec`, `gps_trusted`, `abs_time`가 추가됐다(engine_adapter.load_timeline).
+
+## 2026-10-11 손상 파일 허용 (whs-project와 동일 내용)
+
+- `integration_blackbox.detect_container`: 앞 8바이트가 깨져도 `sniff_damaged_container`가 내용(hdrl/movi/idx1 또는
+  Box 사슬, 앞·뒤 8MB → 전체)으로 판별한다. note에 "시그니처 손상"이 들어간다.
+- `integration_avi.py`: RIFF가 아니어도 종료하지 않는다. `find_top_level_sections_damaged`(hdrl/movi/idx1 바이트 스캔,
+  idx1 엔트리 역산으로 movi 기준점 복원), `find_idx1_fallback`은 `_idx1_entries_plausible`로 가짜 idx1을 거부,
+  `walk_movi_chunks`(재동기화, 비패딩 청크 지원), `synthesize_idx1`(idx1 없을 때 색인 재구성, 손상 구간 빈 자리,
+  `recording_cut_at`으로 옛 녹화 잔재 제외), `detect_base_offset` 후보 D(엔트리 역산), timeline에 `source_offset`
+  (청크 위치), 재생 시각 없는 좌표 행도 timeline에 남김(헤더 소실 - 앱이 UTC로 추정), stdout `DAMAGE_JSON` 줄.
+- `integration_mp4.py`: size 0 + 타입 0x00000000 Box를 손상으로 봄, `scan_top_level_bounded`가 `resync_top_level`로
+  다음 정상 Box에서 이어 읽고 `DAMAGE_GAPS`에 구간을 남김, moof 없는 mdat(`UNINDEXED_MEDIA`)와 손상 구간의 RMC를
+  `carve_gap_gps`가 UTC로 시간축에 되돌려 넣음(`time_source=gap_carved_utc`), timeline에 `source_offset`.
+- 앱이 읽는 열: `source_offset`(바이트 위치), `time_source`가 `gap_carved_utc`면 `recovery_state="gap_carved"`.

@@ -71,6 +71,13 @@ class TrackPoint:
     outlier_reason: str = ""
     # 연속 영상 이어보기에서 이 행이 속한 영상(0부터). 하나짜리 사건은 늘 0이다.
     segment_index: int = 0
+    # 이 기록이 파일 어디에서 왔는지(바이트). 손상 구간을 시간축에 대응시키는 데 쓴다.
+    source_offset: Optional[int] = None
+    # 손상 파일 처리 상태(core/damage_marks.py): "" 정상, "damaged" 손상 구간의 빈 행,
+    # "interpolated" 임의 복구로 만든 추정 좌표, "gap_carved" 손상 구간에서 UTC로 되돌려 넣은 기록.
+    recovery_state: str = ""
+    # 재생 시각을 GPS UTC로 추정한 행(헤더 소실 AVI).
+    time_estimated: bool = False
 
     @property
     def has_coords(self) -> bool:
@@ -102,6 +109,14 @@ class TrackPoint:
         if self.gps_elapsed is not None:
             return ("elapsed", self.gps_elapsed)
         return ("val", self.latitude, self.longitude, self.speed_kmh)
+
+    @property
+    def is_damaged(self) -> bool:
+        return self.recovery_state == "damaged"
+
+    @property
+    def is_interpolated(self) -> bool:
+        return self.recovery_state == "interpolated"
 
     @property
     def is_dropout(self) -> bool:
@@ -155,10 +170,13 @@ class ExtractionResult:
     status_detail: str = ""
     slack_points: List[TrackPoint] = field(default_factory=list)
     avi_repaired: bool = False
+    # 손상 파일 처리 결과(core/pipeline.describe_damage): report·mode·intervals·repaired. 없으면 None.
+    damage: Optional[dict] = None
 
     @property
     def fix_count(self) -> int:
-        return sum(1 for p in self.points if p.has_fix)
+        # 임의 복구로 만든 추정 좌표는 측정이 아니다 - 수신 수에 넣지 않는다.
+        return sum(1 for p in self.points if p.has_fix and not p.is_interpolated)
 
     @property
     def dropout_count(self) -> int:
@@ -343,9 +361,21 @@ def load_timeline(csv_path: str) -> List[TrackPoint]:
                 x_g_cal=_f(row.get("x_g_cal")), y_g_cal=_f(row.get("y_g_cal")),
                 z_g_cal=_f(row.get("z_g_cal")),
                 source_file=csv_path,
+                source_offset=_offset(row.get("source_offset")),
+                recovery_state="gap_carved" if (row.get("time_source") or "").strip() == "gap_carved_utc" else "",
             ))
     _restore_timeline_trust(points, csv_path)
     return points
+
+
+def _offset(value) -> Optional[int]:
+    text = (value or "").strip() if isinstance(value, str) else value
+    if text in ("", None):
+        return None
+    try:
+        return int(text, 16) if isinstance(text, str) and text.lower().startswith("0x") else int(float(text))
+    except (TypeError, ValueError):
+        return None
 
 
 def _restore_timeline_trust(points: List[TrackPoint], csv_path: str) -> None:
@@ -513,6 +543,9 @@ def run_full_extraction(input_path: str, output_dir: str, slack: bool = False,
         ))
 
     points, primary = _load_points(output_dir)
+    # 헤더가 사라진 AVI는 재생 시각 없이 좌표만 온다. GPS UTC로 시간축을 추정한다(손상 파일 복구).
+    from core.damage_marks import estimate_times_from_utc
+    estimate_times_from_utc(points)
     points.sort(key=lambda p: (p.start_time_sec is None, p.start_time_sec or 0.0))
     time_source = next((p.time_source for p in points if p.time_source), "")
 
@@ -649,6 +682,8 @@ def load_existing_results(output_dir: str) -> tuple[List[TrackPoint], Optional[s
         coord_paths = find_csvs(output_dir, "coordinates.csv")
         primary = pick_primary_csv(coord_paths)
         points = load_coordinates_as_points(primary) if primary else []
+    from core.damage_marks import estimate_times_from_utc
+    estimate_times_from_utc(points)   # 헤더 소실 AVI 사건을 다시 열 때도 같은 시간축
     points.sort(key=lambda p: (p.start_time_sec is None, p.start_time_sec or 0.0))
     time_source = next((p.time_source for p in points if p.time_source), "")
     return points, primary, time_source

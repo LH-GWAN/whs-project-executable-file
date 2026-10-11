@@ -44,9 +44,16 @@ class SpeedTab(QWidget):
             stats_row.addSpacing(8)
             stats_row.addWidget(legend)
 
+        # 손상 파일: 손상 구간은 그래프를 비우고 여기에 구간을 적는다(사용자 결정).
+        self._damage_label = QLabel("")
+        self._damage_label.setWordWrap(True)
+        self._damage_label.setStyleSheet("color: #c92a2a; padding: 2px 4px;")
+        self._damage_label.hide()
+
         layout = QVBoxLayout(self)
         layout.addWidget(self._view_bar)
         layout.addWidget(self._chart, 1)
+        layout.addWidget(self._damage_label)
         layout.addLayout(stats_row)
 
     def load(self, records: List[TrackPoint], events: List[DrivingEvent],
@@ -58,6 +65,7 @@ class SpeedTab(QWidget):
         self._views = list(views)
         self._vehicle_type = vehicle_type
         fill_view_bar(self._view_bar, self._views)
+        self._damage_label.hide()
         if not self._views:
             # 끈 탭에 이전 사건 그래프가 남아 리포트에 실리지 않게 비운다(리뷰 #1).
             self._chart.set_data([], [], [])
@@ -78,6 +86,11 @@ class SpeedTab(QWidget):
         speed_events = _speed_only(view.events)
         self._chart.set_data(records, speed_events, view.boundaries,
                              time_label="경과" if view.is_slack else "영상")
+        if view.damage_notes:
+            self._damage_label.setText("손상 구간(속도 없음): " + " / ".join(view.damage_notes))
+            self._damage_label.show()
+        else:
+            self._damage_label.hide()
         indices = _distinct_fix_indices(records)
         speeds = [records[i].speed_kmh for i in indices]
         excluded = sum(r.speed_kmh is not None for r in records) - len(indices)

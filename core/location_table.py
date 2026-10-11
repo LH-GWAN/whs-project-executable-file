@@ -50,6 +50,12 @@ def has_frame_detail(points: List[TrackPoint]) -> bool:
 
 
 def validation_text(rec: TrackPoint) -> str:
+    if rec.recovery_state == "damaged":
+        return "손상"
+    if rec.recovery_state == "interpolated":
+        return "임의 복구"
+    if rec.recovery_state == "gap_carved":
+        return "손상 구간 회수"
     if rec.is_dropout and not rec.has_coords:
         return "끊김"   # 측위 실패(status=V) 행은 검증 실패가 아니라 수신 끊김이다(리뷰 #93)
     if rec.gps_checksum_ok is False or rec.gps_trusted is False:
@@ -62,7 +68,11 @@ def row_texts(rec: TrackPoint, here: Sequence[DrivingEvent]) -> List[str]:
     dropout = rec.is_dropout and not rec.has_coords
     failed = (rec.gps_checksum_ok is False or rec.gps_trusted is False) and not dropout
     time_text = f"{rec.start_time_sec:.2f}" if rec.start_time_sec is not None else "-"
-    if rec.is_outlier:
+    if rec.recovery_state == "damaged":
+        lat, lon = "(손상 구간)", "-"
+    elif rec.recovery_state == "interpolated":
+        lat, lon = f"{rec.latitude:.6f} (추정)", f"{rec.longitude:.6f} (추정)"
+    elif rec.is_outlier:
         lat, lon = "(이상치)", "(이상치)"
     elif dropout:
         lat, lon = "(GPS 끊김)", "-"   # 좌표 없는 끊김은 검증 실패보다 먼저 본다(리뷰 #93)

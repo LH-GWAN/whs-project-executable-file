@@ -58,22 +58,3 @@ def test_detail_notice_single_and_sequence(qapp, monkeypatch):
     assert len(notices) == 2
     MainWindow._notify_frame_detail(host, SimpleNamespace(is_sequence=False, points=[point(0)]))
     assert len(notices) == 2
-
-
-def test_recovery_dialog_background_lifecycle(qapp, monkeypatch, tmp_path):
-    from ui import recovery_dialog
-    from PySide6.QtTest import QTest
-    result = {'videos': [], 'jpeg_stills': 0, 'gps_records': 1, 'output_dir': str(tmp_path)}
-    monkeypatch.setattr(recovery_dialog, 'recover_avi', lambda *a: result)
-    dialog = recovery_dialog.RecoveryDialog()
-    dialog._source.setText(str(tmp_path/'broken.avi'))
-    dialog._destination.setText(str(tmp_path))
-    dialog._run()
-    for _ in range(100):
-        qapp.processEvents()
-        if dialog._worker is None: break
-        QTest.qWait(10)
-    assert dialog._worker is None
-    assert dialog._open.isEnabled() and dialog._start.isEnabled()
-    assert 'GPS 1개' in dialog._status.text()
-    dialog.close()

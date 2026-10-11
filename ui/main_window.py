@@ -356,11 +356,17 @@ class MainWindow(QMainWindow):
         if previous and not self._confirm_reanalysis(previous):
             return
 
+        # 손상 검사: 파일 전체를 훑어 손상이면 알리고 복구 방식을 고르게 한다(사용자 결정 2026-10-11).
+        damage = self._check_damage(video_path, "전방 영상" if rear_path else "")
+        if damage is None:
+            return
+        report, mode, reference = damage
         carve = self._ask_slack([("전방 영상" if rear_path else "영상", video_path)])
         if carve is None:
             return
         self._start_analysis(video_path=video_path, sha256=sha256, carve_slack=carve,
-                             rear_video_path=rear_path or "", track_mode=track_mode or "")
+                             rear_video_path=rear_path or "", track_mode=track_mode or "",
+                             damage_report=report, recovery_mode=mode, reference_path=reference)
 
     def _on_sequence_selected(self, items: list) -> None:
         """연속 영상 이어보기: 영상마다 해시를 내고 사건 정보를 받아 분석한다."""
@@ -381,11 +387,103 @@ class MainWindow(QMainWindow):
             if not sha256:
                 return  # 취소
             hashes[path] = sha256
+        # 이어보기는 손상 파일을 받지 않는다(구간마다 손상 처리·헤더 이식이 얽힌다). 하나씩 분석하게 안내.
+        for n, item in enumerate(items, start=1):
+            report = self._scan_damage_with_progress(item.primary, f"{n}번 영상")
+            if report is None:
+                return
+            if report.damaged:
+                QMessageBox.warning(
+                    self, "손상 파일",
+                    f"{n}번 영상({os.path.basename(item.primary)})이 손상된 파일입니다:\n"
+                    + "\n".join(f"· {line}" for line in report.summary_lines())
+                    + "\n\n손상 영상은 연속 영상 이어보기로 분석할 수 없습니다. 영상 하나씩 분석하세요.")
+                return
         carve = self._ask_slack([(f"{n}번 영상", item.primary) for n, item in enumerate(items, start=1)])
         if carve is None:
             return
         self._start_analysis(video_path=items[0].primary, sha256=hashes[items[0].primary],
                              carve_slack=carve, sequence=items, sequence_sha256=hashes)
+
+    def _scan_damage_with_progress(self, path: str, label: str = ""):
+        """파일 전체를 훑는 손상 검사를 진행 창과 함께 돌린다. 취소·실패면 None."""
+        from core.damage import scan_damage
+        from ui.workers import TaskWorker
+
+        progress = QProgressDialog(f"파일 손상 검사 중... {label}".rstrip(), "취소", 0, 0, self)
+        progress.setWindowTitle(APP_NAME)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        worker = TaskWorker(lambda cancel, _progress: scan_damage(path, cancel_event=cancel), self)
+        result = {"value": None, "error": ""}
+
+        def done(value) -> None:
+            result["value"] = value
+            progress.close()
+
+        def failed(message: str) -> None:
+            result["error"] = message
+            progress.close()
+
+        def on_cancel() -> None:
+            if result["value"] is None and not result["error"]:
+                worker.cancel()
+                progress.setLabelText("취소하는 중...")
+                progress.show()
+
+        worker.finished_task.connect(done)
+        worker.failed.connect(failed)
+        progress.canceled.connect(on_cancel)
+        worker.start()
+        progress.exec()
+        worker.wait()
+        worker.deleteLater()
+        progress.deleteLater()
+        if worker.is_cancelled():
+            return None
+        if result["value"] is None:
+            QMessageBox.critical(self, "손상 검사", f"파일 손상 검사에 실패했습니다:\n{result['error']}")
+            return None
+        return result["value"]
+
+    def _check_damage(self, video_path: str, label: str = ""):
+        """손상 검사 → (검사 결과, 복구 방식, 참조 영상 경로). 취소면 None. 정상 파일이면 (report, 'none', '')."""
+        from core.damage_marks import MODE_NONE
+        from core.damage_repair import find_reference_candidates, validate_reference
+        from ui.damage_dialog import ask_recovery_mode, ask_reference, confirm_reference_problem
+
+        report = self._scan_damage_with_progress(video_path, label)
+        if report is None:
+            return None
+        if not report.damaged:
+            return report, MODE_NONE, ""
+        mode = ask_recovery_mode(self, report, label)
+        if mode is None:
+            return None
+        reference = ""
+        if report.needs_reference:
+            if report.container == "mp4" and not report.fragmented:
+                QMessageBox.information(
+                    self, "헤더 참조 영상",
+                    "moov(헤더)가 파일 끝에 있던 일반 MP4라 다른 영상의 헤더를 이식할 수 없습니다.\n"
+                    "영상은 재생되지 않고, 남아 있는 GPS 문장만 UTC 기준 시간축으로 회수합니다.")
+            else:
+                candidates = find_reference_candidates(video_path, report)
+                while True:
+                    reference, cancelled = ask_reference(self, report, candidates)
+                    if cancelled:
+                        return None
+                    if not reference:
+                        break
+                    ok, reason = validate_reference(report, reference)
+                    if ok:
+                        break
+                    if confirm_reference_problem(self, reason):
+                        reference = ""
+                        break
+                    candidates = []
+        return report, mode, reference
 
     def _ask_slack(self, targets: list) -> Optional[bool]:
         """분석할 영상들의 슬랙(컨테이너가 참조하지 않는 영역) 유무를 보고, 있으면 따로 뽑을지 묻는다.

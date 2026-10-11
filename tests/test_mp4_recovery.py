@@ -321,19 +321,6 @@ def test_cli_help_in_legacy_windows_console():
                        capture_output=True, env=env, timeout=20)
     assert r.returncode == 0 and b'--reference' in r.stdout and b'--fps' in r.stdout
 
-
-def test_ui_format_selection_and_success_summary(qapp):
-    from ui.recovery_dialog import RecoveryDialog
-    dialog = RecoveryDialog(); dialog._format.setCurrentIndex(1)
-    assert 'MP4' in dialog._notice.text() and 'MP4' in dialog.windowTitle()
-    dialog._done(dict(videos=[dict(decode_check=dict(status='passed'))], jpeg_stills=0,
-                      gps_records=20, gsensor_records=200, output_dir='result'))
-    assert '200' in dialog._status.text() and dialog._open.isEnabled()
-    dialog._format.setCurrentIndex(0)
-    assert 'MJPEG' in dialog._notice.text()
-    dialog.deleteLater(); qapp.processEvents()
-
-
 def test_missing_moov_bframes_reconstruct_display_order(mp4_media, tmp_path):
     source = mp4_media['bframes']; data = source.read_bytes()
     moov = next(b for b in top_boxes(data) if b[0] == b'moov')

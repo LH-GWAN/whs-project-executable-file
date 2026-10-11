@@ -359,7 +359,8 @@ class SpeedChartWidget(QWidget):
                 prev_t = self._records[prev_index].start_time_sec
                 broken = (self._records[index].segment_index != self._records[prev_index].segment_index
                           or (prev_t is not None and t - prev_t > MAX_GAP_SEC)   # 측정 공백은 잇지 않는다(리뷰 #91)
-                          or any(self._records[j].is_dropout for j in range(prev_index + 1, index)))
+                          or any(self._records[j].is_dropout or self._records[j].recovery_state
+                                 for j in range(prev_index + 1, index)))   # 손상 구간도 잇지 않는다
                 if broken and qpts:
                     runs.append((indices, qpts))
                     indices, qpts = [], []

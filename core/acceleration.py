@@ -33,7 +33,7 @@ def _distinct_fix_indices(points: List[TrackPoint]) -> List[int]:
     out: List[int] = []
     prev_key = None
     for i, p in enumerate(points):
-        if (not p.has_fix or p.speed_kmh is None or not math.isfinite(p.speed_kmh)
+        if (p.recovery_state or not p.has_fix or p.speed_kmh is None or not math.isfinite(p.speed_kmh)
                 or p.speed_kmh < 0 or _time_of(p) is None
                 or not math.isfinite(_time_of(p)) or _time_of(p) < 0):
             continue
@@ -64,6 +64,8 @@ def speed_rate_pairs(points: List[TrackPoint],
         prev_i, cur_i = usable[j], usable[k]
         if points[prev_i].segment_index != points[cur_i].segment_index:
             continue  # 이어보기 영상 경계는 잇지 않는다(가상의 간격, 리뷰 #45)
+        if any(points[m].recovery_state for m in range(prev_i + 1, cur_i)):
+            continue  # 손상 구간(빈 행·임의 복구 행)을 가로지르는 변화는 판정하지 않는다
         out.append((prev_i, cur_i, dt, (points[cur_i].speed_kmh - points[prev_i].speed_kmh) / dt))
     return out
 

@@ -160,8 +160,9 @@ def slack_sets(result: PipelineResult) -> List[SlackSet]:
 def dataset_views(result: PipelineResult, slacks: Optional[List[SlackSet]] = None) -> List[DatasetView]:
     """Speed/Location 탭의 묶음. 이어보기면 Composed + 영상별, 아니면 하나. 슬랙 데이터를 뽑았으면
     맨 뒤에 "… 슬랙" 묶음(위험운전 판정은 하지 않는다 - 시간축이 영상이 아니다)."""
+    notes = list((result.damage or {}).get("interval_lines") or []) if result.damage else []
     if not result.is_sequence:
-        views = [DatasetView(COMPOSED_LABEL, result.points, result.driving_events)]
+        views = [DatasetView(COMPOSED_LABEL, result.points, result.driving_events, damage_notes=notes)]
     else:
         segs = result.segments
         labels = [seg.label for seg in segs]
@@ -293,11 +294,23 @@ class AnalysisView(QWidget):
         self._analysis_status.setText(
             f"{prefix}분석 상태: {extraction.status} · 경고 {len(extraction.warnings)}건{repair} · "
             f"슬랙 GPS {len(extraction.slack_points)}건")
+        if result.damage:
+            from core.damage_marks import MODE_LABELS
+            mode = MODE_LABELS.get(str(result.damage.get("mode")), str(result.damage.get("mode")))
+            n = len(result.damage.get("intervals") or [])
+            self._analysis_status.setText(self._analysis_status.text()
+                                          + f" · ⚠ 손상 파일({mode}" + (f", 구간 {n}곳" if n else "") + ")")
         if result.artifacts_verified is False:
             self._analysis_status.setText(self._analysis_status.text() + " · ⚠ 엔진 산출물이 분석 때와 다릅니다(manifest 불일치)")
         elif result.artifacts_verified is True:
             self._analysis_status.setText(self._analysis_status.text() + " · 산출물 manifest 일치")
-        self._analysis_status.setToolTip(extraction.status_message + "\n" + "\n".join(extraction.warnings))
+        damage_tip = ""
+        if result.damage:
+            damage_tip = ("\n[손상 파일]\n" + "\n".join(result.damage.get("summary") or [])
+                          + ("\n" + "\n".join(result.damage.get("interval_lines") or []) if result.damage.get("interval_lines") else "")
+                          + ("\n" + str(result.damage.get("repair_note")) if result.damage.get("repair_note") else "")
+                          + ("\n재생 시각은 GPS UTC로 추정한 값입니다." if result.damage.get("time_estimated") else ""))
+        self._analysis_status.setToolTip(extraction.status_message + damage_tip + "\n" + "\n".join(extraction.warnings))
 
         self._file_views = self._build_file_views(result)
         self._start_integrity_checks([f for view in self._file_views[:1] for f in view["files"]]
@@ -317,7 +330,7 @@ class AnalysisView(QWidget):
                                  label=seg.label, primary_is_rear=seg.primary_is_rear)
                     for seg in result.segments])
             else:
-                video_path = result.source_copy_path
+                video_path = result.playback_path   # 헤더를 이식한 작업 사본이 있으면 그것을 튼다(원본 사본은 재생 불가)
                 self._tracker_tab.set_duration_hint(result.duration_sec)
                 if video_path and os.path.isfile(video_path):
                     rear = result.rear_copy_path if result.rear_copy_path and os.path.isfile(result.rear_copy_path) else ""

@@ -46,6 +46,16 @@ class PipelineResult:
     # 연속 영상 이어보기의 구간들. 비어 있으면 영상 하나짜리 사건이다. 이어보기면 extraction·
     # driving_events·duration_sec는 구간들을 시간축으로 이어 붙인 값(Composed)이다.
     segments: List["SegmentResult"] = field(default_factory=list)
+    # 헤더를 이식한 작업 사본(손상 파일). 있으면 Tracker는 이 파일을 튼다(원본 사본은 재생이 안 된다).
+    repaired_path: str = ""
+
+    @property
+    def playback_path(self) -> str:
+        return self.repaired_path if self.repaired_path and os.path.isfile(self.repaired_path) else self.source_copy_path
+
+    @property
+    def damage(self) -> Optional[dict]:
+        return self.extraction.damage
 
     @property
     def points(self) -> List[TrackPoint]:
@@ -233,6 +243,9 @@ def run_analysis_pipeline(
     precomputed_sha256: str = "",
     rear_video_path: str = "",
     track_mode: str = "",
+    damage_report=None,
+    recovery_mode: str = "none",
+    reference_path: str = "",
 ) -> PipelineResult:
     def report(msg: str) -> None:
         if progress_cb:
@@ -318,14 +331,39 @@ def run_analysis_pipeline(
             if _sha256_cancellable(rear_copy_path, cancel_event) != rear_sha256:
                 raise ValueError("후방 사본 SHA-256이 다릅니다. 분석을 중단했습니다.")
 
+        # 손상 파일: 헤더가 사라졌고 참조 영상이 있으면 헤더를 이식한 작업 사본으로 분석·재생한다.
+        repaired_path, repair_note = "", ""
+        if damage_report is not None and damage_report.needs_reference and reference_path:
+            report("참조 영상의 헤더를 이식한 작업 사본 만드는 중...")
+            from core.damage_repair import transplant_header
+            stem, ext = os.path.splitext(os.path.basename(source_copy_path))
+            repaired_path = os.path.join(source_dir, f"{stem}_repaired{ext}")
+            scan_target = replace_report_path(damage_report, source_copy_path)
+            repair_note = transplant_header(scan_target, reference_path, repaired_path)
+            check_cancelled()
+        engine_input = repaired_path or source_copy_path
+
         report("GPS/센서 메타데이터 추출 중..." + (" (슬랙 카빙 포함)" if carve_slack else ""))
         # 여기서부터 실패하거나 취소되면 방금 만든 사건 레코드를 되돌린다 -
         # 안 그러면 output_folder가 빈 고아 레코드가 History에 그대로 쌓인다.
-        extraction = run_full_extraction(source_copy_path, output_dir, slack=carve_slack,
+        # moov가 사라진 일반 MP4는 샘플 표가 없어 정상 경로로 못 읽는다. 슬랙 카빙(파일 전체 NMEA)으로
+        # 남은 GPS를 뽑아 UTC로 시간축을 추정해 본 궤적으로 쓴다(헤더 이식 불가, 영상 재생 불가).
+        gps_only = bool(damage_report is not None and damage_report.index_missing
+                        and damage_report.container == "mp4" and not repaired_path)
+        extraction = run_full_extraction(engine_input, output_dir, slack=carve_slack,
                                          cancel_event=cancel_event)
+        if gps_only and not extraction.points:
+            report("moov 없음 - 파일 전체에서 GPS 문장 회수 중...")
+            from core.damage_marks import carve_whole_file_gps
+            lo, hi = (damage_report.media_range or [0, None])
+            carved = carve_whole_file_gps(engine_input, lo, hi, cancel_event)
+            _promote_carved_gps(extraction, carved)
+            if extraction.points:
+                # 다시 열 때도 같은 행을 읽을 수 있게 엔진 산출물 형식(timeline.csv)으로 남긴다.
+                _write_carved_timeline(os.path.join(output_dir, "recovered_gps"), extraction.points)
 
         report("영상 길이 계산 중...")
-        dur = duration_mod.get_duration_sec(source_copy_path, routing.container,
+        dur = duration_mod.get_duration_sec(engine_input, routing.container,
                                             engine_output_dir=output_dir)
 
         report("이상치 확인 중...")
@@ -334,6 +372,14 @@ def run_analysis_pipeline(
         if extraction.status == "ok" and not extraction.fix_count:
             extraction.status = STATUS_GPS_UNTRUSTED
             extraction.status_detail = "모든 GPS 좌표가 검증 기준에서 제외됐습니다."
+        if damage_report is not None and damage_report.damaged:
+            report("손상 구간 표시·복구 중...")
+            # 손상 구간의 바이트 위치는 이식 사본이 아니라 원 사본 기준이다. 이식하면 앞부분 길이가
+            # 달라지므로 보고서의 구간을 사본 기준으로 옮긴다.
+            shift = _repaired_shift(damage_report, repaired_path) if repaired_path else 0
+            extraction.damage = apply_damage(extraction, damage_report, recovery_mode, dur,
+                                             offset_shift=shift, repaired_path=repaired_path,
+                                             reference_path=reference_path, repair_note=repair_note)
 
         report("위험운전 행동 분석 중...")
         vehicle_type = driving_events.normalize_vehicle(vehicle_type)
@@ -371,10 +417,123 @@ def run_analysis_pipeline(
             track_mode=track_mode,
             rear_sha256=rear_sha256,
             analyzed_at=analyzed_at,
+            repaired_path=repaired_path,
         )
     except BaseException:
         _rollback_case(history_store, case_id, case_folder)
         raise
+
+
+def _write_carved_timeline(folder: str, points: List[TrackPoint]) -> None:
+    import csv
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "timeline.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["sample", "start_time_sec", "end_time_sec", "time_source", "source_offset", "latitude",
+                    "longitude", "speed_kmh", "track_deg", "gps_date", "gps_utc_time", "gps_checksum_ok", "gps_trusted"])
+        for i, p in enumerate(points, start=1):
+            w.writerow([i, f"{p.start_time_sec:.3f}", f"{p.end_time_sec:.3f}", "gap_carved_utc",
+                        p.source_offset if p.source_offset is not None else "",
+                        f"{p.latitude:.6f}", f"{p.longitude:.6f}",
+                        f"{p.speed_kmh:.3f}" if p.speed_kmh is not None else "",
+                        p.track_deg if p.track_deg is not None else "", p.gps_date, p.gps_utc_time,
+                        p.gps_checksum_ok, p.gps_trusted])
+
+
+def _promote_carved_gps(extraction: ExtractionResult, carved: List[TrackPoint]) -> None:
+    """moov 소실 MP4: 미디어 영역에서 카빙한 GPS(시각 없음)를 UTC 기준 시간축으로 본 궤적에 올린다."""
+    from core.damage_marks import estimate_times_from_utc
+    points = [p for p in carved if p.has_coords and p.gps_utc_time]
+    if estimate_times_from_utc(points):
+        extraction.points = points
+        extraction.status = "ok"
+        extraction.status_detail = ("moov(헤더)가 없어 샘플 표 대신 파일 전체에서 GPS 문장을 회수하고 "
+                                    "UTC로 시간축을 추정했습니다. 영상은 재생할 수 없습니다.")
+        extraction.warnings.append("moov 소실: GPS를 미디어 영역 카빙으로 회수해 UTC 기준 시간축을 추정함(영상 재생 불가)")
+
+
+def replace_report_path(report, path: str):
+    """검사 결과의 파일 경로를 분석 사본으로 바꾼 복사본(바이트 구조는 같다)."""
+    from core.damage import DamageReport
+    data = report.to_dict()
+    data["path"] = path
+    return DamageReport.from_dict(data)
+
+
+def _repaired_shift(report, repaired_path: str) -> int:
+    """이식 사본에서 미디어가 몇 바이트 옮겨졌는지(원 사본 기준 구간을 사본 기준으로 옮길 때 더한다)."""
+    try:
+        if report.container == "avi":
+            import mmap
+            from core.paths import ensure_vendor_importable
+            ensure_vendor_importable()
+            import integration_avi as _avi
+            with open(repaired_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                _h, movi, _i, _ = _avi.find_top_level_sections(mm)
+            _avi.WARNINGS.clear()
+            if movi and report.avi_movi_fourcc is not None:
+                return movi[0].data_start - report.avi_movi_fourcc
+        else:
+            from core.paths import ensure_vendor_importable
+            ensure_vendor_importable()
+            import integration_mp4 as _mp4
+            size = os.path.getsize(repaired_path)
+            with open(repaired_path, "rb") as f:
+                boxes, _b, _k = _mp4.scan_top_level_bounded(f, size)
+            _mp4.WARNINGS.clear()
+            first = next((b.start for b in boxes if b.box_type == b"moof"), None)
+            if first is not None and report.mp4_first_moof is not None:
+                return first - report.mp4_first_moof
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def apply_damage(extraction: ExtractionResult, report, mode: str, duration_sec,
+                 offset_shift: int = 0, repaired_path: str = "", reference_path: str = "",
+                 repair_note: str = "") -> Dict:
+    """손상 구간을 시간축에 올리고(빈 행) 선택에 따라 임의 복구 행을 넣는다. case.json에 남길 dict를 돌려준다."""
+    from core.damage_marks import (MODE_NONE, apply_damage_marks, compute_intervals, describe_intervals)
+    mode = mode if mode in ("none", "interpolate") else MODE_NONE
+    shifted = report
+    if offset_shift:
+        shifted = replace_report_path(report, report.path)
+        shifted.gaps = [[a + offset_shift, b + offset_shift] for a, b in report.gaps]
+        shifted.zero_regions = [[a + offset_shift, b + offset_shift] for a, b in report.zero_regions]
+    intervals = compute_intervals(extraction.points, shifted, duration_sec)
+    extraction.points = apply_damage_marks(extraction.points, intervals, mode)
+    reference_sha = ""
+    if reference_path and os.path.isfile(reference_path):
+        try:
+            reference_sha = _sha256_cancellable(reference_path, None)
+        except OSError:
+            reference_sha = ""
+    return {
+        "report": report.to_dict(),
+        "mode": mode,
+        "offset_shift": offset_shift,
+        "intervals": [iv.to_dict() for iv in intervals],
+        "interval_lines": describe_intervals(intervals),
+        "summary": report.summary_lines(),
+        "repaired_file": os.path.basename(repaired_path) if repaired_path else "",
+        "reference_path": reference_path,
+        "reference_sha256": reference_sha,
+        "repair_note": repair_note,
+        "time_estimated": any(p.time_estimated for p in extraction.points),
+    }
+
+
+def reapply_damage(extraction: ExtractionResult, meta: Dict, duration_sec) -> Dict:
+    """다시 열 때: 저장된 검사 결과·복구 방식으로 손상 구간 행을 같은 규칙으로 다시 만든다."""
+    from core.damage import DamageReport
+    report = DamageReport.from_dict(meta.get("report") or {})
+    repaired = meta.get("repaired_file") or ""
+    out = apply_damage(extraction, report, str(meta.get("mode") or "none"), duration_sec,
+                       offset_shift=int(meta.get("offset_shift") or 0), repaired_path=repaired,
+                       reference_path=str(meta.get("reference_path") or ""),
+                       repair_note=str(meta.get("repair_note") or ""))
+    out["reference_sha256"] = meta.get("reference_sha256", "")
+    return out
 
 
 def reopen_case(case: CaseRecord) -> PipelineResult:
@@ -425,6 +584,18 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
     rear_copy = (os.path.join(case_folder, "source", case.rear_video_filename)
                  if case_folder and case.rear_video_filename else "")
     copy_name = str(metadata.get("source_video_filename") or case.source_video_filename)
+    repaired_path = ""
+    damage_meta = metadata.get("damage") if isinstance(metadata.get("damage"), dict) else None
+    if damage_meta:
+        # 손상 구간 행(빈 행·임의 복구)은 CSV에 없다. 저장한 검사 결과와 복구 방식으로 같은 규칙으로 다시 만든다.
+        if damage_meta.get("repaired_file"):
+            repaired_path = os.path.join(case_folder, "source", str(damage_meta["repaired_file"]))
+        try:
+            extraction.damage = reapply_damage(extraction, damage_meta, case.duration_sec)
+            events = driving_events.detect_driving_events(extraction.points, vehicle_type)
+        except Exception as exc:  # noqa: BLE001 - 손상 정보가 깨져도 사건은 연다
+            extraction.warnings.append(f"손상 구간 정보를 복원하지 못했습니다: {exc}")
+            extraction.damage = damage_meta
     return PipelineResult(
         case_id=case.id or -1,
         case_folder=case_folder,
@@ -438,6 +609,7 @@ def reopen_case(case: CaseRecord) -> PipelineResult:
         # 사본이 없어도 경로를 남긴다 - 그래야 무결성 표시등이 '사본 없음'(회색)으로 알린다. 예전엔
         # 비워서 후방이 조용히 빠지고 표시등이 초록이 됐다(리뷰 #17).
         rear_copy_path=rear_copy,
+        repaired_path=repaired_path,
         track_mode=case.track_mode or "",
         rear_sha256=str(metadata.get("rear_sha256") or ""),
         analyzed_at=case.created_at,
@@ -509,6 +681,7 @@ def _write_case_json(case_folder, case_id, case_number, examiner, memo, video_pa
             "rear_video_filename": os.path.basename(rear_copy_path) if rear_copy_path else "",
             "track_mode": track_mode,
             "segments": segments or [],
+            "damage": extraction.damage,
         })
 
 
