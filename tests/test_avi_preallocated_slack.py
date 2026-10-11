@@ -3,7 +3,7 @@ import csv
 import struct
 import pytest
 from core.avi_recovery import recover_avi, _index_boundary, _media_bounds
-from test_avi_recovery import media, packets
+from test_avi_recovery import media, packets, media_long, rebuild
 from test_avi_h264_damage import pixels
 
 
@@ -89,3 +89,56 @@ def test_unpadded_adjacent_video_chunks_keep_every_frame(media, tmp_path, codec)
     assert v['candidate_frames'] == v['decode_check']['decoded_frames'] == 60
     assert v['decode_check']['status'] == 'passed'
     assert pixels(out/v['file']) == pixels(media[codec])
+
+
+# ---- #30 사전 할당 파일: 현재 녹화 뒤에 남은 옛 녹화의 idx1을 현재 녹화의 경계로 받지 않는다.
+@pytest.mark.parametrize('codec', ['mjpeg', 'libx264'])
+@pytest.mark.parametrize('layout', ['movi_size_current', 'movi_size_preallocated', 'absolute_old_index',
+                                    'zero_length_entry_in_current_index'])
+def test_stale_index_after_current_recording_is_not_adopted(media, media_long, tmp_path, codec, layout):
+    new, old = media[codec].read_bytes(), media_long[codec].read_bytes()
+    movi = new.find(b'movi')
+    assert old.find(b'movi') == movi
+    new_idx, old_idx = new.rfind(b'idx1'), old.rfind(b'idx1')
+    frames = packets(new)
+    if layout == 'zero_length_entry_in_current_index':
+        items = []
+        for n, (_, _, data) in enumerate(frames):
+            if n == 5:
+                items.append((b'00dc', b''))
+            items.append((b'00dc', data))
+        new = rebuild(new, items)
+        new_idx = new.rfind(b'idx1')
+        frames = packets(new)
+        raw = bytearray(old)
+        raw[:len(new)] = new                       # 현재 idx1까지 온전, 뒤에 옛 잔재+옛 idx1
+    else:
+        raw = bytearray(old)
+        raw[:new_idx] = new[:new_idx]              # 현재 녹화의 idx1만 소실(전원 차단)
+    if layout == 'movi_size_preallocated':
+        struct.pack_into('<I', raw, movi-4, old_idx-movi)
+    if layout == 'absolute_old_index':
+        for p in range(old_idx+8, len(raw), 16):
+            struct.pack_into('<I', raw, p+8, struct.unpack_from('<I', raw, p+8)[0]+movi)
+    source = tmp_path/'preallocated.avi'
+    source.write_bytes(raw)
+    out = tmp_path/'out'
+    result = recover_avi(source, out)
+    assert result['video_boundary_verified']
+    assert result['video_scan_range']['end'] <= new_idx
+    rows = list(csv.DictReader((out/'frame_offsets.csv').open(encoding='utf-8-sig')))
+    assert [int(r['source_payload_offset']) for r in rows] == [p for _, p, _ in frames]
+    video = result['videos'][0]
+    assert video['decode_check']['status'] == 'passed'
+    assert video['candidate_frames'] == video['decode_check']['decoded_frames'] == 60
+    assert pixels(out/video['file']) == pixels(media[codec])
+
+
+def test_stale_index_fails_validation_even_with_absolute_offsets(media, media_long):
+    new, old = media['mjpeg'].read_bytes(), media_long['mjpeg'].read_bytes()
+    raw = bytearray(old)
+    raw[:new.rfind(b'idx1')] = new[:new.rfind(b'idx1')]
+    assert _index_boundary(raw) is None
+    assert _media_bounds(raw)[1:] == (new.rfind(b'idx1'), 'movi')
+    struct.pack_into('<I', raw, raw.find(b'movi')-4, old.rfind(b'idx1')-raw.find(b'movi'))
+    assert _media_bounds(raw) == (raw.find(b'movi')+4, new.rfind(b'idx1'), 'contiguous_before_rejected_index')

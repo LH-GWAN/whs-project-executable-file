@@ -5,7 +5,7 @@ from typing import List
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from core.acceleration import _distinct_fix_indices
+from core.acceleration import _distinct_fix_indices, judged_pair_count
 from core.driving_events import (DEFAULT_VEHICLE, EVENT_COLORS, EVENT_LABELS, SPEED_EVENT_KINDS,
                                  DrivingEvent, criteria_lines, summarize_counts, vehicle_label)
 from engine.engine_adapter import TrackPoint
@@ -84,8 +84,7 @@ class SpeedTab(QWidget):
         view = self._views[index]
         records = view.points
         speed_events = _speed_only(view.events)
-        self._chart.set_data(records, speed_events, view.boundaries,
-                             time_label="경과" if view.is_slack else "영상")
+        self._chart.set_data(records, speed_events, view.boundaries, time_label=self._time_label_for(view))
         if view.damage_notes:
             self._damage_label.setText("손상 구간(속도 없음): " + " / ".join(view.damage_notes))
             self._damage_label.show()
@@ -104,6 +103,12 @@ class SpeedTab(QWidget):
             self._max_label.setText("최고 속도: -")
         if view.is_slack:
             self._flag_label.setText("위험운전: 판정 안 함 (슬랙 - 시간축이 영상이 아님)")
+        elif not any(r.start_time_sec is not None for r in records):
+            # 시간축이 전혀 없는 손상본(FineVu hdrl 손상 등): 속도는 있어도 가속도를 못 구한다(리뷰 #77).
+            self._flag_label.setText(f"위험운전({vehicle_label(self._vehicle_type)} 기준): 판정 불가(시각 없음)")
+        elif not indices or judged_pair_count(records) == 0:
+            # 판정에 쓸 속도 변화 표본이 없으면 '없음'이 아니라 판정 불가다(리뷰 #4).
+            self._flag_label.setText(f"위험운전({vehicle_label(self._vehicle_type)} 기준): 판정 불가(속도 표본 없음)")
         else:
             self._flag_label.setText(
                 f"위험운전({vehicle_label(self._vehicle_type)} 기준): "
@@ -117,8 +122,16 @@ class SpeedTab(QWidget):
             return self._chart.grab_png()
         composed = self._views[0]
         current = self._views[self.current_view()]
-        self._chart.set_data(composed.points, _speed_only(composed.events), composed.boundaries)
+        self._chart.set_data(composed.points, _speed_only(composed.events), composed.boundaries,
+                             time_label=self._time_label_for(composed))
         try:
             return self._chart.grab_png()
         finally:
-            self._chart.set_data(current.points, _speed_only(current.events), current.boundaries)
+            # 되돌릴 때도 묶음에 맞는 시각 이름을 넘긴다 - 빠뜨리면 슬랙 말풍선이 '영상 시각'으로 바뀌었다(리뷰 #73).
+            self._chart.set_data(current.points, _speed_only(current.events), current.boundaries,
+                                 time_label=self._time_label_for(current))
+
+    @staticmethod
+    def _time_label_for(view: DatasetView) -> str:
+        """말풍선의 시각 이름. 슬랙은 시간축이 영상이 아니라 '경과'(리뷰 #119)."""
+        return "경과" if view.is_slack else "영상"

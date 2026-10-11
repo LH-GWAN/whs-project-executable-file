@@ -39,6 +39,9 @@
   .trk-start { background: #1a9e5c; }
   .trk-end { background: #111111; }
   .trk-pos { width: 18px; height: 18px; border-width: 3px; background: #1c7ed6; }
+  /* 임의 복구의 추정 좌표 위에 있을 때(리뷰 #21) */
+  .trk-wrap.est .trk-pos { background: #9c36b5; }
+  .trk-wrap.est .trk-arrow svg path { fill: #9c36b5; }
   /* 진행 방향 화살표: 위(북)를 향하는 삼각형을 transform: rotate 로 돌린다 */
   .trk-arrow { width: 26px; height: 26px; transform-origin: 50% 50%; }
   .trk-arrow svg { display: block; width: 26px; height: 26px; }
@@ -201,6 +204,7 @@ function makeDot(cls) {
 let posArrowEl = null, posDotEl = null, posWrapEl = null;
 function makePosOverlay() {
   posWrapEl = document.createElement("div");
+  posWrapEl.className = "trk-wrap";
   posArrowEl = document.createElement("div");
   posArrowEl.className = "trk-arrow";
   posArrowEl.innerHTML = '<svg viewBox="0 0 64 64"><path d="M32 4 L58 58 L32 45 L6 58 Z" fill="#1c7ed6" stroke="#ffffff" stroke-width="5" stroke-linejoin="round"/></svg>';
@@ -321,9 +325,10 @@ function buildRuns(points) {
 const LINE_STYLES = {
   dashed: { strokeWeight: 3, strokeColor: "#9aa4ad", strokeOpacity: 0.9, strokeStyle: "dashed", zIndex: 1 },
   solid: { strokeWeight: 5, strokeColor: "#1a9e5c", strokeOpacity: 0.9, strokeStyle: "solid", zIndex: 2 },
-  // 손상 파일: 임의 복구(추정 좌표)는 보라 점선, 복구하지 않은 손상 구간은 빨간 점선.
+  // 손상 파일: 임의 복구(추정 좌표)는 보라 점선, 복구하지 않은 손상 구간은 검정 긴 점선.
+  // 색은 ui/map_view.py의 INTERPOLATED_COLOR / DAMAGED_COLOR와 같다(급가속 빨강과 겹치지 않게 - 리뷰 #55).
   interp: { strokeWeight: 5, strokeColor: "#9c36b5", strokeOpacity: 0.9, strokeStyle: "shortdash", zIndex: 2 },
-  damaged: { strokeWeight: 3, strokeColor: "#e03131", strokeOpacity: 0.9, strokeStyle: "dashed", zIndex: 1 },
+  damaged: { strokeWeight: 3, strokeColor: "#212529", strokeOpacity: 0.9, strokeStyle: "longdash", zIndex: 1 },
 };
 function lineStyle(kind) {
   return LINE_STYLES[kind] ||
@@ -333,10 +338,11 @@ function lineStyle(kind) {
 function renderLegend(legend) {
   const box = document.getElementById("legend-events");
   box.innerHTML = "";
-  (legend || []).forEach(([label, color]) => {
+  (legend || []).forEach(([label, color, style]) => {
     const row = document.createElement("div");
     const line = document.createElement("i");
     line.style.borderColor = color;
+    line.style.borderTopStyle = style || "solid";   // 손상·추정 구간은 지도 위 선처럼 점선(리뷰 #55)
     row.appendChild(line);
     row.appendChild(document.createTextNode(" " + label));
     box.appendChild(row);
@@ -413,15 +419,25 @@ function renderTrack(payload) {
     };
     kakao.maps.event.addListener(map, "tilesloaded", idleListener);
 
-    const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
-    const outliers = pts.reduce((n, p) => n + (p.o ? 1 : 0), 0);
-    setStatus(`좌표 ${fixes.length}개` + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : "")
-      + (outliers ? ` · 이상치 ${outliers}개 제외` : ""));
+    setStatus(trackStatus(pts, fixes));
   } else {
     startOverlay.setMap(null);
     endOverlay.setMap(null);
     setStatus(noFixStatus(pts));
   }
+}
+
+// 상태 줄의 좌표 수. 임의 복구의 추정 좌표는 실측과 따로 센다(리뷰 #21). 손상 구간의 빈 행도 따로 적는다.
+function trackStatus(pts, fixes) {
+  const estimated = fixes.reduce((n, p) => n + (p.r === "interpolated" ? 1 : 0), 0);
+  const damaged = pts.reduce((n, p) => n + (p.r === "damaged" ? 1 : 0), 0);
+  const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
+  const outliers = pts.reduce((n, p) => n + (p.o ? 1 : 0), 0);
+  return `좌표 ${fixes.length - estimated}개`
+    + (estimated ? ` · 추정 좌표 ${estimated}개(임의 복구, 측정값 아님)` : "")
+    + (damaged ? ` · 손상 구간 ${damaged}개 지점` : "")
+    + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : "")
+    + (outliers ? ` · 이상치 ${outliers}개 제외` : "");
 }
 
 // 좌표를 하나도 못 그릴 때의 사유. 이상치·검증 실패로 뺀 것과 수신 자체가 없는 것을 구분한다(리뷰 #111).
@@ -471,6 +487,13 @@ function setPlaybackTime(sec) {
   if (!best) { posOverlay.setMap(null); return; }
   const pos = latLng(best);
   setPosHeading(best.h);
+  // 임의 복구의 추정 좌표 위에 있을 때는 마커 색을 바꿔 실측과 구분한다(리뷰 #21).
+  const est = best.r === "interpolated";
+  if (posWrapEl) {
+    posWrapEl.classList.toggle("est", est);
+    posWrapEl.title = est ? "추정 좌표 (임의 복구 - 측정값 아님)" : "";
+  }
+  window.__posEstimated = est;
   posOverlay.setPosition(pos);
   posOverlay.setMap(map);
 

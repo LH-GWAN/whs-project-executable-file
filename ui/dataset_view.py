@@ -24,6 +24,9 @@ class DatasetView:
     is_slack: bool = False
     # 손상 파일: 구간별 안내 문구("12.0~15.0초: 손상으로 인한 임의복구"). 없으면 빈 목록.
     damage_notes: List[str] = field(default_factory=list)
+    # 영상별 묶음: 이 묶음의 첫 행이 Composed(리포트 '#')에서 몇 번째인지(0부터). Composed·슬랙은 0.
+    # 표의 행 번호를 리포트 번호와 맞추는 데 쓴다(리뷰 #119).
+    row_offset: int = 0
 
 
 def make_view_bar(on_change) -> QTabBar:

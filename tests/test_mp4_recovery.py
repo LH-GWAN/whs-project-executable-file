@@ -18,6 +18,7 @@ from fractions import Fraction
 import pytest
 
 from core.mp4_recovery import recover_mp4, RecoveryCancelled
+from core.mp4_structure import discover, parse_moov
 
 
 def ffmpeg(*args):
@@ -369,15 +370,33 @@ def test_raw_carving_stops_before_embedded_recording(mp4_media, tmp_path):
     assert pixels(tmp_path/'out'/r['videos'][0]['file']) == pixels(source)
 
 
-def test_index_cannot_point_into_known_free_slack(mp4_media, tmp_path):
+def test_index_cannot_point_into_known_free_slack(mp4_media, tmp_path, monkeypatch):
+    # 마지막 video chunk의 offset만 뒤의 free 슬랙으로 돌린다. 첫 chunk를 돌리면 chunk가
+    # 단조 증가하지 않아 표 전체가 버려지고 카빙으로 빠져 가드에 닿지 않는다(#126).
+    import core.mp4_recovery as module
     source = mp4_media['avc']; data = bytearray(source.read_bytes())
-    size = len(data); packet = packet_map(source)[0]
+    size = len(data); packet = packet_map(source)[-1]
     old = data[int(packet['pos']):int(packet['pos'])+int(packet['size'])]
     data += struct.pack('>I4s', len(old)+8, b'free') + old
-    stco = data.find(b'stco'); struct.pack_into('>I', data, stco+12, size+8)
+    boxes, _, _ = discover(data); moov = next(b for b in boxes if b.kind == b'moov')
+    track = parse_moov(data, moov)[0][0]
+    stco = data.find(b'stco', moov.start); n = int.from_bytes(data[stco+8:stco+12], 'big')
+    last_chunk = int.from_bytes(data[stco+12+(n-1)*4:stco+12+n*4], 'big')
+    in_last_chunk = sum(1 for a, _, _ in track.samples if a >= last_chunk)
+    assert 1 <= in_last_chunk < 90
+    struct.pack_into('>I', data, stco+12+(n-1)*4, size+8)
     path = tmp_path/'poisoned.mp4'; path.write_bytes(data)
+    seen = {}
+    original_indexed = module.indexed_frames
+    def spy(buf, track, limit, media, check, stats, forbidden=()):
+        seen['forbidden'] = list(forbidden); seen['stats'] = stats
+        return original_indexed(buf, track, limit, media, check, stats, forbidden)
+    monkeypatch.setattr(module, 'indexed_frames', spy)
     r = recover_mp4(path, tmp_path/'out')
-    # A corrupt source table may fall back to bounded current mdat carving.
+    assert any(a <= size+8 < b for a, b in seen['forbidden']) and seen['stats']['damaged_samples'] == in_last_chunk
+    v = r['videos'][0]
+    assert v['recovery_method'] == 'source_sample_tables' and v['candidate_frames'] == 90-in_last_chunk
+    assert pixels(tmp_path/'out'/v['file']) == pixels(source)[:90-in_last_chunk]
     for row in csv.DictReader((tmp_path/'out'/'nal_offsets.csv').open(encoding='utf-8-sig')):
         assert int(row['source_nal_offset']) < size
 

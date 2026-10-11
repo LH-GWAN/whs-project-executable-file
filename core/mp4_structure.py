@@ -31,13 +31,14 @@ class Box:
     payload: int
     end: int
     truncated: bool = False
+    unbounded: bool = False  # 크기 0(파일 끝까지) 선언: 경계 근거로 쓰지 않는다.
 
 
 def box_at(data, pos, end, *, truncated_mdat=False):
     if pos < 0 or pos + 8 > end:
         raise InvalidMP4('incomplete box header')
     size, kind = struct.unpack_from('>I4s', data, pos)
-    header = 8
+    header = 8; unbounded = False
     if size == 1:
         if pos + 16 > end:
             raise InvalidMP4('incomplete extended box header')
@@ -46,14 +47,14 @@ def box_at(data, pos, end, *, truncated_mdat=False):
     elif size == 0:
         if kind != b'mdat':
             raise InvalidMP4('unbounded non-media box')
-        size = end - pos
+        size = end - pos; unbounded = True
     if size < header:
         raise InvalidMP4('invalid box size')
     stop = pos + size
     truncated = stop > end
     if truncated and not (truncated_mdat and kind == b'mdat'):
         raise InvalidMP4('box outside enclosing extent')
-    return Box(kind, pos, pos + header, min(stop, end), truncated)
+    return Box(kind, pos, pos + header, min(stop, end), truncated, unbounded)
 
 
 def checked_range(count, check):
@@ -290,10 +291,13 @@ def parse_track(data, trak, check=lambda: None):
             raise InvalidMP4('incomplete sample mapping')
         stts = child(data, stbl, b'stts', check); p, n = table(data, stts, 8)
         runs = [struct.unpack_from('>II', data, p + i * 8) for i in checked_range(n, check)]
-        if sum(a for a, _ in runs) != count or any(not a or not b for a, b in runs):
+        if sum(a for a, _ in runs) != count or any(not a for a, _ in runs):
             raise InvalidMP4('invalid sample durations')
-        if count:
-            t.fps = Fraction(count * t.timescale, sum(a * b for a, b in runs))
+        # ffmpeg는 VFR 출력의 마지막 샘플에 delta 0을 정상적으로 쓴다. 표는
+        # 그대로 두고 FPS 계산에서만 뺀다. 출력 FPS는 평균이 아니라 공칭값
+        # (과반 샘플의 delta)이다: 한 샘플만 길이가 달라도 평균 분수는 약분되지
+        # 않아 지원 범위를 넘고, 검토용 영상의 재생 속도는 공칭값이 맞다.
+        t.fps = nominal_rate(t.timescale, Counter({b: a for a, b in runs if b}) if count else Counter())
         ticks = 0
         for number, duration in runs:
             for _ in checked_range(number, check):
@@ -309,7 +313,9 @@ def parse_track(data, trak, check=lambda: None):
             for i in checked_range(n, check):
                 first = p + 8 + i * 8
                 repeat = u32(data, first)
-                value = int.from_bytes(data[first + 4:first + 8], 'big', signed=data[p] == 1)
+                # version 0도 int32로 읽는다. ffmpeg 등은 version 0에 음수
+                # 오프셋을 쓰며, 부호 없이 읽으면 표시 순서가 뒤섞인다.
+                value = int.from_bytes(data[first + 4:first + 8], 'big', signed=True)
                 if not repeat or len(t.composition) + repeat > count:
                     raise InvalidMP4('invalid composition run')
                 t.composition.extend([value] * repeat)
@@ -318,6 +324,71 @@ def parse_track(data, trak, check=lambda: None):
     except (InvalidMP4, struct.error, IndexError) as exc:
         t.samples.clear(); t.composition.clear(); t.decode_times.clear(); t.durations.clear(); t.table_error = str(exc)
     return t
+
+
+def nominal_rate(timescale, counts):
+    """샘플 길이 분포에서 공칭 FPS를 고른다. 과반이 같은 길이면 그 값, 아니면 평균."""
+    counts = Counter({d: n for d, n in counts.items() if d and n})
+    total = sum(counts.values())
+    if not total:
+        return None
+    duration, frequency = counts.most_common(1)[0]
+    if frequency * 2 > total:
+        return Fraction(timescale, duration)
+    return Fraction(total * timescale, sum(d * n for d, n in counts.items()))
+
+
+def trak_handlers(data, moov, check=lambda: None):
+    """moov 안 모든 trak의 handler. 파싱에 실패해도 trak 수는 세야 한다.
+
+    둘째 카메라의 trak이 손상돼 parse_track이 실패하면 그 채널은 사라진 것이
+    아니라 '알 수 없는 영상 채널'이다. 반환값: [(trak Box, handler bytes|None)].
+    """
+    result = []
+    for b in children(data, moov.payload, moov.end, check):
+        if b.kind != b'trak':
+            continue
+        handler = None
+        try:
+            hdlr = child(data, child(data, b, b'mdia', check), b'hdlr', check)
+            if hdlr.payload + 12 <= hdlr.end:
+                handler = bytes(data[hdlr.payload + 8:hdlr.payload + 12])
+        except (InvalidMP4, struct.error, IndexError):
+            handler = None
+        result.append((b, handler))
+    return result
+
+
+def samples_consistent(data, track, limit, count=64, check=lambda: None):
+    """표가 가리키는 바이트가 실제로 길이 접두 NAL로 샘플을 정확히 채우는지 확인.
+
+    크기 0·잘린 mdat 안에서 찾은 moov는 옛 녹화의 것일 수 있다. 같은 인코더라면
+    chunk offset이 현재 녹화 범위에 들어가므로 범위 검사만으로는 구별되지 않는다.
+    앞뒤 샘플 각 count개의 NAL 길이가 샘플을 정확히 채우고 헤더가 유효해야 한다.
+    """
+    if track.handler != b'vide' or not track.samples or track.length_size not in (1, 2, 4):
+        return False
+    picked = track.samples[:count] + track.samples[-count:] if len(track.samples) > 2 * count else track.samples
+    for offset, size, _ in picked:
+        check()
+        if offset < 0 or offset + size > limit:
+            return False
+        p, end = offset, offset + size
+        while p < end:
+            if p + track.length_size > end:
+                return False
+            n = int.from_bytes(data[p:p + track.length_size], 'big'); p += track.length_size
+            if not 0 < n <= 32 * 1024 * 1024 or p + n > end:
+                return False
+            head = data[p]
+            if head & 0x80 or (track.codec == 'h264' and head & 31 not in (1, 5, 6, 7, 8, 9, 10, 11, 12)):
+                return False
+            if track.codec == 'hevc' and (n < 3 or not data[p + 1] & 7 or (head >> 1) & 63 > 40):
+                return False
+            p += n
+        if p != end:
+            return False
+    return True
 
 
 def parse_moov(data, box, check=lambda: None):
@@ -352,6 +423,22 @@ def parse_moov(data, box, check=lambda: None):
 
 
 SIGNATURE = re.compile(rb'ftyp|moov|moof|mdat')
+KNOWN_TOP = (b'ftyp', b'moov', b'moof', b'mdat', b'free', b'skip', b'wide',
+             b'sidx', b'mfra', b'pdin', b'uuid', b'prft', b'emsg', b'styp')
+
+
+def opaque_box(data, b, end):
+    """목록에 없는 최상위 Box(udta/meta/ICAT 등)는 크기가 다음 Box나 파일 끝에 정확히
+    닿을 때만 내용을 보지 않는 opaque Box로 받는다. 그렇지 않으면 손상이다."""
+    if b.truncated or b.unbounded or not all(0x20 <= c < 0x7f for c in b.kind):
+        return False
+    if b.end == end:
+        return True
+    try:
+        following = box_at(data, b.end, end, truncated_mdat=True)
+    except (InvalidMP4, struct.error):
+        return False
+    return following.kind in KNOWN_TOP
 
 
 def valid_fragment(data, box, check=lambda: None):
@@ -373,8 +460,7 @@ def discover(data, cancel_check=lambda: None):
             raise InvalidMP4('too many top-level boxes')
         try:
             b = box_at(data, p, end, truncated_mdat=True)
-            if b.kind not in (b'ftyp', b'moov', b'moof', b'mdat', b'free', b'skip', b'wide',
-                              b'sidx', b'mfra', b'pdin', b'uuid', b'prft', b'emsg', b'styp'):
+            if b.kind not in KNOWN_TOP and not opaque_box(data, b, end):
                 raise InvalidMP4('unknown top-level box in recovery')
             if b.kind == b'moov':
                 parse_moov(data, b, cancel_check)
@@ -383,10 +469,12 @@ def discover(data, cancel_check=lambda: None):
                     raise InvalidMP4('invalid fragment header')
             elif b.kind == b'ftyp' and (b.end - b.payload < 8 or (b.end - b.payload) % 4):
                 raise InvalidMP4('invalid ftyp')
-            if b.kind == b'mdat' and b.truncated:
-                # A corrupted oversized mdat must not hide the source's intact
-                # moov. Accept only a complete movie whose live sample extent
-                # lies before it, then use that independently checked boundary.
+            if b.kind == b'mdat' and (b.truncated or b.unbounded):
+                # A corrupted oversized (or size 0) mdat must not hide the
+                # source's intact moov. Accept only a complete movie whose live
+                # sample extent lies before it AND whose tables actually match
+                # the bytes there (an old recording's moov left in a
+                # preallocated slot also satisfies the extent check).
                 for match in scanned_matches(re.compile(b'moov'), data, b.payload, b.end, cancel_check):
                     cancel_check()
                     try:
@@ -394,8 +482,9 @@ def discover(data, cancel_check=lambda: None):
                         ts, _, _ = parse_moov(data, candidate, cancel_check)
                         video = [t for t in ts if t.handler == b'vide' and t.samples]
                         if video and all(b.payload <= a and a + n <= candidate.start
-                                         for t in video for a, n, _ in t.samples):
-                            b = Box(b.kind, b.start, b.payload, candidate.start, True)
+                                         for t in video for a, n, _ in t.samples) and all(
+                                samples_consistent(data, t, candidate.start, check=cancel_check) for t in video):
+                            b = Box(b.kind, b.start, b.payload, candidate.start, b.truncated, b.unbounded)
                             break
                     except (InvalidMP4, struct.error, IndexError):
                         continue
@@ -461,15 +550,60 @@ def discover(data, cancel_check=lambda: None):
     return sorted([b for b in boxes + embedded if b.start < limit], key=lambda b: b.start), limit, gaps
 
 
-def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
-    """Resolve tfhd/trun offsets, including 64-bit bases and per-track defaults."""
+def fragment_sequence(data, moof, check=lambda: None):
+    try:
+        mfhd = child(data, moof, b'mfhd', check)
+        if mfhd.end - mfhd.payload != 8:
+            return None
+        return u32(data, mfhd.payload + 4)
+    except (InvalidMP4, struct.error, IndexError):
+        return None
+
+
+def fragment_samples(data, boxes, tracks, defaults, check=lambda: None, state=None):
+    """Resolve tfhd/trun offsets, including 64-bit bases and per-track defaults.
+
+    state(dict, 선택)에 다음을 기록한다.
+    - recording_end: 녹화 끝으로 판정한 오프셋(None이면 없음). mfhd 순번이 역행하거나
+      손상 없이 건너뛰는 지점, tfdt가 되돌아가는 지점은 같은 카메라의 옛 fragment가
+      남은 것이다. 옛 GOP도 IDR로 시작해 디코딩 검증을 통과하므로 구조로 끊어야 한다.
+    - unknown_track_ids: trak이 없는 traf의 track id 집합(파싱 실패한 둘째 카메라 등).
+    """
     byid = {t.id: t for t in tracks}
+    state = state if state is not None else {}
+    state.setdefault('recording_end', None); state.setdefault('unknown_track_ids', set())
     media = [(b.payload, b.end) for b in boxes if b.kind == b'mdat']
     duration_counts, errors, dts_ends = {}, [], {}
     sample_numbers = {t.id: max((n for _, _, n in t.samples), default=0) for t in tracks}
     broken_tracks = set()
-    for moof in (b for b in boxes if b.kind == b'moof'):
+    ordered = sorted(boxes, key=lambda b: b.start)
+    previous_sequence = previous_moof = None
+    comparisons = 0; sequence_usable = True
+    for moof in (b for b in ordered if b.kind == b'moof'):
         check(); previous_end = moof.start
+        sequence = fragment_sequence(data, moof, check)
+        if (sequence_usable and previous_moof is not None and sequence is not None
+                and previous_sequence is not None):
+            if comparisons == 0 and sequence == previous_sequence:
+                # 처음부터 같은 순번을 쓰는 muxer: 순번에 정보가 없다. tfdt 검사만 남긴다.
+                sequence_usable = False
+            comparisons += 1
+        if sequence_usable and previous_moof is not None and sequence is not None and previous_sequence is not None:
+            # 직전 moof부터 이 moof까지 Box가 빈틈없이 이어지면 손상이 없는 구간이다.
+            between = [b for b in ordered if previous_moof.start <= b.start <= moof.start]
+            intact = all(a.end == b.start for a, b in zip(between, between[1:]))
+            if sequence <= previous_sequence or (intact and sequence != previous_sequence + 1):
+                state['recording_end'] = moof.start
+                errors.append(f'moof@{moof.start}: mfhd 순번 {sequence}이(가) 직전 {previous_sequence}에서 '
+                              '이어지지 않아 녹화 끝(옛 fragment)으로 판정, 이후 fragment 제외')
+                break
+        if sequence is not None:
+            previous_sequence = sequence
+        previous_moof = moof
+        stale = False
+        snapshot = {t.id: (len(t.samples), len(t.composition), len(t.decode_times), len(t.durations),
+                           sample_numbers.get(t.id, 0), dts_ends.get(t.id), set(t.break_offsets),
+                           Counter(duration_counts.get(t.id, Counter()))) for t in tracks}
         for traf in (b for b in children(data, moof.payload, moof.end, check) if b.kind == b'traf'):
             tid = None
             try:
@@ -496,6 +630,8 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                 if p != tfhd.end:
                     raise InvalidMP4('invalid tfhd extent')
                 t = byid.get(tid); cursor = base; pending = []; ticks = 0
+                if t is None:
+                    state['unknown_track_ids'].add(tid)
                 number = sample_numbers.get(tid, 0)
                 pending_composition, pending_times, pending_durations, kept_durations = [], [], [], Counter()
                 excluded = 0
@@ -555,6 +691,12 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                 if t:
                     if len(t.samples) + len(pending) > MAX_TABLE:
                         raise InvalidMP4('too many fragment samples')
+                    if dts is not None and tid in dts_ends and dts < dts_ends[tid] - max(1, t.timescale // 2):
+                        # 되돌아간 tfdt는 손상으로 설명되지 않는다: 옛 녹화의 fragment.
+                        # (muxer의 반올림 오차는 0.5초 안에서 허용한다.)
+                        stale = True
+                        raise InvalidMP4(f'track {tid} tfdt {dts}이(가) 직전 끝 {dts_ends[tid]}보다 앞서 '
+                                         '녹화 끝(옛 fragment)으로 판정, 이후 fragment 제외')
                     if pending and (tid in broken_tracks or dts is None
                                     or (tid in dts_ends and dts != dts_ends[tid])):
                         t.break_offsets.add(pending[0][0])
@@ -580,16 +722,28 @@ def fragment_samples(data, boxes, tracks, defaults, check=lambda: None):
                 previous_end = cursor
             except (InvalidMP4, struct.error, IndexError) as exc:
                 errors.append(f'moof@{moof.start}: {exc}')
+                if stale:
+                    break
                 if tid in byid:
                     broken_tracks.add(tid)
+        if stale:
+            # 같은 moof의 다른 트랙에서 이미 받은 샘플도 옛 fragment의 것이다.
+            for t in tracks:
+                ns, nc, nd, nu, number, dts_end, breaks, counts = snapshot[t.id]
+                del t.samples[ns:]; del t.composition[nc:]; del t.decode_times[nd:]; del t.durations[nu:]
+                sample_numbers[t.id] = number; t.break_offsets = breaks
+                if dts_end is None:
+                    dts_ends.pop(t.id, None)
+                else:
+                    dts_ends[t.id] = dts_end
+                duration_counts[t.id] = counts
+            state['recording_end'] = moof.start
+            break
     for t in tracks:
         counts = duration_counts.get(t.id)
         if counts and not counts.get(0):
-            duration, frequency = counts.most_common(1)[0]
-            total = sum(counts.values())
             # An audio-alignment extension to one picture must not change a
             # CFR recording's nominal playback rate. Missing pictures do not
             # contribute durations to the review video's rate either.
-            t.fps = (Fraction(t.timescale, duration) if frequency * 2 > total else
-                     Fraction(total * t.timescale, sum(d * n for d, n in counts.items())))
+            t.fps = nominal_rate(t.timescale, counts)
     return errors

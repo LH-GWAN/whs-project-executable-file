@@ -11,11 +11,21 @@ REM            https://www.python.org/downloads/windows/
 REM ============================================================
 
 setlocal
-REM A UNC path (\\server\share) cannot be a working directory for cmd; "cd /d" then
-REM silently stays in C:\Windows and the clean step below would run there (review #128).
-pushd "%~dp0" || (
-    echo [ERROR] Cannot change to the script folder: %~dp0
-    echo         Copy the project to a local drive (not a \\server\share path).
+REM A UNC path (\\server\share) is refused outright. "cd /d" silently stays in C:\Windows
+REM there (review #128), and pushd would quietly map a temporary drive letter instead, so
+REM the venv and the IDAS.lnk shortcut would point at a drive that is gone after a reboot
+REM (review #98). Note for editing: inside a ( ... ) block an unquoted ")" ends the block,
+REM so paths are quoted and messages carry no parentheses there (review #25).
+set "SCRIPT_DIR=%~dp0"
+if "%SCRIPT_DIR:~0,2%"=="\\" (
+    echo [ERROR] The project is on a network path: "%SCRIPT_DIR%"
+    echo         Copy the project to a local drive such as C:\ or D:\ and run it there.
+    pause
+    exit /b 1
+)
+pushd "%SCRIPT_DIR%" || (
+    echo [ERROR] Cannot change to the script folder: "%SCRIPT_DIR%"
+    echo         Copy the project to a local drive and run the script there.
     pause
     exit /b 1
 )
@@ -99,11 +109,20 @@ echo.
 echo [3/5] Cleaning previous build...
 REM Key files and basemaps that were put into dist\IDAS\_internal\assets\ after the last
 REM build (as assets\README.md tells the user to do) must survive the rebuild (review #58).
+REM Only files that are NOT in assets\ are kept: a file that is in assets\ is bundled fresh
+REM by idas.spec, and restoring an old copy over it shipped a replaced key as the old key.
+REM A build_keep_assets\ left behind by a failed build is not deleted here - it is restored
+REM after this build like the rest (review #59). The folder is in .gitignore.
 set "KEEP=%CD%\build_keep_assets"
-if exist "%KEEP%\" rmdir /s /q "%KEEP%"
+if exist "%KEEP%\" echo [INFO] build_keep_assets\ from an earlier run is kept and restored after this build.
 if exist "dist\IDAS\_internal\assets\" (
-    echo [INFO] Keeping files from dist\IDAS\_internal\assets\ (restored after the build)
-    xcopy "dist\IDAS\_internal\assets" "%KEEP%\" /E /I /Q /Y >nul
+    for %%f in ("dist\IDAS\_internal\assets\*") do (
+        if not exist "assets\%%~nxf" (
+            if not exist "%KEEP%\" mkdir "%KEEP%"
+            echo [INFO] Keeping dist\IDAS\_internal\assets\%%~nxf - restored after the build
+            copy /Y "%%f" "%KEEP%\" >nul
+        )
+    )
 )
 if exist "build\" rmdir /s /q build
 if exist "dist\"  rmdir /s /q dist
@@ -116,8 +135,16 @@ if errorlevel 1 goto :error
 
 if exist "%KEEP%\" (
     echo [INFO] Restoring kept files into dist\IDAS\_internal\assets\
-    xcopy "%KEEP%" "dist\IDAS\_internal\assets\" /E /I /Q /Y >nul
-    rmdir /s /q "%KEEP%"
+    if not exist "dist\IDAS\_internal\assets\" mkdir "dist\IDAS\_internal\assets"
+    for %%f in ("%KEEP%\*") do (
+        if exist "dist\IDAS\_internal\assets\%%~nxf" (
+            echo [WARN] %%~nxf is already in the new build - the kept copy stays in build_keep_assets\
+        ) else (
+            copy /Y "%%f" "dist\IDAS\_internal\assets\" >nul
+            del /q "%%f"
+        )
+    )
+    rmdir /q "%KEEP%" 2>nul
 )
 
 if not exist "dist\IDAS\IDAS.exe" (

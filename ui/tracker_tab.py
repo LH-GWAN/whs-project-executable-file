@@ -29,7 +29,7 @@ from core.video_tracks import TRACK_MODE_BOTH, TRACK_MODE_FRONT, TRACK_MODE_REAR
 from core.driving_events import DrivingEvent
 from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
-from ui.map_view import MapView
+from ui.map_view import MapView, is_synthetic_point
 
 # ±버튼 건너뛰기. 5초는 너무 많이 건너뛴다는 의견으로 3초.
 SKIP_MS = 3000
@@ -53,8 +53,17 @@ GPS_JITTER_TOLERANCE_SEC = 0.15
 def _is_gps_row(p: TrackPoint) -> bool:
     """GPS 기록으로 볼 행. NMEA 기기는 시각 필드(gps_utc_time)가 있고, FineVu처럼 자체 형식으로
     좌표·속도만 쓰는 기기는 시각 필드가 없다 - 좌표가 있으면 GPS 기록이다(검토 제보: FineVu
-    샘플이 표에는 나오는데 영상 밑에는 "미기록"만 떴다)."""
-    return p.has_gps_record or p.has_coords
+    샘플이 표에는 나오는데 영상 밑에는 "미기록"만 떴다). 손상 구간의 빈 행(damaged)도 그 초의 상태를
+    '(손상 구간)'으로 보이기 위해 포함한다 - 빼면 '(GPS 미기록)'으로 나오고 시계가 직전 시각에 멈췄다(리뷰 #21)."""
+    return p.has_gps_record or p.has_coords or p.recovery_state == "damaged"
+
+
+def _time_estimate_tag(p: Optional[TrackPoint]) -> str:
+    """재생 시각이 추정값인 행의 표: UTC로 추정했으면 '(UTC 추정)', 경과 초·기기 절대 시각으로 추정했으면 '(추정)'.
+    time_source는 core/damage_marks의 TIME_SOURCE_*_ESTIMATED 값이다(리뷰 #74)."""
+    if p is None or not (getattr(p, "time_estimated", False) or (p.time_source or "").endswith("_estimated")):
+        return ""
+    return " (UTC 추정)" if (p.time_source or "") in ("", "gps_utc_estimated") else " (추정)"
 
 
 def _gps_key(p: TrackPoint):
@@ -515,8 +524,17 @@ class TrackerTab(QWidget):
         offset = self._offsets_ms[self._seg] if self._seg < len(self._offsets_ms) else 0
         return offset + max(0, local_ms)
 
+    def _local_position_ms(self) -> int:
+        """지금 영상 안의 현재 위치. 구간을 여는 중이면 재생기 위치는 아직 0이라, 로드 뒤 옮겨 갈 목표 위치를
+        현재 위치로 본다 - 막대를 옮긴 직후 →를 누르면 0초 기준으로 계산돼 이전 영상으로 넘어갔다(리뷰 #79)."""
+        if self._pending_seek_ms is not None:
+            return max(0, self._pending_seek_ms)
+        if self._prime_pending:
+            return max(0, self._prime_target_ms)
+        return self._player.position()
+
     def global_position_ms(self) -> int:
-        return self._global_ms(self._player.position())
+        return self._global_ms(self._local_position_ms())
 
     def _locate(self, global_ms: int) -> Tuple[int, int]:
         """전체 시각 → (구간, 그 영상 안의 위치)."""
@@ -585,8 +603,10 @@ class TrackerTab(QWidget):
         self._rear_pane.setVisible(active)
         self._front_pane.set_caption("전방", active)
         self._rear_pane.set_caption("후방", active)
-        if not (keep_enlarged and active):
-            self._enlarged = None   # 이어보기에서 영상이 바뀔 때는 키워 둔 쪽을 그대로 둔다(리뷰 #117)
+        if not keep_enlarged:
+            # 이어보기에서 영상이 바뀔 때는 키워 둔 쪽을 그대로 둔다(리뷰 #117). 구간을 열며 후방을 잠깐 끌 때도
+            # 지우지 않아야 다음 영상에서 복원된다 - 예전엔 끌 때 무조건 지워 1:1로 돌아갔다(리뷰 #70).
+            self._enlarged = None
         self._apply_split_sizes()
 
     def enlarged_pane(self) -> Optional[int]:
@@ -752,7 +772,8 @@ class TrackerTab(QWidget):
         self._gps_times = [t for t, _ in self._gps_rows]
         self._fix_rows = [(t, p) for t, p in self._gps_rows if p.has_fix]
         self._fix_times = [t for t, _ in self._fix_rows]
-        self._gps_interval = estimate_gps_interval(self._gps_rows)
+        # 주기는 실측 행으로만 잰다 - 손상 구간의 합성 행(1초 간격 고정)이 기기 주기를 흐리지 않게.
+        self._gps_interval = estimate_gps_interval([r for r in self._gps_rows if not is_synthetic_point(r[1])])
         self._update_info(0.0)
 
     def gps_interval(self) -> float:
@@ -794,21 +815,32 @@ class TrackerTab(QWidget):
 
         point = self._slot_point(seconds)
 
+        # 손상 처리로 만든 합성 행은 실측처럼 보이면 안 된다(리뷰 #21). 끊김(좌표 없음)은 검증 실패보다
+        # 먼저 본다 - 리포트·표(core/location_table.row_texts)와 같은 순서(리뷰 #116, #93).
         if point is None:
             status = "(GPS 미기록)"
+        elif point.recovery_state == "damaged":
+            status = "(손상 구간)"
+        elif is_synthetic_point(point):
+            status = "(추정 좌표)"
         elif point.is_outlier:
             status = "(이상치)"
+        elif point.is_dropout:
+            status = "(GPS 끊김)"
         elif point.gps_checksum_ok is False or point.gps_trusted is False:
             status = "(검증 실패)"
         elif point.has_fix:
             status = ""
-        elif point.is_dropout:
-            status = "(GPS 끊김)"
         else:
             status = "(GPS 미기록)"
         self._status_label.setText(status)
-        self._status_label.setToolTip(
-            "이 시점의 GPS 기록이 없거나 이상치라 마지막 정상 측정값을 그대로 표시합니다." if status else "")
+        if status == "(손상 구간)":
+            status_tip = "파일의 이 부분이 손상돼 기록이 없습니다. 마지막 정상 측정값을 그대로 표시합니다."
+        elif status == "(추정 좌표)":
+            status_tip = "임의 복구: 손상 직전 좌표와 손상 뒤 첫 좌표를 직선으로 이은 추정값입니다. 측정값이 아닙니다."
+        else:
+            status_tip = "이 시점의 GPS 기록이 없거나 이상치라 마지막 정상 측정값을 그대로 표시합니다." if status else ""
+        self._status_label.setToolTip(status_tip)
 
         # 지도와 동일하게 현재 시각 이하의 마지막 유효 좌표를 조회한다.
         i = bisect.bisect_right(self._fix_times, seconds) - 1
@@ -816,10 +848,19 @@ class TrackerTab(QWidget):
         self._last_valid = shown
         clock_i = bisect.bisect_right(self._gps_times, seconds) - 1
         clock_point = self._gps_rows[clock_i][1] if clock_i >= 0 else None
-        clock = gpstime.format_point(clock_point)
-        self._clock_label.setText(f"날짜·시간 {clock}" if clock else "날짜·시간 -")
-        self._clock_label.setToolTip(
-            f"UTC 원본: {clock_point.gps_date} {clock_point.gps_utc_time}" if clock_point else "")
+        if clock_point is not None and is_synthetic_point(clock_point):
+            # 합성 행에는 GPS 시각이 없다. 직전 시각을 그대로 두면 시계가 멈춘 것처럼 보인다(리뷰 #21).
+            self._clock_label.setText("날짜·시간 - " + ("(손상 구간)" if clock_point.recovery_state == "damaged" else "(추정 구간)"))
+            self._clock_label.setToolTip("손상 구간이라 이 시점의 GPS 기록 시각이 없습니다.")
+        else:
+            clock = gpstime.format_point(clock_point)
+            # 재생 시각을 GPS 기록으로 추정한 행(헤더 소실 AVI·moov 소실 MP4 카빙)은 시각에 표를 단다(리뷰 #74).
+            est = _time_estimate_tag(clock_point)
+            self._clock_label.setText(f"날짜·시간 {clock}{est}" if clock else "날짜·시간 -")
+            tip = f"UTC 원본: {clock_point.gps_date} {clock_point.gps_utc_time}" if clock_point else ""
+            if est:
+                tip += ("\n" if tip else "") + f"{est} 재생 위치를 영상 시간축이 아니라 GPS 기록으로 추정했습니다 - 영상과 몇 초 어긋날 수 있습니다."
+            self._clock_label.setToolTip(tip)
         if shown is None:
             self._speed_label.setText("속도 -")
             self._coord_label.setText("위치 -")
@@ -828,13 +869,22 @@ class TrackerTab(QWidget):
             self._addr_key = None
             return
         age = max(0.0, seconds - self._fix_times[i])
-        self._coord_label.setToolTip(f"GPS 측정: 영상 {self._fix_times[i]:.3f}초 / 경과 {age:.3f}초")
+        estimated = is_synthetic_point(shown)
+        if estimated:
+            self._coord_label.setToolTip(f"추정 좌표(임의 복구, 측정값 아님): 영상 {self._fix_times[i]:.3f}초 / 경과 {age:.3f}초")
+        else:
+            self._coord_label.setToolTip(f"GPS 측정: 영상 {self._fix_times[i]:.3f}초 / 경과 {age:.3f}초")
         if point is None or not point.has_fix:
-            self._status_label.setToolTip(f"이전 정상값: 영상 {self._fix_times[i]:.3f}초 (현재보다 {age:.3f}초 이전)")
+            self._status_label.setToolTip(status_tip + f"\n이전 정상값: 영상 {self._fix_times[i]:.3f}초 (현재보다 {age:.3f}초 이전)")
         speed = shown.speed_kmh
         self._speed_label.setText(f"속도 {speed:.1f} km/h" if speed is not None and math.isfinite(speed) else "속도 -")
 
         self._coord_label.setText(f"위치 {shown.latitude:.6f}, {shown.longitude:.6f}")
+        if estimated:
+            # 추정 좌표로는 주소를 조회하지 않는다(외부 전송도, 실측처럼 보이는 주소도 없게).
+            self._addr_label.setText("")
+            self._addr_key = None
+            return
         self._show_address(shown.latitude, shown.longitude)
 
     def _show_address(self, lat: float, lon: float) -> None:
@@ -858,13 +908,20 @@ class TrackerTab(QWidget):
             self._addr_label.setText(f"({address})" if address else "")
 
     # ---------- 재생 조작 ----------
+    def _pause_rear(self) -> None:
+        """후방 재생기를 멈춘다. 후방이 끝난(EndOfMedia) 상태에서 pause()를 부르면 Qt가 0초로 되감아 녹화 시작
+        장면이 남는다(리뷰 #84). _sync_rear에만 있던 검사를 후방을 멈추는 모든 경로가 거치게 한다(리뷰 #78)."""
+        if self._rear_player.mediaStatus() == QMediaPlayer.EndOfMedia:
+            return
+        self._rear_player.pause()
+
     def _toggle_play(self) -> None:
         was_priming = self._priming
         self._cancel_priming()
         if self._player.playbackState() == QMediaPlayer.PlayingState and not was_priming:
             self._player.pause()
             if self._rear_active:
-                self._rear_player.pause()
+                self._pause_rear()
         elif self._ended and len(self._playlist) > 1:
             # 이어보기를 끝까지 본 뒤 재생: 마지막 영상만 다시 트는 게 아니라 처음부터(리뷰 #116)
             self._ended = False
@@ -880,7 +937,12 @@ class TrackerTab(QWidget):
 
     def _skip(self, delta_ms: int) -> None:
         total = self.total_duration_ms()
-        target = self.global_position_ms() + delta_ms
+        if self._player.error() != QMediaPlayer.NoError:
+            # 재생할 수 없는 구간: 재생기 위치는 0에 멈춰 있으니 막대 값을 기준으로 옮긴다(리뷰 #111).
+            base = self._seek_slider.value()
+        else:
+            base = self.global_position_ms()
+        target = base + delta_ms
         target = max(0, min(target, total) if total > 0 else max(0, target))
         self._on_slider_moved(target)
 
@@ -898,19 +960,22 @@ class TrackerTab(QWidget):
 
     def step_frame(self, direction: int) -> None:
         """한 프레임 앞(+1)/뒤(-1). 재생 중이면 멈추고 옮긴다."""
-        self._cancel_priming()
         if self._player.playbackState() == QMediaPlayer.PlayingState:
             self._player.pause()
             if self._rear_active:
-                self._rear_player.pause()
+                self._pause_rear()
         step = self._frame_ms()
-        pos = self.global_position_ms()
-        # 33.33ms를 33으로 내림하면 다음 프레임의 pts에 닿지 못해 화면이 안 바뀐다(리뷰 #115). 다음(이전)
-        # 프레임 경계로 올림(내림)해 목표를 잡는다.
-        if direction > 0:
-            target = int(math.ceil((math.floor(pos / step + 1e-6) + 1) * step))
-        else:
-            target = int(math.floor((math.ceil(pos / step - 1e-6) - 1) * step))
+        # 프레임 번호는 지금 영상 안의 위치(로컬)로 센다. 구간 offset을 더한 전체 시각으로 세면 2번째 영상부터
+        # 경계가 어긋나 앞으로도 뒤로도 못 갔다(리뷰 #72). 로드 중이면 대기 중인 목표 위치가 현재 위치다(리뷰 #79).
+        local = self._local_position_ms()
+        frame = math.floor(local / step + 1e-6)
+        # 33.33ms를 33으로 내림하면 그 프레임의 pts에 닿지 못해 화면이 안 바뀐다(리뷰 #115). 앞뒤 모두
+        # 목표 프레임 경계로 올림해 pts 이상을 겨눈다 - 뒤로 갈 때 내림하면 현재 프레임에 머물렀다.
+        target_local = max(0, int(math.ceil((frame + direction) * step - 1e-6)))
+        seg_len = self._durations_ms[self._seg] if self._seg < len(self._durations_ms) else 0
+        if seg_len > 0:
+            target_local = min(target_local, seg_len)
+        target = self._global_ms(target_local)
         self._on_slider_moved(max(0, min(target, self.total_duration_ms() or target)))
 
     def _on_key(self, event) -> bool:
@@ -942,16 +1007,34 @@ class TrackerTab(QWidget):
         self._sync_rear(self._player.position())
 
     def _on_slider_moved(self, global_ms: int) -> None:
-        self._cancel_priming()
         seg, position = self._locate(global_ms)
         if seg != self._seg and self._playlist:
             # 다른 영상으로 넘어간다: 그 파일을 열고 위치를 옮긴다(재생 중이었으면 이어서 재생).
+            self._cancel_priming()
             playing = self._player.playbackState() == QMediaPlayer.PlayingState
             self._segment_switching = True
             try:
                 self._load_segment(seg, position, play=playing, prime=not playing)
             finally:
                 self._segment_switching = False
+            return
+        if self._prime_pending or self._pending_seek_ms is not None:
+            # 구간을 여는 중: 첫 장면 띄우기는 그대로 두고 목표 위치만 바꾼다. 예전엔 띄우기를 취소하고 0초
+            # 기준으로 탐색해 화면이 검게 남았다(리뷰 #79).
+            if self._prime_pending:
+                self._prime_target_ms = position
+            else:
+                self._pending_seek_ms = position
+            self._ended = False
+            self._on_position_changed(position)
+            return
+        self._cancel_priming()
+        if self._player.error() != QMediaPlayer.NoError:
+            # 재생할 수 없는 구간: 원인 문구를 덮지 않는다(리뷰 #111). 막대 값은 사용자가 옮긴 자리에 두어
+            # ±버튼으로 다른 구간까지 옮겨 갈 수 있게 한다.
+            with QSignalBlocker(self._seek_slider):
+                self._seek_slider.setValue(global_ms)
+            self._time_label.setText(f"{_fmt_ms(global_ms)} / {_fmt_ms(self.total_duration_ms())}")
             return
         if self._player.source().isEmpty() or not self._player.isSeekable():
             self._media_label.setText("아직 탐색할 수 없습니다. 영상 로드 후 다시 시도하세요.")
@@ -960,6 +1043,7 @@ class TrackerTab(QWidget):
             return
         duration = self._player.duration()
         position = max(0, min(position, duration)) if duration > 0 else max(0, position)
+        self._ended = False   # 같은 구간 안에서 옮겨도 '끝까지 봄'은 풀린다 - 안 풀면 재생 때 1번 영상으로 갔다(리뷰 #71)
         self._player.setPosition(position)
         self._sync_rear(self._player.position())
         self._on_position_changed(self._player.position())
@@ -1004,11 +1088,11 @@ class TrackerTab(QWidget):
         if rear:
             self._rear_prime_timer.stop()
             self._rear_prime_pending = False
-            self._rear_player.pause()
+            self._pause_rear()
         else:
             self._cancel_priming()
             self._player.pause()
-            self._rear_player.pause()
+            self._pause_rear()
             # 이어보기면 다른 구간으로는 갈 수 있어야 한다(리뷰 #88): 재생 버튼만 끈다.
             if len(self._playlist) > 1:
                 self._play_btn.setEnabled(False)
@@ -1023,10 +1107,8 @@ class TrackerTab(QWidget):
         duration = self._rear_player.duration()
         # 길이를 0으로 주는 파일(헤더 길이 0인 AVI)은 길이 검사를 건너뛴다(리뷰 #86).
         if duration > 0 and position >= duration:
-            # 후방이 더 짧아 끝났으면 마지막 장면에 둔다. EndOfMedia 상태에서 pause()를 부르면 Qt가
-            # 0초로 되감아 녹화 시작 장면이 남았다(리뷰 #84).
-            if self._rear_player.mediaStatus() != QMediaPlayer.EndOfMedia:
-                self._rear_player.pause()
+            # 후방이 더 짧아 끝났으면 마지막 장면에 둔다(_pause_rear가 EndOfMedia면 건너뛴다 - 리뷰 #84).
+            self._pause_rear()
             self._media_label.setText("해당 시각 후방 영상 없음 (전후방은 동일 재생 시간 기준)")
             return
         if self._media_label.text().startswith("해당 시각 후방 영상 없음"):
@@ -1039,7 +1121,7 @@ class TrackerTab(QWidget):
         if self._player.playbackState() == QMediaPlayer.PlayingState:
             self._rear_player.play()
         else:
-            self._rear_player.pause()
+            self._pause_rear()
 
     def _cancel_priming(self) -> None:
         self._prime_timer.stop()

@@ -5,7 +5,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from core.appinfo import app_data_dir
 from core.paths import resource_root
@@ -61,12 +61,21 @@ def _decode_text(raw: bytes) -> str:
     return raw.decode("utf-8-sig")
 
 
-def _read_config_file() -> Dict[str, Any]:
+class ConfigReadError(OSError):
+    """설정 파일이 있는데 읽지 못했다(잠김·권한). 저장을 멈춰 파일의 다른 키를 잃지 않게 한다(리뷰 #46)."""
+
+
+def _read_config_file(strict: bool = False) -> Dict[str, Any]:
+    """strict=True면 파일이 있는데 읽지 못할 때 ConfigReadError를 낸다(파일이 없으면 빈 dict)."""
     path = _config_path()
     try:
         with open(path, "rb") as f:
             raw = f.read()
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if strict and os.path.exists(path):
+            raise ConfigReadError(str(exc)) from exc
         return {}
     try:
         data = json.loads(_decode_text(raw))
@@ -87,12 +96,20 @@ def load_config(force: bool = False) -> Dict[str, Any]:
     return dict(_config_cache)
 
 
-def save_config(data: Dict[str, Any]) -> bool:
+def save_config(data: Dict[str, Any], remove: Optional[Iterable[str]] = None) -> bool:
     """settings.json에 쓴다. 실패하면 False - 호출 쪽이 알리고 다음 실행에서 다시 묻는다(리뷰 #70).
-    쓰기 전에 파일을 다시 읽어 합친다 - 실행 중 직접 고친 값이 메모리 캐시에 덮이지 않게(리뷰 #108)."""
+    쓰기 전에 파일을 다시 읽어 합친다 - 실행 중 직접 고친 값이 메모리 캐시에 덮이지 않게(리뷰 #108).
+    remove에 적은 키는 파일에서 지운다 - 병합 때문에 지운 키가 되살아나던 문제(리뷰 #46).
+    파일이 있는데 읽지 못하면(잠김·권한) 쓰지 않고 False - 빈 내용과 합쳐 다른 키(키 덮어쓰기 값)를
+    지우지 않게 한다. 그때는 메모리 캐시도 바꾸지 않는다."""
     global _config_cache, _keys_cache
     path = _config_path()
-    merged = _read_config_file()
+    try:
+        merged = _read_config_file(strict=True)
+    except ConfigReadError:
+        return False
+    for key in remove or ():
+        merged.pop(key, None)
     merged.update(data)
     ok = True
     try:
@@ -121,12 +138,11 @@ def set_map_mode(mode: str) -> bool:
     return save_config({"map_mode": mode})
 
 
-def reset_map_mode() -> None:
-    """선택을 지워 다음 시작(또는 첫 실행 절차)에서 다시 묻게 한다. 다른 설정은 그대로."""
-    data = load_config()
-    if "map_mode" in data:
-        del data["map_mode"]
-        save_config(data)
+def reset_map_mode() -> bool:
+    """선택을 지워 다음 시작(또는 첫 실행 절차)에서 다시 묻게 한다. 다른 설정은 그대로.
+    예전엔 캐시에서 지운 dict를 save_config에 넘겼는데, 파일과 병합하면서 map_mode가 되살아났다(리뷰 #46).
+    저장 성공 여부를 돌려준다."""
+    return save_config({}, remove=["map_mode"])
 
 
 def config_path() -> str:
@@ -205,6 +221,19 @@ def _keys_from_text(text: str) -> tuple:
     return js, rest, ""
 
 
+def _decode_key_text(raw: bytes) -> str:
+    """키 파일은 UTF-8이 아니어도(메모장 ANSI=CP949로 저장한 경우) 버리지 않는다(리뷰 #136, #97).
+    키 값 자체는 ASCII라 어떤 인코딩으로 읽어도 같다. 안내 문구 등 나머지는 깨져도 상관없다."""
+    try:
+        return _decode_text(raw)
+    except (UnicodeDecodeError, UnicodeError):
+        pass
+    try:
+        return raw.decode("cp949")
+    except (UnicodeDecodeError, UnicodeError):
+        return raw.decode("utf-8", errors="replace")
+
+
 def scan_key_files() -> List[KeyFileInfo]:
     """assets/ 안에서 키 파일 후보를 전부 읽어 본다. online_keys.json이 먼저, 나머지는 이름순.
 
@@ -237,11 +266,7 @@ def scan_key_files() -> List[KeyFileInfo]:
         except OSError as exc:
             infos.append(KeyFileInfo(path, problem=f"읽지 못했습니다: {exc}"))
             continue
-        try:
-            text = _decode_text(raw)
-        except (UnicodeDecodeError, UnicodeError) as exc:
-            infos.append(KeyFileInfo(path, problem=f"텍스트로 읽지 못했습니다: {exc}"))
-            continue
+        text = _decode_key_text(raw)
         if "kakao" not in text.lower():
             continue
         js, rest, problem = _keys_from_text(text)

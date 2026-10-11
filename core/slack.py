@@ -51,9 +51,11 @@ RECORDING_GAP_SEC = 120.0
 
 
 def slack_track(raw_points: List[TrackPoint]) -> List[TrackPoint]:
-    """GPS 시각순으로 세우고 첫 기록 기준 경과 초를 start_time_sec에 넣는다. 시각이 2분 넘게 비거나
-    날짜가 바뀌면 segment_index를 올려 다른 녹화로 나눈다 - 2023년 서울 기록과 2024년 부산 기록이
-    실선 하나로 이어지던 문제(리뷰 #12). 녹화마다 이상치 판정도 거친다(리뷰 #33)."""
+    """GPS 시각순으로 세우고 첫 기록 기준 경과 초를 start_time_sec에 넣는다. 시각이 2분 넘게 비면
+    segment_index를 올려 다른 녹화로 나눈다 - 2023년 서울 기록과 2024년 부산 기록이 실선 하나로
+    이어지던 문제(리뷰 #12). 날짜(UTC)가 바뀌는 것은 기준에 넣지 않는다: 자정(UTC)은 한국 시간 09:00이라
+    연속 기록이 두 묶음으로 갈라졌다(리뷰 #103). 녹화마다 이상치 판정도 거치고, 시각 없는 행도 좌표 검사는
+    받는다 - (0,0)을 채우는 기기의 행이 표와 지도 링크에 정상 좌표로 나왔다(리뷰 #33·#104)."""
     from core.outliers import mark_outliers
 
     timed = [(utc, p) for p in raw_points if (utc := _utc_of(p)) is not None]
@@ -64,8 +66,7 @@ def slack_track(raw_points: List[TrackPoint]) -> List[TrackPoint]:
     segment = 0
     prev_utc = None
     for utc, p in timed:
-        if prev_utc is not None and ((utc - prev_utc).total_seconds() > RECORDING_GAP_SEC
-                                     or utc.date() != prev_utc.date()):
+        if prev_utc is not None and (utc - prev_utc).total_seconds() > RECORDING_GAP_SEC:
             segment += 1
         p.start_time_sec = (utc - base).total_seconds()
         p.end_time_sec = None
@@ -77,7 +78,9 @@ def slack_track(raw_points: List[TrackPoint]) -> List[TrackPoint]:
     for p in untimed:
         p.start_time_sec = None
         p.segment_index = segment + 1
-        out.append(p)
+    # 시각이 없어 속도 판정은 못 해도 값 자체가 불가능한 좌표((0,0)·범위 밖)는 걸러야 한다(리뷰 #104).
+    mark_outliers(untimed)
+    out.extend(untimed)
     return out
 
 

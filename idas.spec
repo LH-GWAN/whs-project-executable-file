@@ -31,11 +31,23 @@ web_datas = [
     (os.path.join("ui", "vendor", "pmtiles.js"), os.path.join("ui", "vendor")),
 ]
 
-import glob as _glob
+# glob에 절대 경로를 그대로 넣으면 폴더 이름의 '['가 문자 클래스로 해석돼 '[팀] IDAS' 같은 폴더에서
+# 지도·키가 조용히 빠졌다(리뷰 #60). 패턴 없이 os.listdir로 고른다.
 _ASSETS = os.path.join(_ROOT, "assets")
-for _bm in _glob.glob(os.path.join(_ASSETS, "*.pmtiles")):
+
+
+def _asset_files(*suffixes):
+    try:
+        names = sorted(os.listdir(_ASSETS))
+    except OSError:
+        return []
+    return [os.path.join(_ASSETS, n) for n in names
+            if n.lower().endswith(suffixes) and os.path.isfile(os.path.join(_ASSETS, n))]
+
+
+for _bm in _asset_files(".pmtiles"):
     web_datas.append((_bm, "assets"))
-if not _glob.glob(os.path.join(_ASSETS, "*.pmtiles")) and _glob.glob(os.path.join(_ASSETS, "*.zip")):
+if not _asset_files(".pmtiles") and _asset_files(".zip"):
     # build_windows.bat가 먼저 풀어 주지만, spec만 따로 돌릴 때를 위해 알린다(리뷰 #59).
     print("[idas.spec] WARNING: assets/ has a .zip but no .pmtiles - unpack it first "
           "(core.basemap.extract_zipped_basemap) or the exe ships without a basemap")
@@ -44,10 +56,9 @@ if not _glob.glob(os.path.join(_ASSETS, "*.pmtiles")) and _glob.glob(os.path.joi
 # 번들에 들어간다. 없으면 온라인 모드를 골라도 오프라인 지도로 표시된다.
 # 앱(core/appconfig.scan_key_files)은 assets/ 의 .json/.txt 를 이름과 상관없이 키 파일 후보로
 # 읽으므로 같은 규칙으로 번들한다(online_keys (1).json 처럼 이름이 어긋난 파일도 포함, 리뷰 #19).
-for _pattern in ("*.json", "*.txt"):
-    for _keys in _glob.glob(os.path.join(_ASSETS, _pattern)):
-        if os.path.basename(_keys).lower() != "readme.txt":
-            web_datas.append((_keys, "assets"))
+for _keys in _asset_files(".json", ".txt"):
+    if os.path.basename(_keys).lower() != "readme.txt":
+        web_datas.append((_keys, "assets"))
 
 a = Analysis(
     ["app.py"],

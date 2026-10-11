@@ -57,14 +57,31 @@ def _mp4_video_tracks(path: str) -> int:
     return count
 
 
+# RIFF 크기 필드가 비정상(0 등 - 녹화 중단으로 못 채운 파일)이면 헤더를 찾을 범위를 이만큼으로 잡는다.
+_AVI_HEADER_SCAN_LIMIT = 8 * 1024 * 1024
+_AVI_MIN_RIFF_SIZE = 16   # 'AVI ' + 최소 청크 헤더
+
+
+def _is_fourcc(tag: bytes) -> bool:
+    """청크 ID는 인쇄 가능한 ASCII 넷이다. 0으로 채워진 영역·쓰레기 바이트면 False."""
+    return len(tag) == 4 and all(0x20 <= b <= 0x7E for b in tag)
+
+
 def _avi_video_tracks(path: str) -> int:
     """첫 RIFF의 hdrl LIST 안 strl/strh 중 fccType 'vids'만 센다. 앞 2MB를 통째로 문자열 검색하면 뒤에
-    이어붙은 옛 녹화 RIFF의 strh까지 세어 1트랙 파일이 2트랙으로 보였다(리뷰 #101)."""
+    이어붙은 옛 녹화 RIFF의 strh까지 세어 1트랙 파일이 2트랙으로 보였다(리뷰 #101).
+    RIFF 크기가 0이면(녹화 중단) 범위가 8바이트가 되어 2트랙 파일이 0트랙으로 보였고, 0으로 채워진 영역은
+    8바이트씩 걸어 GUI가 멈췄다(리뷰 #105) - 크기가 비정상이면 앞 8MB를 보고, 청크 ID가 FourCC가 아니면 멈춘다."""
     with open(path, "rb") as f:
         head = f.read(12)
         if len(head) < 12 or head[:4] != b"RIFF":
             return 0
-        riff_end = min(8 + struct.unpack("<I", head[4:8])[0], os.path.getsize(path))
+        size = os.path.getsize(path)
+        declared = struct.unpack("<I", head[4:8])[0]
+        if declared < _AVI_MIN_RIFF_SIZE:
+            riff_end = min(size, _AVI_HEADER_SCAN_LIMIT)
+        else:
+            riff_end = min(8 + declared, size)
         pos = 12
         count = 0
         while pos + 12 <= riff_end:
@@ -73,6 +90,8 @@ def _avi_video_tracks(path: str) -> int:
             if len(hdr) < 12:
                 break
             ck_id, ck_size, list_type = hdr[:4], struct.unpack("<I", hdr[4:8])[0], hdr[8:12]
+            if not _is_fourcc(ck_id):
+                break
             if ck_id == b"LIST" and list_type == b"hdrl":
                 hdrl_start, hdrl_end = pos + 12, min(pos + 8 + ck_size, riff_end)
                 q = hdrl_start
@@ -82,6 +101,8 @@ def _avi_video_tracks(path: str) -> int:
                     if len(sub) < 8:
                         break
                     sub_id, sub_size = sub[:4], struct.unpack("<I", sub[4:8])[0]
+                    if not _is_fourcc(sub_id):
+                        break
                     if sub_id == b"LIST" and sub[8:12] == b"strl":
                         f.seek(q + 12)
                         strh = f.read(12)

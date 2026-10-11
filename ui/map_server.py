@@ -80,6 +80,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_HEAD(self):  # noqa: N802
+        if not self._is_own_request():
+            self.send_error(403)   # GET과 같은 Host 검사(리뷰 #110) - 파일 유무·크기도 다른 Host에는 주지 않는다
+            return
         self._serve(head_only=True)
 
     def _is_own_request(self) -> bool:

@@ -104,8 +104,14 @@ class HEVC:
         return first, pid, poc, 1 << s['poc_bits']
 
 
-def carved_hevc_frames(buf, track, media, check, stats):
-    from core.mp4_recovery import Frame, MAX_NAL, nal_kind
+def carved_hevc_frames(buf, track, media, check, stats, *, stop_at_break=False):
+    """사슬(직전 NAL 끝에 이어지는 후보)만 믿는 HEVC 카빙. core.mp4_recovery.carved_frames 참고.
+
+    HEVC는 FFmpeg가 빠진 슬라이스를 오류로 잡지 못하므로(AVC는 잡는다) 그림의 슬라이스
+    수가 이 스트림에서 본 최대 슬라이스 수보다 적으면 불완전한 그림으로 보고 버린다(#37).
+    사슬 밖의 비VCL 후보는 건너뛰기 근거로도, 파라미터셋 비교에도 쓰지 않는다(#38).
+    """
+    from core.mp4_recovery import Frame, MAX_NAL, NalChain, identical_run, nal_kind
     import re
     if track.length_size != 4:
         stats['withheld'] = '샘플 표 없는 HEVC는 4바이트 NAL 길이만 지원합니다.'
@@ -121,9 +127,28 @@ def carved_hevc_frames(buf, track, media, check, stats):
     # is only a candidate: validate its extent, parameter ids and POC, then
     # require the same full decode and byte audit as indexed recovery.
     marker = re.compile(rb'\x00[\x00-\xff]{3}[\x00-\x50]\x01')
+    expected_slices = 0
+
+    def complete(frame):
+        nonlocal expected_slices
+        slices = len(frame.nals)
+        if slices < expected_slices:
+            stats['incomplete_pictures'] = stats.get('incomplete_pictures', 0) + 1
+            return False
+        expected_slices = max(expected_slices, slices)
+        return True
+
     for begin, end in media:
         pos = begin; current = None; waiting = True; previous_poc = None; suppress_rasl = False
-        while pos+6 <= end:
+        chain = NalChain(); halted = False
+
+        def broken(where):
+            nonlocal waiting, current, halted
+            waiting = True; current = None; stats['prediction_breaks'] += 1
+            if stop_at_break:
+                stats['slack_after'] = where; halted = True
+
+        while pos+6 <= end and not halted:
             check()
             m = marker.search(buf, pos, min(end, pos+1024*1024))
             if not m:
@@ -131,40 +156,66 @@ def carved_hevc_frames(buf, track, media, check, stats):
             p = m.start(); pos = p+1; n = int.from_bytes(buf[p:p+4], 'big')
             if not 3 <= n <= MAX_NAL or p+4+n > end:
                 continue
-            nal = bytes(buf[p+4:p+4+n])
+            nal = bytes(buf[p+4:p+4+n]); linked = chain.linked(p)
             try:
                 kind = nal_kind(nal, 'hevc')
-                if kind in (32, 33, 34):
-                    if nal not in track.parameters:
-                        raise ValueError('HEVC parameters changed inside unindexed media; channel mixing withheld')
-                    pos = p+4+n; continue
                 if kind >= 32:
-                    pos = p+4+n; continue
-                if n < 16:
+                    if linked:
+                        if kind in (32, 33, 34) and nal not in track.parameters:
+                            raise ValueError('HEVC parameters changed inside unindexed media; channel mixing withheld')
+                        chain.accept(p, n); pos = p+4+n
+                    else:
+                        chain.offer(p, n, nal, kind)
                     continue
                 first, pid, poc, modulus = parser.picture(nal)
                 if first:
-                    if current and not waiting:
+                    for pending_nal, pending_kind in chain.confirm(p):
+                        if pending_kind in (32, 33, 34) and pending_nal not in track.parameters:
+                            raise ValueError('HEVC parameters changed inside unindexed media; channel mixing withheld')
+                    if n < 16 and not linked:
+                        continue
+                    if current and not waiting and complete(current):
                         yield current
+                    elif current and not waiting:
+                        # 슬라이스가 빠진 그림: 그 뒤 그림은 이 그림을 참조하므로 IRAP까지 대기.
+                        broken(p)
+                        if halted:
+                            break
                     current = None
                     random_access = kind in (16, 17, 18, 19, 20, 21)
+                    run = chain.end is not None and identical_run(buf, chain.end, p)
+                    lost = run
                     if random_access:
-                        suppress_rasl = waiting and kind == 21
-                        waiting = False; previous_poc = None
-                    elif previous_poc is not None and poc != (previous_poc+1) % modulus:
-                        waiting = True; stats['prediction_breaks'] += 1
+                        lost = run and stop_at_break
+                        if not lost:
+                            suppress_rasl = waiting and kind == 21
+                            waiting = False; previous_poc = None
+                    elif previous_poc is not None:
+                        lost = lost or poc != (previous_poc+1) % modulus
+                    if lost:
+                        broken(p)
+                        if halted:
+                            break
+                    chain.accept(p, n); pos = p+4+n
                     if suppress_rasl and kind in (8, 9):
                         stats['discarded_rasl'] = stats.get('discarded_rasl', 0)+1
-                        pos = p+4+n; continue
+                        continue
                     if waiting:
-                        stats['waiting_for_idr'] += 1; pos = p+4+n; continue
+                        stats['waiting_for_idr'] += 1; continue
                     current = Frame(p, n+4, 0, idr=kind in (16, 17, 18, 19, 20), cra=kind==21,
-                                    rasl=kind in (8, 9), key=(pid, poc), frame_num=poc, modulus=modulus)
+                                    rasl=kind in (8, 9), key=(pid, poc), frame_num=poc, modulus=modulus,
+                                    poc_lsb=poc)
+                    current.nals.append((p+4, n))
                     previous_poc = poc
                 elif current is None or current.key[0] != pid or (poc is not None and current.key[1] != poc):
                     continue
-                current.nals.append((p+4, n)); current.size = p+4+n-current.offset; pos = p+4+n
+                elif not linked:
+                    stats['damaged_samples'] += 1
+                    broken(p)
+                else:
+                    current.nals.append((p+4, n)); current.size = p+4+n-current.offset
+                    chain.accept(p, n); pos = p+4+n
             except (InvalidMP4, IndexError):
                 continue
-        if current and not waiting:
+        if current and not waiting and not halted and complete(current):
             yield current

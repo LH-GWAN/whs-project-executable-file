@@ -61,27 +61,34 @@ def test_large_declared_tables_stop_during_parsing(mp4_media, structure, control
     boxes = children(data, 0, len(data))
     moov = next(b for b in boxes if b.kind == b'moov')
     tracks, defaults = ([], {}) if structure == 'classic' else parse_moov(data, moov)[:2]
-    timer = None
+    # 검사(check)가 선언된 표를 처리하는 도중에 불려야 한다. 취소/시한이 첫 검사에서
+    # 바로 걸리면 표 처리 경로에 닿지 않은 채 통과한다(#126). 20번째 검사부터 취소
+    # 신호를 켜고, 그 뒤 곧바로 멈추는지(검사 횟수·시간) 확인한다.
+    calls = []
     if control == 'deadline':
-        token = RecoveryDeadline(None, .01)
+        token = RecoveryDeadline(None, 3600)
         error = RecoveryTimedOut
+        def check():
+            calls.append(1)
+            if len(calls) >= 20:
+                token.deadline = time.monotonic() - 1
+            _check(token)
     else:
         token = threading.Event()
-        timer = threading.Timer(.01, token.set)
-        timer.start()
         error = RecoveryCancelled
+        def check():
+            calls.append(1)
+            if len(calls) >= 20:
+                token.set()
+            _check(token)
     started = time.monotonic()
-    try:
-        with pytest.raises(error):
-            if structure == 'classic':
-                parse_moov(data, moov, lambda: _check(token))
-            else:
-                fragment_samples(data, boxes, tracks, defaults, lambda: _check(token))
-        assert time.monotonic() - started < 2
-    finally:
-        if timer:
-            timer.cancel()
-            timer.join()
+    with pytest.raises(error):
+        if structure == 'classic':
+            parse_moov(data, moov, check)
+        else:
+            fragment_samples(data, boxes, tracks, defaults, check)
+    assert time.monotonic() - started < 2
+    assert len(calls) == 20, '검사가 표 처리 중에 주기적으로 불리지 않았다'
 
 
 def test_fragment_entry_extent_is_rejected_before_declared_work(mp4_media):

@@ -23,6 +23,7 @@ from core.video_tracks import view_tag
 from core.pipeline import PipelineResult
 from core.slack import SlackSet, build_slack_set
 from ui.dataset_view import COMPOSED_LABEL, DatasetView
+from core.damage_marks import TIME_ESTIMATED_WARNING
 from ui.slack_tab import SlackTab
 from ui.location_tab import LocationTab
 from ui.speed_tab import SpeedTab
@@ -169,7 +170,12 @@ def dataset_views(result: PipelineResult, slacks: Optional[List[SlackSet]] = Non
         composed = DatasetView(COMPOSED_LABEL, result.points, result.driving_events,
                                boundaries=[(seg.offset_sec, seg.label) for seg in segs[1:]],
                                segment_labels=labels)
-        views = [composed] + [DatasetView(seg.label, seg.points, seg.driving_events) for seg in segs]
+        views = [composed]
+        offset = 0
+        for seg in segs:
+            # 영상별 묶음의 행 번호는 Composed(리포트 '#')의 번호를 그대로 쓴다(리뷰 #119).
+            views.append(DatasetView(seg.label, seg.points, seg.driving_events, row_offset=offset))
+            offset += len(seg.points)
     for slack in slacks or []:
         views.append(DatasetView(slack.label, slack.points, [], map_points=slack.map_points, is_slack=True))
     return views
@@ -300,6 +306,15 @@ class AnalysisView(QWidget):
             n = len(result.damage.get("intervals") or [])
             self._analysis_status.setText(self._analysis_status.text()
                                           + f" · ⚠ 손상 파일({mode}" + (f", 구간 {n}곳" if n else "") + ")")
+        rear_damage = settings.get("rear_damage") if isinstance(settings, dict) else None
+        if isinstance(rear_damage, dict) and rear_damage.get("damaged"):
+            # 후방 영상의 손상 검사 결과(ui/main_window가 settings에 기록). 후방은 복구하지 않고 원본을 그대로 튼다(리뷰 #101).
+            self._analysis_status.setText(self._analysis_status.text() + " · ⚠ 후방 영상 손상(복구 안 함)")
+        time_estimated = bool(getattr(extraction, "time_estimated", False))
+        if time_estimated:
+            self._analysis_status.setText(self._analysis_status.text() + " · ⚠ 재생 시각 추정(GPS 기준)")
+        if getattr(result, "damage_source", "") == "db":
+            self._analysis_status.setText(self._analysis_status.text() + " · ⚠ case.json 손상 - DB 사본으로 복원")
         if result.artifacts_verified is False:
             self._analysis_status.setText(self._analysis_status.text() + " · ⚠ 엔진 산출물이 분석 때와 다릅니다(manifest 불일치)")
         elif result.artifacts_verified is True:
@@ -309,7 +324,14 @@ class AnalysisView(QWidget):
             damage_tip = ("\n[손상 파일]\n" + "\n".join(result.damage.get("summary") or [])
                           + ("\n" + "\n".join(result.damage.get("interval_lines") or []) if result.damage.get("interval_lines") else "")
                           + ("\n" + str(result.damage.get("repair_note")) if result.damage.get("repair_note") else "")
-                          + ("\n재생 시각은 GPS UTC로 추정한 값입니다." if result.damage.get("time_estimated") else ""))
+                          + ("\n" + TIME_ESTIMATED_WARNING if (time_estimated or result.damage.get("time_estimated")) else ""))
+        elif time_estimated:
+            damage_tip = "\n" + TIME_ESTIMATED_WARNING
+        if getattr(result, "damage_source", "") == "db":
+            damage_tip += "\ncase.json의 손상 정보가 깨져 있어 사건 이력 DB에 저장된 사본으로 복원했습니다(리뷰 #82)."
+        if isinstance(rear_damage, dict) and rear_damage.get("damaged"):
+            damage_tip += ("\n[후방 영상 손상 - 복구하지 않음]\n"
+                           + "\n".join(str(line) for line in (rear_damage.get("summary") or [])))
         self._analysis_status.setToolTip(extraction.status_message + damage_tip + "\n" + "\n".join(extraction.warnings))
 
         self._file_views = self._build_file_views(result)
@@ -401,6 +423,10 @@ class AnalysisView(QWidget):
             files = [("전방" if result.rear_copy_path else "", video_path, result.sha256)]
             if result.rear_copy_path:
                 files.append(("후방", result.rear_copy_path, result.rear_sha256))
+            repaired = getattr(result, "repaired_path", "")
+            if repaired:
+                # 헤더를 이식한 재생·분석 사본도 이식 직후의 해시와 대조한다(리뷰 #42). 해시 기록이 없으면 'none'.
+                files.append(("재생 사본(헤더 이식)", repaired, getattr(result, "repaired_sha256", "")))
             tip = (video_path or "") + ({"F": "\n전방만 보기", "B": "\n후방만 보기",
                                           "F, B": "\n전방·후방 같이 보기"}.get(tag, ""))
             if result.rear_copy_path:

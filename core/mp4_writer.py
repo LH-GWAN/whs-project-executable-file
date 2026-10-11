@@ -20,6 +20,9 @@ MATRIX = struct.pack('>9I', 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
 
 def composition_offsets(track, frames, tick, scale):
     if track.composition and all(0 < f.sample <= len(track.composition) for f in frames):
+        if all(track.composition[f.sample-1] == 0 for f in frames):
+            # 재정렬이 없으면(모든 composition offset 0) tfdt가 없어도 순서는 그대로다(#92).
+            return [0] * len(frames)
         if not all(f.sample <= len(track.decode_times) and track.decode_times[f.sample-1] is not None for f in frames):
             raise InvalidMP4('DTS 없는 B-picture의 표시 순서를 확인할 수 없습니다.')
         orders = [track.decode_times[f.sample-1] + track.composition[f.sample-1] for f in frames]
@@ -31,6 +34,15 @@ def composition_offsets(track, frames, tick, scale):
         ranked = {value: i for i, value in enumerate(sorted(orders))}
         return [(ranked[value] - i) * tick for i, value in enumerate(orders)]
     if track.codec != 'h264':
+        # ctts가 없는 HEVC: SPS의 재정렬 수가 0일 때만 표시 순서 = 디코딩 순서다. B 그림이
+        # 있는데 ctts가 사라졌으면 순서를 지어내지 않고 명시적 사유와 함께 보류한다(#95).
+        from core.hevc_recovery import sps_header
+        try:
+            reorder = max((sps_header(n)['reorder'] for n in track.parameters if (n[0] >> 1) & 63 == 33), default=None)
+        except InvalidMP4 as exc:
+            raise InvalidMP4(f'HEVC SPS를 읽을 수 없어 표시 순서를 확인할 수 없습니다: {exc}')
+        if reorder is None or reorder > 0:
+            raise InvalidMP4('ctts 없는 HEVC B-picture의 표시 순서는 추정하지 않습니다. MP4 생성 보류')
         return [0] * len(frames)
     if not any(f.b_picture for f in frames):
         return [0] * len(frames)
@@ -48,7 +60,9 @@ def composition_offsets(track, frames, tick, scale):
         group = frames[start:stop]; orders = []; msb = previous = 0
         for f in group:
             pid = f.key[0]; s = avc.sps[avc.pps[pid]['sps']]; maximum = 1 << s['poc_bits']
-            lsb = f.key[-1]
+            if f.poc_lsb is None:
+                raise InvalidMP4('POC LSB 없는 picture: 표시 순서를 확인할 수 없습니다.')
+            lsb = f.poc_lsb
             current_msb = msb
             if lsb < previous and previous - lsb >= maximum // 2:
                 current_msb += maximum

@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 from typing import List, Optional, Sequence
 
+from core.acceleration import is_synthetic
 from core.driving_events import DrivingEvent, events_by_row
 from engine.engine_adapter import TrackPoint
 
@@ -14,25 +15,32 @@ COLUMNS = ["시각(초)", "위도", "경도", "속도(km/h)", "위험운전", "�
 COL_TIME, COL_LAT, COL_LON, COL_SPEED, COL_EVENT, COL_G, COL_LINK, COL_CHECK = range(8)
 SEGMENT_HEADER = "영상"
 LINK_TEXT = "지도에서 보기"
+# 이 이상의 합력(g)은 충격으로 본다 - 화면 표의 빨간 글자(ui/location_tab)와 리포트의 충격 행 우선 표본·
+# 최대 충격 요약(report/report_builder, 리뷰 #113)이 같은 값을 쓴다.
+IMPACT_G = 2.0
 
 
 def _is_gps_row(p: TrackPoint) -> bool:
     return p.has_gps_record or p.has_coords
 
 
-def _gps_key(p: TrackPoint):
+def _gps_key(p: TrackPoint, index: int):
+    # 합성 행(손상 빈 행·임의 복구 행)은 기록 열쇠가 없어 값으로 묶으면 구간 전체가 한 행이 된다 - 행마다 따로.
+    if is_synthetic(p):
+        return ("synthetic", index)
     return p.record_key()
 
 
 def gps_slot_rows(points: List[TrackPoint]) -> List[int]:
     """GPS 기록이 바뀌는 행(기록 하나당 첫 행)의 번호 - "1초마다" 보기. 같은 기록을 반복해 쓴
-    행(VUGERA는 초당 31행, FineVu 17행)과 G센서 전용 행(INAVI 0.1초)은 빠진다."""
+    행(VUGERA는 초당 31행, FineVu 17행)과 G센서 전용 행(INAVI 0.1초)은 빠진다. 손상 구간의 빈 행·
+    임의 복구 행은 1초마다 하나씩이라 늘 들어간다(리뷰 2026-10-11 #44)."""
     out: List[int] = []
     prev_key = None
     for i, p in enumerate(points):
-        if not _is_gps_row(p):
+        if not (_is_gps_row(p) or is_synthetic(p)):
             continue
-        key = _gps_key(p)
+        key = _gps_key(p, i)
         if key != prev_key:
             out.append(i)
             prev_key = key
@@ -41,26 +49,32 @@ def gps_slot_rows(points: List[TrackPoint]) -> List[int]:
 
 def has_frame_detail(points: List[TrackPoint]) -> bool:
     """GPS 기록보다 훨씬 자주 행을 쓰는 영상(프레임·G센서 단위)인가. 그러면 Location 표는 기본으로
-    1초 단위 행만 보이고 '상세보기'로 전체 행을 연다."""
-    slots = len(gps_slot_rows(points))
+    1초 단위 행만 보이고 '상세보기'로 전체 행을 연다. 손상 처리로 끼운 합성 행은 기기가 쓴 행이 아니라
+    여기서 세지 않는다 - 1Hz 영상에 손상 40행이 끼면 '프레임 단위'가 됐다(리뷰 2026-10-11 #44)."""
+    real_count = sum(1 for p in points if not is_synthetic(p))
+    slots = sum(1 for i in gps_slot_rows(points) if not is_synthetic(points[i]))
     if slots == 0:
         return False   # GPS가 전혀 없는 G센서 전용 영상은 전체 행을 그대로 보인다(리뷰 #47)
-    extra = len(points) - slots
-    return extra >= 5 and len(points) >= 1.5 * slots
+    extra = real_count - slots
+    return extra >= 5 and real_count >= 1.5 * slots
 
 
 def validation_text(rec: TrackPoint) -> str:
+    """'GPS 검증' 칸. 끊김(측위 실패 V) > 실패 > 정상/미제공 순으로 판정하고, 손상 구간에서 회수한 행은 그
+    판정 뒤에 덧붙인다 - 회수 표시가 실패 판정을 가리면 안 된다(리뷰 #93, 2026-10-11 #116·#122)."""
     if rec.recovery_state == "damaged":
         return "손상"
     if rec.recovery_state == "interpolated":
         return "임의 복구"
-    if rec.recovery_state == "gap_carved":
-        return "손상 구간 회수"
     if rec.is_dropout and not rec.has_coords:
-        return "끊김"   # 측위 실패(status=V) 행은 검증 실패가 아니라 수신 끊김이다(리뷰 #93)
-    if rec.gps_checksum_ok is False or rec.gps_trusted is False:
-        return "실패"
-    return "정상" if rec.gps_checksum_ok is True else "미제공"
+        base = "끊김"   # 측위 실패(status=V) 행은 검증 실패가 아니라 수신 끊김이다(리뷰 #93)
+    elif rec.gps_checksum_ok is False or rec.gps_trusted is False:
+        base = "실패"
+    else:
+        base = "정상" if rec.gps_checksum_ok is True else "미제공"
+    if rec.recovery_state == "gap_carved":
+        return "손상 구간 회수" if base == "정상" else f"{base} (손상 구간 회수)"
+    return base
 
 
 def row_texts(rec: TrackPoint, here: Sequence[DrivingEvent]) -> List[str]:

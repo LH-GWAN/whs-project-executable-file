@@ -27,11 +27,15 @@ import time
 
 from core.avi_recovery import RecoveryCancelled, _check, _hash
 from core.mp4_structure import (InvalidMP4, MAX_TABLE, Track, box_at, discover,
-                                fragment_samples, parse_moov)
+                                fragment_samples, parse_moov, trak_handlers)
 
 MAX_FILE = 16 * 1024**3
 MAX_NAL = 32 * 1024**2
 DEFAULT_TIMEOUT = 180
+# 카빙 중 연속된 두 그림 사이에 같은 바이트(0x00/0xFF)가 이 길이 이상 이어지면 손실 증거로
+# 본다. 정확히 GOP 배수만큼 0으로 지워진 손실은 frame_num/POC가 우연히 이어져 비트스트림
+# 만으로는 구별되지 않는다. 음성 샘플 하나는 이 길이에 미치지 않는다.
+IDENTICAL_RUN = 64 * 1024
 TIMING_WARNING = ('회수된 프레임을 빈 구간 없이 이어 붙인 검토용 영상입니다. 원래 시각·길이, '
                   'GPS 동기화, 사고 시각·급가감속 판정에 사용하지 마세요. GPS·G센서는 파일 '
                   '전체에서 별도로 회수하며 슬랙/과거 녹화가 포함될 수 있습니다.')
@@ -45,9 +49,11 @@ class RecoveryTimedOut(TimeoutError):
 
 class RecoveryDeadline:
     """A shared wall-clock budget, including hashing, parsing and all children."""
-    def __init__(self, cancel, seconds):
+    def __init__(self, cancel, seconds, protected_dirs=()):
         self.cancel = cancel
         self.deadline = time.monotonic() + seconds
+        # 증거 폴더·출력 폴더 아래의 실행 파일은 검증 도구로 쓰지 않는다.
+        self.protected_dirs = tuple(Path(d).resolve() for d in protected_dirs)
 
     def is_set(self):
         if self.cancel is not None and self.cancel.is_set():
@@ -221,7 +227,10 @@ class AVC:
             if p['bottom'] and not field:
                 order.append(b.se())
         key = (pid, frame, field, bottom, kind == 5, iid, nal[0] >> 5 != 0, *order)
-        return first, key, frame, 1 << s['frame_bits'], nal[0] >> 5 != 0, typ % 5
+        # POC LSB는 key 끝이 아니라 따로 돌려준다. bottom_field_pic_order 플래그가 켜진
+        # PPS에서는 key[-1]이 delta 값이다(#129).
+        poc_lsb = order[0] if s['poc'] == 0 else None
+        return first, key, frame, 1 << s['frame_bits'], nal[0] >> 5 != 0, typ % 5, poc_lsb
 
 
 @dataclass
@@ -238,6 +247,7 @@ class Frame:
     b_picture: bool = False
     cra: bool = False
     rasl: bool = False
+    poc_lsb: int | None = None
 
     @property
     def random_access(self):
@@ -286,11 +296,12 @@ def indexed_frames(buf, track, limit, media, check, stats, forbidden=()):
                 if avc and kind in (7, 8):
                     avc.add(nal)
                 if track.codec == 'h264' and kind in (1, 5):
-                    first, key, number, modulus, ref, slice_type = avc.picture(nal)
+                    first, key, number, modulus, ref, slice_type, poc_lsb = avc.picture(nal)
                     starts += first == 0
                     if frame.key and frame.key != key:
                         raise InvalidMP4('multiple pictures in one sample')
                     frame.key, frame.frame_num, frame.modulus, frame.reference = key, number, modulus, ref
+                    frame.poc_lsb = poc_lsb
                     frame.b_picture = slice_type == 1
                     frame.idr |= kind == 5
                 elif track.codec == 'hevc' and kind < 32:
@@ -324,19 +335,94 @@ def indexed_frames(buf, track, limit, media, check, stats, forbidden=()):
 RAW_MARKER = re.compile(rb'\x00[\x00-\xff]{3}[\x01\x21\x41\x61\x05\x25\x45\x65\x06\x27\x47\x67\x28\x48\x68\x09]')
 
 
-def carved_frames(buf, track, media, check, stats, *, fixed_parameters=False):
-    """Length-prefixed NALs only; PCM/text gaps do not become video bytes."""
+def identical_run(buf, begin, end):
+    """[begin, end)에 같은 바이트(0x00 또는 0xFF)가 IDENTICAL_RUN 이상 이어지는지."""
+    if end - begin < IDENTICAL_RUN:
+        return False
+    return (buf.find(bytes(IDENTICAL_RUN), begin, end) != -1
+            or buf.find(b'\xff' * IDENTICAL_RUN, begin, end) != -1)
+
+
+class NalChain:
+    """카빙 중 '직전 NAL 끝에 이어지는' 후보만 믿기 위한 사슬 상태.
+
+    - end: 마지막으로 받아들인(또는 대기 중이라 건너뛴) 실제 NAL의 끝. 여기에 정확히
+      이어지는 후보(linked)는 같은 샘플의 다음 NAL이다. 그 밖의 후보는 음성/텍스트 안의
+      우연한 일치일 수 있으므로 길이만큼 건너뛰지 않고 파라미터셋으로도 쓰지 않는다(#38).
+    - pending: 사슬 밖에서 시작한 비VCL 후보들(AUD/SEI/SPS/PPS…). 바로 이어지는 VCL 첫
+      슬라이스가 나타나야 실제 샘플 머리로 확정되어 파라미터셋 비교에 쓰인다.
+    """
+    def __init__(self):
+        self.end = None; self.pending = []; self.pending_end = None
+
+    def linked(self, p):
+        return self.end is not None and p == self.end
+
+    def accept(self, p, n):
+        self.end = p + 4 + n; self.pending = []; self.pending_end = None
+
+    def offer(self, p, n, nal, kind):
+        """비VCL 후보를 임시 사슬에 넣는다. 사슬 안쪽 후보는 무시한다."""
+        if self.pending and p == self.pending_end:
+            self.pending.append((nal, kind)); self.pending_end = p + 4 + n
+        elif self.pending and p < self.pending_end:
+            return
+        else:
+            self.pending = [(nal, kind)]; self.pending_end = p + 4 + n
+
+    def confirm(self, p):
+        """VCL 첫 슬라이스가 임시 사슬에 이어지면 그 파라미터셋을 돌려준다."""
+        confirmed = list(self.pending) if self.pending and p == self.pending_end else []
+        self.pending = []; self.pending_end = None
+        return confirmed
+
+
+def carved_frames(buf, track, media, check, stats, *, fixed_parameters=False, stop_at_break=False):
+    """Length-prefixed NALs only; PCM/text gaps do not become video bytes.
+
+    - 참조·moov의 파라미터셋이 있으면 그 집합을 고정한다(#35). 사슬에 이어진 다른
+      SPS/PPS가 나오면 다른 채널의 혼입 가능성이 있어 생성을 보류한다.
+    - 모든 그림(비참조 포함)에 frame_num = 직전 참조 + 1을 요구한다(#32).
+    - 같은 그림의 다음 슬라이스는 직전 NAL 끝에 이어질 때만 붙인다(#37). 이어지지
+      않으면 사이가 손실된 것이므로 그림을 버리고 다음 IDR까지 기다린다.
+    - stop_at_break: 본문 경계를 확인할 수 없는 mdat(크기 0·잘림)에서는 연속성이 끊긴
+      뒤를 슬랙으로 보고 카빙을 멈춘다(#33). stats['slack_after']에 위치를 기록한다.
+    """
     if track.codec == 'hevc':
         from core.hevc_recovery import carved_hevc_frames
-        yield from carved_hevc_frames(buf, track, media, check, stats)
+        yield from carved_hevc_frames(buf, track, media, check, stats, stop_at_break=stop_at_break)
         return
     if track.codec != 'h264' or track.length_size != 4:
         stats['withheld'] = 'moov 없는 NAL 카빙은 4바이트 길이 H.264만 지원합니다.'
         return
-    avc = AVC(track.parameters); current = None; waiting = True; previous_ref = None
+    avc = AVC(track.parameters)
+    fixed = fixed_parameters or bool(track.parameters)
+
+    def accept_parameter(nal, kind):
+        if fixed and nal not in track.parameters:
+            raise ValueError('AVC parameters changed inside unindexed media; channel mixing withheld')
+        if kind == 7:
+            sps = sps_info(nal)
+            if track.width and (track.width, track.height) != (sps['width'], sps['height']):
+                stats['withheld'] = '영상 본문에서 다른 해상도의 SPS가 발견되어 트랙 혼입 방지를 위해 생성을 보류했습니다.'
+                raise ValueError(stats['withheld'])
+            track.width, track.height = sps['width'], sps['height']
+            track.fps = track.fps or sps['fps']
+        avc.add(nal)
+        if nal not in track.parameters:
+            track.parameters.append(nal)
+
     for begin, end in media:
         check(); current = None; waiting = True; previous_ref = None; pos = begin
-        while pos + 5 <= end:
+        chain = NalChain(); halted = False
+
+        def broken(where):
+            nonlocal waiting, current, halted
+            waiting = True; current = None; stats['prediction_breaks'] += 1
+            if stop_at_break:
+                stats['slack_after'] = where; halted = True
+
+        while pos + 5 <= end and not halted:
             check()
             match = RAW_MARKER.search(buf, pos, min(end, pos + 1024 * 1024))
             if not match:
@@ -345,55 +431,68 @@ def carved_frames(buf, track, media, check, stats, *, fixed_parameters=False):
             p = match.start(); pos = p + 1; n = int.from_bytes(buf[p:p + 4], 'big')
             if not 1 <= n <= MAX_NAL or p + 4 + n > end:
                 continue
-            nal = bytes(buf[p + 4:p + 4 + n])
+            nal = bytes(buf[p + 4:p + 4 + n]); linked = chain.linked(p)
             try:
                 kind = nal_kind(nal, 'h264')
-                if kind in (7, 8):
-                    if fixed_parameters and nal not in track.parameters:
-                        raise ValueError('AVC parameters changed inside unindexed media; channel mixing withheld')
-                    if kind == 7:
-                        s = sps_info(nal)
-                        if track.width and (track.width, track.height) != (s['width'], s['height']):
-                            stats['withheld'] = '영상 본문에서 다른 해상도의 SPS가 발견되어 트랙 혼입 방지를 위해 생성을 보류했습니다.'
-                            raise ValueError(stats['withheld'])
-                        track.width, track.height = s['width'], s['height']
-                        track.fps = track.fps or s['fps']
-                    avc.add(nal)
-                    if nal not in track.parameters:
-                        track.parameters.append(nal)
-                    pos = p + 4 + n
-                    continue
                 if kind not in (1, 5):
-                    # AUD/SEI are not needed to synthesize access units or timing.
+                    # AUD/SEI/SPS/PPS: 사슬에 이어진 것만 샘플의 일부로 믿는다.
+                    if linked:
+                        if kind in (7, 8):
+                            accept_parameter(nal, kind)
+                        chain.accept(p, n); pos = p + 4 + n
+                    else:
+                        chain.offer(p, n, nal, kind)
                     continue
-                if n < 16:
-                    continue
-                first, key, number, modulus, ref, slice_type = avc.picture(nal)
+                first, key, number, modulus, ref, slice_type, poc_lsb = avc.picture(nal)
                 if first == 0:
+                    for pending_nal, pending_kind in chain.confirm(p):
+                        if pending_kind in (7, 8):
+                            accept_parameter(pending_nal, pending_kind)
+                    if n < 16 and not linked:
+                        continue
                     if current and not waiting:
                         yield current
                     current = None
+                    run = chain.end is not None and identical_run(buf, chain.end, p)
+                    lost = run
                     if kind == 5:
-                        waiting = False; previous_ref = None
-                    elif ref and previous_ref is not None and number not in (previous_ref, (previous_ref + 1) % modulus):
-                        waiting = True; stats['prediction_breaks'] += 1
+                        # 경계가 확인된 본문에서 손실 뒤의 IDR은 정상 재개다. 경계를 확인할
+                        # 수 없는 본문에서는 그 뒤가 옛 녹화일 수 있어 슬랙으로 본다.
+                        lost = run and stop_at_break
+                        if not lost:
+                            waiting = False; previous_ref = None
+                    elif previous_ref is not None:
+                        expected = (previous_ref + 1) % modulus
+                        # 비참조 그림도 frame_num = PrevRefFrameNum + 1 이어야 한다.
+                        # 필드 쌍의 둘째 필드만 같은 값을 가질 수 있다.
+                        lost = lost or (number != expected and not (key[2] and number == previous_ref))
+                    if lost:
+                        broken(p)
+                        if halted:
+                            break
+                    chain.accept(p, n); pos = p + 4 + n
                     if waiting:
                         stats['waiting_for_idr'] += 1
-                        pos = p + 4 + n
                         continue
                     current = Frame(p, n + 4, 0, idr=kind == 5, key=key, frame_num=number,
-                                    modulus=modulus, reference=ref, b_picture=slice_type == 1)
+                                    modulus=modulus, reference=ref, b_picture=slice_type == 1, poc_lsb=poc_lsb)
+                    current.nals.append((p + 4, n))
                     if ref:
                         previous_ref = number
                 elif current is None or current.key != key:
                     continue
-                current.nals.append((p + 4, n)); current.size = p + 4 + n - current.offset
-                pos = p + 4 + n
+                elif not linked:
+                    # 같은 그림의 슬라이스가 직전 NAL에 이어지지 않는다: 사이가 손실됐다.
+                    stats['damaged_samples'] += 1
+                    broken(p)
+                else:
+                    current.nals.append((p + 4, n)); current.size = p + 4 + n - current.offset
+                    chain.accept(p, n); pos = p + 4 + n
             except (InvalidMP4, IndexError):
                 # A bad candidate inside audio is not proof of video loss. The
                 # next slice frame number plus full decode decides continuity.
                 continue
-        if current and not waiting:
+        if current and not waiting and not halted:
             yield current
 
 
@@ -462,11 +561,41 @@ def carve_metadata(buf, work, cancel, boxes=(), limit=None, tracks=()):
     return gps, sensor
 
 
-def run_command(args, cancel, timeout=120, *, capture_stdout=False):
-    """No shell/network, cancellable, bounded log/progress files on disk."""
-    _check(cancel)
+def find_tool(name, cancel=None):
+    """PATH에서 검증 도구를 찾되, 현재 디렉터리와 증거·출력 폴더 아래의 실행 파일은 거부한다.
+
+    Windows의 shutil.which는 현재 디렉터리를 먼저 찾는다. 증거 폴더에 놓인 ffmpeg.exe가
+    검증 도구로 실행되면 안 된다. 거부되면 도구가 없는 것으로 취급한다(not_run).
+    """
+    exe = shutil.which(name)
+    if not exe:
+        return None
+    try:
+        resolved = Path(exe).resolve()
+        protected = [Path.cwd().resolve()] + list(getattr(cancel, 'protected_dirs', ()))
+        for base in protected:
+            if resolved == base or base in resolved.parents:
+                return None
+    except OSError:
+        return None
+    return exe
+
+
+def command_timeout(cancel, timeout=None):
+    """명령별 제한 시간: 전체 시간 제한이 있으면 그 남은 시간, 없으면 120초(또는 지정값)."""
     if isinstance(cancel, RecoveryDeadline):
-        timeout = min(timeout, cancel.remaining)
+        return cancel.remaining if timeout is None else min(timeout, cancel.remaining)
+    return 120 if timeout is None else timeout
+
+
+def run_command(args, cancel, timeout=None, *, capture_stdout=False):
+    """No shell/network, cancellable, bounded log/progress files on disk.
+
+    명령별 제한 시간은 남은 전체 시간이다(#89). 고정 120초는 긴 녹화의 디코딩 검증을
+    중간에 끊어 정상 결과를 지웠다. 전체 시간 제한이 없으면 120초를 쓴다.
+    """
+    _check(cancel)
+    timeout = command_timeout(cancel, timeout)
     with tempfile.TemporaryFile() as log, tempfile.TemporaryFile() as output:
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output, stderr=log)
         start = time.monotonic(); reason = ''
@@ -508,7 +637,7 @@ def run_command(args, cancel, timeout=120, *, capture_stdout=False):
 
 
 def decode_check(path, count, cancel):
-    exe = shutil.which('ffmpeg')
+    exe = find_tool('ffmpeg', cancel)
     if not exe:
         return dict(status='not_run', decoded_frames=0, reason='FFmpeg 없음')
     check = run_command([exe, '-nostdin', '-v', 'error', '-xerror', '-err_detect', 'explode+bitstream+buffer+careful',
@@ -520,7 +649,7 @@ def decode_check(path, count, cancel):
 
 
 def probe_check(path, track, count, cancel):
-    exe = shutil.which('ffprobe')
+    exe = find_tool('ffprobe', cancel)
     if not exe:
         return dict(status='not_run', reason='FFprobe 없음')
     result = run_command([exe, '-v', 'error', '-protocol_whitelist', 'file,pipe', '-count_packets',
@@ -545,9 +674,11 @@ def probe_check(path, track, count, cancel):
 def verification_tools(cancel):
     result = {}
     for name in ('ffmpeg', 'ffprobe'):
-        exe = shutil.which(name)
+        exe = find_tool(name, cancel)
         if not exe:
-            result[name] = dict(available=False)
+            located = shutil.which(name)
+            result[name] = dict(available=False, **(dict(rejected_path=located,
+                reason='현재 디렉터리·증거 폴더 아래의 실행 파일은 검증 도구로 쓰지 않습니다.') if located else {}))
             continue
         version = run_command([exe, '-version'], cancel, timeout=5, capture_stdout=True)
         result[name] = dict(available=True, path=exe, sha256=_hash(exe, cancel),
@@ -631,16 +762,32 @@ def audit_mp4(path, source, track, frames, cancel):
         return dict(status='failed', reason=str(exc))
 
 
+MAX_DECODE_ATTEMPTS = 256
+
+
 def export_video(work, buf, track, frames, cancel, progress):
+    """후보 전체를 검증하고, 실패하면 GOP 단위 이분 탐색으로 통과하는 접두를 찾는다(#36).
+
+    GOP마다 따로 검증하면 긴 녹화에서 시도 횟수·시간 상한에 걸려 멀쩡한 GOP까지 버렸다.
+    여기서는 '지금까지 통과한 생존 집합 + 다음 GOP들'을 이분 탐색해 처음 실패하는 GOP를
+    찾고, 그 GOP 안에서만 프레임 접두를 이분 탐색한다. 생존 집합은 항상 실제로 mux·대조·
+    디코딩을 통과한 집합이며, 상한에 걸리면 그때까지의 생존 집합으로 결과를 만든다.
+    """
     raw = work / f'recovered_track{track.id:02d}.{track.codec}'
     target = work / f'recovered_track{track.id:02d}.mp4'
     initial_count = len(frames); attempts = 0
     deadline = time.monotonic() + 300
-    def validate(candidate):
-        nonlocal attempts
+    limited = None
+
+    def validate(candidate, *, final=False):
+        nonlocal attempts, limited
         _check(cancel)
-        if attempts >= 256 or time.monotonic() >= deadline:
-            return dict(status='verification_limit', reason='트랙 검증 시간/횟수 한도 초과'), dict(status='not_run')
+        if not candidate:
+            return dict(status='passed', decoded_frames=0), dict(status='not_run')
+        if not final and (attempts >= MAX_DECODE_ATTEMPTS or time.monotonic() >= deadline
+                          or limited is not None):
+            limited = limited or dict(status='verification_limit', reason='트랙 검증 시간/횟수 한도 초과')
+            return limited, dict(status='not_run')
         attempts += 1
         result = mux(buf, target, track, candidate, cancel)
         if result['status'] != 'passed':
@@ -654,6 +801,10 @@ def export_video(work, buf, track, frames, cancel, progress):
         decoded = decode_check(target, len(candidate), cancel)
         decoded['probe_check'] = probe
         return decoded, payload
+
+    def flatten(groups):
+        return [f for g in groups for f in g]
+
     check, payload = validate(frames)
     discarded = []
     if check['status'] in ('failed', 'incomplete'):
@@ -665,41 +816,64 @@ def export_video(work, buf, track, frames, cancel, progress):
             group.append(frame)
         if group:
             groups.append(group)
-        survivors = []
-        for i, group in enumerate(groups):
+        survivors = []; i = 0; previous_truncated = False
+        while i < len(groups) and limited is None:
             _check(cancel)
-            # A CRA tested independently has no pictures from the preceding
-            # GOP. Drop its RASL pictures before decoding that isolated group.
-            isolated = [f for f in group if not (group[0].cra and f.rasl)]
-            test, group_payload = validate(isolated)
+            # 직전 GOP를 버리거나 잘랐으면 이어지는 CRA의 RASL은 참조를 잃었다.
+            if previous_truncated and groups[i][0].cra:
+                kept = [f for f in groups[i] if not f.rasl]
+                if len(kept) != len(groups[i]):
+                    discarded.append(dict(gop=i, candidate_frames=len(groups[i]), kept_prefix_frames=len(kept),
+                        source_offset=groups[i][0].offset, reason='CRA random access: RASL excluded'))
+                groups[i] = kept
+            # survivors + groups[i:k]가 통과하는 최대 k를 이분 탐색한다.
+            low, high = i, len(groups)
+            # 첫 반복의 '남은 전체'는 방금 실패한 전체 후보와 같으므로 다시 검증하지 않는다.
+            test = check if i == 0 else validate(survivors + flatten(groups[i:high]))[0]
             if test['status'] == 'passed':
-                survivors.extend(isolated)
-                if len(isolated) != len(group):
-                    discarded.append(dict(gop=i, candidate_frames=len(group), kept_prefix_frames=len(isolated),
-                        source_offset=group[0].offset, reason='CRA random access: RASL excluded'))
-            else:
-                # The first bad picture invalidates later predictions, but
-                # need not erase the healthy prefix. Every retained prefix is
-                # muxed and fully decoded, never accepted by frame count alone.
-                low, high = 0, len(isolated)
-                if test['status'] in ('failed', 'incomplete'):
-                    for _ in range(16):
-                        if high - low <= 1:
-                            break
-                        middle = (low + high) // 2
-                        prefix_check, _ = validate(isolated[:middle])
-                        if prefix_check['status'] == 'passed':
-                            low = middle
-                        elif prefix_check['status'] in ('failed', 'incomplete'):
-                            high = middle
-                        else:
-                            break
-                survivors.extend(isolated[:low])
-                discarded.append(dict(gop=i, candidate_frames=len(group), kept_prefix_frames=low,
-                    source_offset=group[0].offset, decode_check=test, payload_check=group_payload))
+                survivors += flatten(groups[i:high]); i = high
+                break
+            if test['status'] not in ('failed', 'incomplete'):
+                break
+            while high - low > 1:
+                middle = (low + high) // 2
+                test, _ = validate(survivors + flatten(groups[i:middle]))
+                if test['status'] == 'passed':
+                    low = middle
+                elif test['status'] in ('failed', 'incomplete'):
+                    high = middle
+                else:
+                    break
+            if limited is not None:
+                survivors += flatten(groups[i:low]); i = low
+                break
+            survivors += flatten(groups[i:low])
+            bad = groups[low]; i = low + 1
+            # 처음 실패한 GOP 안에서 통과하는 프레임 접두를 이분 탐색한다. 첫 손상
+            # 그림은 뒤의 예측을 깨지만 앞의 멀쩡한 접두까지 지울 필요는 없다.
+            frame_low, frame_high = 0, len(bad); last = None
+            for _ in range(16):
+                if frame_high - frame_low <= 1:
+                    break
+                middle = (frame_low + frame_high) // 2
+                test, group_payload = validate(survivors + bad[:middle])
+                if test['status'] == 'passed':
+                    frame_low = middle
+                elif test['status'] in ('failed', 'incomplete'):
+                    frame_high = middle; last = (test, group_payload)
+                else:
+                    break
+            survivors += bad[:frame_low]; previous_truncated = True
+            discarded.append(dict(gop=low, candidate_frames=len(bad), kept_prefix_frames=frame_low,
+                source_offset=bad[0].offset, decode_check=last[0] if last else dict(status='failed'),
+                payload_check=last[1] if last else dict(status='not_run')))
+        if i < len(groups):
+            discarded.append(dict(gop=i, candidate_frames=sum(len(g) for g in groups[i:]), kept_prefix_frames=0,
+                source_offset=groups[i][0].offset, decode_check=limited or dict(status='not_run'),
+                reason='검증 한도에 걸려 뒤쪽 GOP는 검사하지 않았습니다.'))
         frames = survivors
         if frames:
-            check, payload = validate(frames)
+            check, payload = validate(frames, final=True)
         else:
             check = dict(status='failed', decoded_frames=0, reason='검증에 성공한 독립 GOP 없음')
     # A failed mux can leave a header-only or corrupt file. Do not present it as recovery.
@@ -713,7 +887,8 @@ def export_video(work, buf, track, frames, cancel, progress):
         fps_basis='surviving_or_reference_configuration',
         elementary_file=raw.name if raw.exists() else None,
         elementary_sha256=_hash(raw, cancel) if raw.exists() else None, decode_check=check,
-        payload_check=payload, decode_attempts=attempts, discarded_gops=discarded)
+        payload_check=payload, decode_attempts=attempts, discarded_gops=discarded,
+        verification_limit=limited)
 
 
 def publish_result(work, output, cancel):
@@ -762,7 +937,7 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
     if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
         raise ValueError('전체 복원 시간 제한은 0초 초과, 3600초 이하여야 합니다.')
     started = time.monotonic()
-    cancel = RecoveryDeadline(cancel, timeout)
+    cancel = RecoveryDeadline(cancel, timeout, protected_dirs=(source.parent, output))
     _check(cancel); output.parent.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='.mp4-recovery-', dir=output.parent))
     report = progress or (lambda _: None)
@@ -781,8 +956,8 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
             verification_tools=verification_tools(cancel),
             reference=None, videos=[], jpeg_stills=0, diagnostics=[], video_boundary_verified=False,
             video_withheld_reason=None)
-        manifest['execution_limits'] = dict(total_timeout_seconds=timeout, command_timeout_seconds=120,
-            max_decode_attempts_per_track=256, metadata_scan_chunk_bytes=1024*1024)
+        manifest['execution_limits'] = dict(total_timeout_seconds=timeout, command_timeout_seconds='remaining_total',
+            max_decode_attempts_per_track=MAX_DECODE_ATTEMPTS, metadata_scan_chunk_bytes=1024*1024)
         reference_tracks, reference_defaults = [], {}
         if reference:
             if not 8 <= reference.stat().st_size <= MAX_FILE:
@@ -812,23 +987,46 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
         with copied.open('rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as buf:
             report('MP4 박스·샘플 표 및 손상 이후의 데이터 탐색 중...')
             boxes, limit, gaps = discover(buf, lambda: _check(cancel))
-            media = [(b.payload, min(b.end, limit)) for b in boxes if b.kind == b'mdat']
             moov = next((b for b in boxes if b.kind == b'moov'), None)
             tracks, defaults = [], {}
+            # 영상 채널 수: 파싱에 실패한 trak(둘째 카메라의 avcC 손상 등)과 trak이 없는
+            # traf도 센다(#34). 구별할 수 없는 채널이 둘 이상이면 카빙을 보류한다.
+            unknown_channels = []
             if moov:
                 tracks, defaults, errors = parse_moov(buf, moov, lambda: _check(cancel))
                 manifest['diagnostics'].extend(errors)
+                handlers = [h for _, h in trak_handlers(buf, moov, lambda: _check(cancel))]
+                # 파싱에 성공한 trak의 handler를 하나씩 빼면 실패한 trak의 handler만 남는다.
+                for t in tracks:
+                    if t.handler in handlers:
+                        handlers.remove(t.handler)
+                unknown_channels.extend(f'trak(handler={h.decode("ascii", "replace") if h else "?"})'
+                                        for h in handlers if h in (None, b'vide'))
             elif reference_tracks:
                 tracks, defaults = reference_tracks, reference_defaults
+            fragment_state = {}
             if tracks and any(b.kind == b'moof' for b in boxes):
                 manifest['diagnostics'].extend(fragment_samples(buf, boxes, tracks, defaults,
-                                                               lambda: _check(cancel)))
+                                                               lambda: _check(cancel), fragment_state))
+                unknown_channels.extend(f'traf(track_id={tid})' for tid in sorted(fragment_state.get('unknown_track_ids', ())))
+            recording_end = fragment_state.get('recording_end')
+            if recording_end is not None:
+                # 옛 fragment(순번 역행·되돌아간 tfdt) 뒤는 현재 녹화가 아니다(#12).
+                limit = min(limit, recording_end)
+                boxes = [b for b in boxes if b.start < limit]
+                gaps = [(a, min(b, limit)) for a, b in gaps if a < limit]
+                manifest['recording_end_offset'] = recording_end
+            media = [(b.payload, min(b.end, limit)) for b in boxes if b.kind == b'mdat' and b.payload < limit]
+            if unknown_channels:
+                manifest['unknown_video_channels'] = unknown_channels
             videos = [t for t in tracks if t.handler == b'vide']
+            channel_count = len(videos) + len(unknown_channels)
             for t in videos:
                 if t.table_error:
                     manifest['diagnostics'].append(f'track {t.id}: {t.table_error}')
             # Header-free but surviving moov: verified source tables bound reading.
             indexed = any(t.samples for t in videos)
+            boundary_unverified = [b.start for b in boxes if b.kind == b'mdat' and (b.truncated or b.unbounded)]
             if indexed:
                 manifest['video_boundary_verified'] = True
                 manifest['video_scan_range'] = dict(end=limit, basis='source_sample_tables',
@@ -838,11 +1036,28 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                 # joined. Keep only media before its first validated ftyp.
                 media = [(a, min([b] + [x.start for x in boxes
                                        if x.kind == b'ftyp' and a <= x.start < b])) for a, b in media]
-                manifest['video_boundary_verified'] = True
-                manifest['video_scan_range'] = dict(end=limit, basis='surviving_mdat_extent', media_ranges=media)
+                if boundary_unverified:
+                    # 크기 0이거나 파일보다 큰 mdat는 경계 근거가 아니다(#33). 카빙은 하되
+                    # 연속성이 끊기는 지점 뒤는 슬랙으로 분리하고 경계 미확인으로 기록한다.
+                    manifest['video_boundary_verified'] = False
+                    manifest['video_scan_range'] = dict(end=limit, basis='unverified_mdat_extent', media_ranges=media,
+                        unbounded_mdat_offsets=boundary_unverified)
+                    manifest['diagnostics'].append(
+                        'mdat 크기가 0이거나 파일을 넘어 현재 녹화의 끝을 확인할 수 없습니다. 연속성이 끊기는 '
+                        '지점 뒤는 슬랙으로 분리했지만, 그 앞까지 옛 녹화가 이어 붙어 있을 가능성은 배제하지 못합니다.')
+                else:
+                    manifest['video_boundary_verified'] = True
+                    manifest['video_scan_range'] = dict(end=limit, basis='surviving_mdat_extent', media_ranges=media)
                 if not videos:
-                    videos = reference_tracks or [Track(0, b'vide', codec='h264')]
-                if len(videos) != 1:
+                    if not reference_tracks:
+                        # moov도 참조도 없으면 채널 수와 설정을 알 수 없다(#35). 본문 안의
+                        # SPS/PPS만으로는 설정이 같은 두 카메라를 구별할 수 없으므로 보류한다.
+                        videos = []
+                        manifest['video_withheld_reason'] = ('moov와 참조 영상이 모두 없어 영상 채널 수와 코덱 설정을 '
+                            '확인할 수 없습니다. 같은 기기·설정의 정상 참조 영상(--reference)을 지정하세요.')
+                    else:
+                        videos = reference_tracks
+                if videos and channel_count != 1 or len(videos) > 1:
                     videos = []
                     manifest['video_withheld_reason'] = '샘플 표 없이 여러 영상 트랙을 구별할 수 없어 영상 생성을 보류했습니다.'
             else:
@@ -859,7 +1074,7 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
             all_rows, nal_rows = [], []
             for t in videos:
                 _check(cancel); stats = dict(damaged_samples=0, waiting_for_idr=0, prediction_breaks=0)
-                if not t.samples and len(videos) > 1:
+                if not t.samples and channel_count > 1:
                     reason = (f'{t.id}번 영상의 샘플 표가 소실되어 여러 영상 채널을 구별할 수 없습니다. '
                               '채널 혼입 방지를 위해 해당 영상 생성을 보류했습니다.')
                     manifest['diagnostics'].append(reason)
@@ -877,7 +1092,8 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                         continue
                 forbidden = [(b.start, b.end) for b in boxes if b.kind not in (b'mdat',)]
                 iterator = indexed_frames(buf, t, limit, media, lambda: _check(cancel), stats, forbidden) if t.samples else (
-                    carved_frames(buf, t, media, lambda: _check(cancel), stats))
+                    carved_frames(buf, t, media, lambda: _check(cancel), stats,
+                                  stop_at_break=not manifest['video_boundary_verified']))
                 frames = []
                 orphaned = []
                 withheld_ranges = []
@@ -889,7 +1105,11 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                     # A missing moof/trun does not imply that its mdat pictures
                     # are gone. Only a single verified video channel may carve
                     # media with no declarations; never scan free/slack bytes.
-                    if t.samples and len(videos) == 1:
+                    if t.samples and channel_count > 1 and unknown_channels:
+                        manifest['diagnostics'].append(
+                            f'track {t.id}: 구별할 수 없는 영상 채널({", ".join(unknown_channels)})이 있어 '
+                            '색인 없는 mdat 구간의 카빙을 보류했습니다.')
+                    if t.samples and channel_count == 1:
                         starts = sorted(a for a, _, _ in t.samples)
                         for a, b in media:
                             j = bisect_right(starts, a-1)
@@ -939,6 +1159,10 @@ def recover_mp4(source, output_dir, reference=None, cancel=None, progress=None, 
                     'source_sample_tables' if t.samples else raw_method)
                 video['unindexed_media_ranges'] = orphaned
                 video['withheld_unindexed_media_ranges'] = withheld_ranges
+                if stats.get('slack_after') is not None:
+                    video['slack_after_offset'] = stats['slack_after']
+                    manifest['diagnostics'].append(f'track {t.id}: 오프셋 {stats["slack_after"]} 이후는 연속성이 끊겨 '
+                                                   '슬랙(옛 녹화 가능)으로 제외했습니다.')
                 video['carved_frames'] = sum(f.sample == 0 for f in frames)
                 video['source_sample_number_basis'] = ('surviving_fragment_declarations'
                     if t.samples and any(b.kind == b'moof' for b in boxes) else 'source_stbl_ordinal'

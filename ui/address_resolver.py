@@ -8,6 +8,9 @@
 
 요청 간격도 최소 0.4초로 띄운다. 카카오는 짧은 시간에 몰린 요청도 429로 거절하는데,
 그걸 일일 한도 초과와 구분할 수 없어서 애초에 몰리지 않게 한다.
+
+스레드는 파이썬 데몬 스레드다. 종료할 때 조회(DNS 등)가 길어져도 기다리거나 terminate()로 끊지 않는다 -
+잠금을 쥔 채 강제 종료되면 교착할 수 있고, 데몬 스레드는 프로세스가 끝날 때 같이 사라진다(리뷰 #132).
 """
 from __future__ import annotations
 
@@ -15,14 +18,14 @@ import threading
 import time
 from typing import Dict, Optional, Tuple
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, Signal
 
 from core import geocode
 
 _MIN_INTERVAL_SEC = 0.4
 
 
-class AddressResolver(QThread):
+class AddressResolver(QObject):
     # (위도, 경도, 주소). 주소가 빈 문자열이면 표시할 것이 없다는 뜻(실패 포함).
     resolved = Signal(float, float, str)
     # (상태, 서버 메시지). 한도 초과/키 오류처럼 세션 동안 계속되는 실패를 한 번만 알린다.
@@ -36,6 +39,7 @@ class AddressResolver(QThread):
         self._pending: Dict[str, Tuple[float, float]] = {}   # 요청자 -> 마지막 요청
         self._stopping = False
         self._failure_reported = False
+        self._thread: Optional[threading.Thread] = None
 
     @classmethod
     def instance(cls) -> "AddressResolver":
@@ -43,32 +47,32 @@ class AddressResolver(QThread):
             cls._instance = AddressResolver()
         return cls._instance
 
+    def isRunning(self) -> bool:  # noqa: N802 - 예전 QThread 인터페이스와 같은 이름
+        return self._thread is not None and self._thread.is_alive()
+
     def request(self, lat: float, lon: float, owner: str = "default") -> None:
         with self._cond:
+            if self._stopping:
+                return   # 종료 중에는 새 조회를 시작하지 않는다
             self._pending.pop(owner, None)
             self._pending[owner] = (lat, lon)   # 뒤로 보내 요청자 사이에서는 먼저 온 것부터
             self._cond.notify()
-        if not self.isRunning():
-            self.start()
+            if not self.isRunning():
+                self._thread = threading.Thread(target=self._run, name="AddressResolver", daemon=True)
+                self._thread.start()
 
     def reset(self) -> None:
         """지도 사용 방식을 다시 고른 뒤 실패 안내를 다시 할 수 있게 한다."""
         self._failure_reported = False
 
     def stop(self) -> None:
+        """종료 신호만 보낸다. 진행 중인 조회의 결과는 버리고, 스레드가 끝나길 기다리지 않는다."""
         with self._cond:
             self._stopping = True
+            self._pending.clear()
             self._cond.notify()
-        if self.isRunning():
-            # 조회 시간 제한(4초)보다 길게 기다린다. 요청이 진행 중일 때 짧게 끊으면
-            # 종료 시점에 QThread가 살아 있는 채로 파괴돼 크래시가 난다. 시간 제한은 DNS 조회에는
-            # 걸리지 않아 8초를 넘길 수 있는데, 그래도 살아 있으면 강제로 끝낸다 - 종료 중이라 잃을
-            # 결과가 없고, 실행 중인 QThread가 파괴되는 abort보다 낫다(리뷰 #78).
-            if not self.wait(8000):
-                self.terminate()
-                self.wait(2000)
 
-    def run(self) -> None:  # noqa: D401
+    def _run(self) -> None:
         last_call = 0.0
         while True:
             with self._cond:
@@ -89,6 +93,8 @@ class AddressResolver(QThread):
 
             result = geocode.describe_location(lat, lon)
             last_call = time.monotonic()
+            if self._stopping:
+                return   # 종료 중에 늦게 온 결과는 화면에 보내지 않는다(받을 위젯이 사라졌을 수 있다)
 
             if result.status in (geocode.STATUS_OK, geocode.STATUS_EMPTY):
                 self.resolved.emit(lat, lon, result.address)

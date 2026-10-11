@@ -36,9 +36,11 @@ def hybrid_media(mp4_media, tmp_path_factory):
             data = candidate.read_bytes(); bs,_,_ = discover(data)
             tracks,_,_ = parse_moov(data,next(b for b in bs if b.kind==b'moov'))
             assert (tracks[0].width,tracks[0].height)==((160,90) if dimensions=='same' else (128,96))
-            parameter = next(n for n in tracks[0].parameters
-                             if (n[0]&31==7 if codec=='h264' else (n[0]>>1)&63==33))
-            prefixes[dimensions] = len(parameter).to_bytes(4,'big')+parameter
+            # 다른 채널의 샘플 머리: 파라미터셋 뒤에 IDR 슬라이스가 바로 이어진다. 사슬에
+            # 이어지지 않은 단독 SPS 후보는 음성 속 우연한 일치와 구별되지 않아 무시된다(#38).
+            first = packet_map(candidate)[0]
+            sample = data[int(first['pos']):int(first['pos'])+int(first['size'])]
+            prefixes[dimensions] = b''.join(len(n).to_bytes(4,'big')+n for n in tracks[0].parameters)+sample
         result[codec] = (source, prefixes)
     return result
 

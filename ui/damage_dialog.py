@@ -58,29 +58,36 @@ def ask_reference(parent, report: DamageReport, candidates: List[str]) -> Tuple[
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Question)
     box.setWindowTitle("헤더 참조 영상")
+    what = "헤더(영상 설정) 내용이 손상됐습니다" if report.header_damaged else "헤더(영상 설정)가 사라졌습니다"
     if candidates:
-        box.setText(f"{name}의 헤더(영상 설정)가 사라졌습니다.\n같은 폴더에서 같은 기기의 정상 영상을 찾았습니다:\n"
+        # 자동 후보는 파일 이름(접두·채널 표시)과 구조·설정 대조로 고른 것이지 같은 기기임을 보장하지는 않는다.
+        # 그래서 '같은 기기'라고 단정하지 않고 기본 버튼도 두지 않는다(리뷰 #13).
+        box.setText(f"{name}의 {what}.\n같은 폴더에서 이름·채널·스트림 구성이 맞는 정상 영상을 찾았습니다 (참조 후보):\n"
                     f"{os.path.basename(candidates[0])}")
-        box.setInformativeText("이 영상의 헤더(스트림 구성·코덱·FPS)만 이식해 분석·재생합니다. 영상·GPS 데이터는 손상 파일 것만 씁니다. "
-                               "이식 사실은 사건 정보와 리포트에 남깁니다.")
+        box.setInformativeText("이 영상이 같은 기기·같은 채널(전방/후방)·같은 설정으로 녹화된 것이 맞는지 확인하세요. "
+                               "헤더(스트림 구성·코덱·FPS)만 이식해 분석·재생하며 영상·GPS 데이터는 손상 파일 것만 씁니다. "
+                               "설정이 다른 영상을 쓰면 재생 시각이 틀어질 수 있습니다. 이식 사실은 사건 정보와 리포트에 남깁니다.")
         use_btn = box.addButton("이 영상 사용", QMessageBox.AcceptRole)
     else:
-        box.setText(f"{name}의 헤더(영상 설정)가 사라졌습니다.\n같은 폴더에서 같은 기기의 정상 영상을 찾지 못했습니다.")
-        box.setInformativeText("같은 기기·같은 녹화 종류(상시/이벤트)의 정상 영상을 고르면 그 헤더를 이식해 분석·재생합니다. "
-                               "참조 없이 진행하면 영상은 재생되지 않고 GPS만 UTC 기준 시간축으로 회수합니다.")
+        box.setText(f"{name}의 {what}.\n같은 폴더에서 이름·채널·스트림 구성이 맞는 정상 영상을 찾지 못했습니다.")
+        box.setInformativeText("같은 기기·같은 채널(전방/후방)·같은 녹화 종류(상시/이벤트)의 정상 영상을 고르면 그 헤더를 "
+                               "이식해 분석·재생합니다. 고른 영상은 손상 파일의 스트림 구성·코덱·FPS와 대조해 맞지 않으면 "
+                               "쓰지 않습니다. 참조 없이 진행하면 영상은 재생되지 않고 GPS만 UTC 기준 시간축으로 회수합니다.")
         use_btn = None
     pick_btn = box.addButton("다른 파일 선택" if candidates else "파일 선택", QMessageBox.AcceptRole)
     skip_btn = box.addButton("참조 없이 진행 (GPS만)", QMessageBox.AcceptRole)
-    box.addButton("취소", QMessageBox.RejectRole)
-    box.setDefaultButton(use_btn or pick_btn)
+    cancel_btn = box.addButton("취소", QMessageBox.RejectRole)
+    box.setDefaultButton(cancel_btn if use_btn is not None else pick_btn)
     box.exec()
     clicked = box.clickedButton()
     if use_btn is not None and clicked is use_btn:
         return candidates[0], False
     if clicked is pick_btn:
-        path, _ = QFileDialog.getOpenFileName(parent, "같은 기기의 정상 영상 선택", os.path.dirname(report.path), VIDEO_FILTER)
+        path, _ = QFileDialog.getOpenFileName(parent, "같은 기기·같은 채널의 정상 영상 선택", os.path.dirname(report.path),
+                                              VIDEO_FILTER)
         if not path:
-            return None, True
+            # 파일 창만 닫은 것은 취소가 아니다 - 참조 선택 창으로 돌아간다(리뷰 #51; main_window가 None, False를 그렇게 다룬다).
+            return None, False
         return path, False
     if clicked is skip_btn:
         return "", False

@@ -172,7 +172,11 @@ async function addBasemapIfAvailable() {
 
 function buildFeatures(points) {
   // 위험운전 선 색은 Python이 '이 점으로 들어오는 선분' 단위로 정해 준다(p.e).
-  const solid = [], dashed = [], eventLines = [], interp = [], damaged = [];
+  // 같은 종류가 이어지는 선분은 하나의 LineString으로 묶는다. 1초 선분마다 피처를 따로 만들면 점선
+  // 패턴이 선분마다 처음부터 다시 시작해 확대 수준에 따라 실선처럼 보였다(리뷰 #55).
+  const runs = { solid: [], dashed: [], interp: [], damaged: [] };
+  const eventLines = [];
+  let current = null, currentKind = null;
 
   let prev = null;
   let sawDropout = false;
@@ -182,20 +186,29 @@ function buildFeatures(points) {
     if (p.lat === null || p.lon === null) {
       // 이상치(o)는 좌표를 지도에 쓰지 않되 끊김으로도 치지 않는다 - 앞뒤 정상 지점을 실선으로 잇는다.
       if (p.d) sawDropout = true;
-      if (p.r === "damaged") sawDamage = true;   // 손상 구간의 빈 행: 앞뒤를 빨간 점선으로 잇는다
+      if (p.r === "damaged") sawDamage = true;   // 손상 구간의 빈 행: 앞뒤를 손상 점선으로 잇는다
       continue;
     }
     if (prev !== null && (p.s || 0) !== (points[prev].s || 0)) {
       // 이어보기: 영상이 바뀌는 곳은 잇지 않는다(앞 영상 끝의 검은 점에서 다음 영상이 시작한다).
       prev = null;
+      current = null;
     }
     if (prev !== null) {
-      const seg = [[points[prev].lon, points[prev].lat], [p.lon, p.lat]];
-      if (p.r === "interpolated" || points[prev].r === "interpolated") interp.push(seg);
-      else if (sawDamage) damaged.push(seg);
-      else if (p.e) eventLines.push({ coords: seg, color: p.e });
-      else if (sawDropout) dashed.push(seg);
-      else solid.push(seg);
+      let kind;
+      if (p.r === "interpolated" || points[prev].r === "interpolated") kind = "interp";
+      else if (sawDamage) kind = "damaged";
+      else if (p.e) kind = p.e;
+      else if (sawDropout) kind = "dashed";
+      else kind = "solid";
+      if (current === null || kind !== currentKind) {
+        current = [[points[prev].lon, points[prev].lat], [p.lon, p.lat]];
+        if (runs[kind]) runs[kind].push(current);
+        else eventLines.push({ coords: current, color: kind });
+        currentKind = kind;
+      } else {
+        current.push([p.lon, p.lat]);
+      }
     }
     prev = i;
     sawDropout = false;
@@ -210,16 +223,18 @@ function buildFeatures(points) {
     features: eventLines.map((l) => ({ type: "Feature", properties: { color: l.color },
       geometry: { type: "LineString", coordinates: l.coords } })),
   };
-  return { solid: fc(solid), dashed: fc(dashed), events: events, interp: fc(interp), damaged: fc(damaged) };
+  return { solid: fc(runs.solid), dashed: fc(runs.dashed), events: events,
+           interp: fc(runs.interp), damaged: fc(runs.damaged) };
 }
 
 function renderLegend(legend) {
   const box = document.getElementById("legend-events");
   box.innerHTML = "";
-  (legend || []).forEach(([label, color]) => {
+  (legend || []).forEach(([label, color, style]) => {
     const row = document.createElement("div");
     const line = document.createElement("i");
     line.style.borderColor = color;
+    line.style.borderTopStyle = style || "solid";   // 손상·추정 구간은 지도 위 선처럼 점선(리뷰 #55)
     row.appendChild(line);
     row.appendChild(document.createTextNode(" " + label));
     box.appendChild(row);
@@ -298,14 +313,25 @@ function renderTrack(payload) {
     window.__trackIdle = false;
     map.once("idle", function () { window.__trackIdle = true; });
 
-    const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
-    const outliers = pts.reduce((n, p) => n + (p.o ? 1 : 0), 0);
-    setStatus(`좌표 ${fixes.length}개` + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : "")
-      + (outliers ? ` · 이상치 ${outliers}개 제외` : "")
+    setStatus(trackStatus(pts, fixes)
       + (window.__hasBasemap ? "" : " · 배경지도 없음(궤적만 표시)") + fallbackNote);
   } else {
     setStatus(noFixStatus(pts));
   }
+}
+
+// 상태 줄의 좌표 수. 임의 복구의 추정 좌표는 실측과 따로 센다 - 예전엔 '좌표 300개'에 추정 59개가
+// 섞여 실측처럼 보였다(리뷰 #21). 손상 구간의 빈 행도 따로 적는다.
+function trackStatus(pts, fixes) {
+  const estimated = fixes.reduce((n, p) => n + (p.r === "interpolated" ? 1 : 0), 0);
+  const damaged = pts.reduce((n, p) => n + (p.r === "damaged" ? 1 : 0), 0);
+  const dropouts = pts.reduce((n, p) => n + (p.d ? 1 : 0), 0);
+  const outliers = pts.reduce((n, p) => n + (p.o ? 1 : 0), 0);
+  return `좌표 ${fixes.length - estimated}개`
+    + (estimated ? ` · 추정 좌표 ${estimated}개(임의 복구, 측정값 아님)` : "")
+    + (damaged ? ` · 손상 구간 ${damaged}개 지점` : "")
+    + (dropouts ? ` · GPS 끊김 ${dropouts}개 지점` : "")
+    + (outliers ? ` · 이상치 ${outliers}개 제외` : "");
 }
 
 // 좌표를 하나도 못 그릴 때의 사유. 이상치·검증 실패로 뺀 것과 수신 자체가 없는 것을 구분한다(리뷰 #111).
@@ -334,10 +360,13 @@ function setPlaybackTime(sec) {
   const fc = { type: "FeatureCollection", features: [] };
   if (best) {
     const props = (best.h === null || best.h === undefined) ? {} : { bearing: best.h };
+    // 임의 복구의 추정 좌표 위에 있을 때는 마커 색을 바꿔 실측과 구분한다(리뷰 #21).
+    props.est = best.r === "interpolated" ? 1 : 0;
     fc.features.push({ type: "Feature", properties: props,
       geometry: { type: "Point", coordinates: [best.lon, best.lat] } });
   }
   map.getSource("trk-pos").setData(fc);
+  window.__posEstimated = !!(best && best.r === "interpolated");
 
   // 확대해서 보면 차량이 금방 화면 밖으로 나가서 사용자가 마우스로 계속 따라가야 했다.
   // 화면 가운데에 가로세로 70% 크기의 상자가 있다고 보고, 마커가 그 상자를 벗어나면
@@ -366,7 +395,7 @@ function setFollow(on) {
 }
 
 // 진행 방향 화살표 아이콘. 위(북)를 향하는 삼각형을 그려 두고 icon-rotate로 돌린다.
-function makeArrowImage(size) {
+function makeArrowImage(size, color) {
   const c = document.createElement("canvas");
   c.width = size; c.height = size;
   const g = c.getContext("2d");
@@ -377,7 +406,7 @@ function makeArrowImage(size) {
   g.lineTo(size / 2, size * 0.70);
   g.lineTo(size * 0.10, size * 0.90);
   g.closePath();
-  g.fillStyle = "#1c7ed6";
+  g.fillStyle = color || "#1c7ed6";
   g.fill();
   g.lineWidth = size * 0.09;
   g.strokeStyle = "#ffffff";
@@ -392,6 +421,7 @@ function addTrackLayers() {
     map.addSource(id, { type: "geojson", data: empty });
   }
   if (!map.hasImage("pos-arrow")) map.addImage("pos-arrow", makeArrowImage(64), { pixelRatio: 2 });
+  if (!map.hasImage("pos-arrow-est")) map.addImage("pos-arrow-est", makeArrowImage(64, "#9c36b5"), { pixelRatio: 2 });
   map.addLayer({ id: "l-dashed", type: "line", source: "trk-dashed",
     paint: { "line-color": "#9aa4ad", "line-width": 2, "line-dasharray": [2, 2] } });
   map.addLayer({ id: "l-solid", type: "line", source: "trk-solid",
@@ -400,11 +430,12 @@ function addTrackLayers() {
   map.addLayer({ id: "l-events", type: "line", source: "trk-events",
     layout: { "line-cap": "round", "line-join": "round" },
     paint: { "line-color": ["get", "color"], "line-width": 6 } });
-  // 손상 파일: 임의 복구(추정 좌표)는 보라 점선, 복구하지 않은 손상 구간은 빨간 점선.
+  // 손상 파일: 임의 복구(추정 좌표)는 보라 점선, 복구하지 않은 손상 구간은 검정 긴 점선.
+  // 색은 ui/map_view.py의 INTERPOLATED_COLOR / DAMAGED_COLOR와 같다(급가속 빨강과 겹치지 않게 - 리뷰 #55).
   map.addLayer({ id: "l-interp", type: "line", source: "trk-interp",
     paint: { "line-color": "#9c36b5", "line-width": 4, "line-dasharray": [1, 1.2] } });
   map.addLayer({ id: "l-damaged", type: "line", source: "trk-damaged",
-    paint: { "line-color": "#e03131", "line-width": 3, "line-dasharray": [2, 2] } });
+    paint: { "line-color": "#212529", "line-width": 3, "line-dasharray": [4, 2] } });
   map.addLayer({ id: "l-ends", type: "circle", source: "trk-ends",
     paint: {
       "circle-radius": 7,
@@ -412,14 +443,16 @@ function addTrackLayers() {
       "circle-stroke-color": "#ffffff", "circle-stroke-width": 2,
     } });
   // 방향을 모르는 지점(첫 측정 전 등)은 원, 아는 지점은 진행 방향으로 돌린 화살표.
+  // 추정 좌표(est=1) 위에서는 보라색으로 그린다(리뷰 #21).
   map.addLayer({ id: "l-pos", type: "circle", source: "trk-pos",
     filter: ["!", ["has", "bearing"]],
-    paint: { "circle-radius": 8, "circle-color": "#1c7ed6",
+    paint: { "circle-radius": 8,
+             "circle-color": ["case", ["==", ["get", "est"], 1], "#9c36b5", "#1c7ed6"],
              "circle-stroke-color": "#ffffff", "circle-stroke-width": 3 } });
   map.addLayer({ id: "l-pos-arrow", type: "symbol", source: "trk-pos",
     filter: ["has", "bearing"],
     layout: {
-      "icon-image": "pos-arrow", "icon-size": 0.55,
+      "icon-image": ["case", ["==", ["get", "est"], 1], "pos-arrow-est", "pos-arrow"], "icon-size": 0.55,
       "icon-rotate": ["get", "bearing"], "icon-rotation-alignment": "map",
       "icon-allow-overlap": true, "icon-ignore-placement": true,
     } });

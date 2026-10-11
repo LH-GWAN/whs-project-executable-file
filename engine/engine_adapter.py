@@ -5,7 +5,9 @@ import glob
 import math
 import os
 import json
+import re
 import subprocess
+import tempfile
 import time
 import sys
 import threading
@@ -118,6 +120,18 @@ class TrackPoint:
     def is_interpolated(self) -> bool:
         return self.recovery_state == "interpolated"
 
+    # recovery_state 계약(리뷰 2026-10-11 #4·#14·#20·#74): 합성 행인지 한 곳에서 정한다.
+    #   is_synthetic  - "damaged"(빈 행)·"interpolated"(추정 좌표). 실측이 아니므로 앵커·판정·집계·
+    #                   '수신 수'·'GPS 미기록' 어디에도 실측처럼 넣지 않는다.
+    #   is_recovered  - "gap_carved". 손상 구간에서 회수한 **실측**이라 정상 행과 똑같이 다룬다(표시만 구분).
+    @property
+    def is_synthetic(self) -> bool:
+        return self.recovery_state in ("damaged", "interpolated")
+
+    @property
+    def is_recovered(self) -> bool:
+        return self.recovery_state == "gap_carved"
+
     @property
     def is_dropout(self) -> bool:
         # 좌표 자체가 없을 때만 끊김이다. 이상치는 좌표가 있지만 쓰지 않는 것이라 따로 센다.
@@ -172,11 +186,21 @@ class ExtractionResult:
     avi_repaired: bool = False
     # 손상 파일 처리 결과(core/pipeline.describe_damage): report·mode·intervals·repaired. 없으면 None.
     damage: Optional[dict] = None
+    # 엔진(integration_avi)이 stdout `DAMAGE_JSON …` 한 줄로 넘긴 색인 재구성 판정 근거: measured_duration_sec
+    # (색인 영상 프레임 수÷fps, 빈 자리 포함)·header_duration_sec·idx1_truncated·zero_tail·truncated_tail·
+    # boundary_uncertain·cut_reason 등. 없으면 None.
+    engine_damage: Optional[dict] = None
 
     @property
     def fix_count(self) -> int:
-        # 임의 복구로 만든 추정 좌표는 측정이 아니다 - 수신 수에 넣지 않는다.
-        return sum(1 for p in self.points if p.has_fix and not p.is_interpolated)
+        # 합성 행(빈 행·임의 복구 추정 좌표)은 측정이 아니다 - 수신 수에 넣지 않는다.
+        return sum(1 for p in self.points if p.has_fix and not p.is_synthetic)
+
+    @property
+    def time_estimated(self) -> bool:
+        """재생 시각을 영상 시간축이 아니라 GPS 기록(UTC·경과 초)으로 추정했는가(헤더 소실 AVI, moov 소실
+        MP4 카빙). True면 상태 줄·리포트에 추정 안내를 띄우고 시각에 '(추정)'을 붙여야 한다(리뷰 #74)."""
+        return any(p.time_estimated for p in self.points)
 
     @property
     def dropout_count(self) -> int:
@@ -240,32 +264,42 @@ def run_engine(input_path: str, output_dir: str, slack: bool = False,
     # subprocess.run은 블로킹이라 중간에 멈출 수 없다. 대용량 파일 분석이 수십 분
     # 걸릴 수 있으므로, 취소 요청이 오면 자식 프로세스를 실제로 종료할 수 있게
     # Popen으로 띄우고 짧은 간격으로 지켜본다.
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace")
-    stdout = stderr = ""
+    # stdout·stderr는 파이프가 아니라 임시 파일로 받는다 - 경고 수백만 건을 찍는 조작 파일에서 PIPE로
+    # 전부 받은 뒤 자르면 GUI 프로세스 메모리가 수백 MB까지 올랐다(리뷰 #62·#115). 파일에서는 앞·뒤만 읽는다.
+    out_fd, out_path = tempfile.mkstemp(prefix="idas_engine_", suffix=".out")
+    err_fd, err_path = tempfile.mkstemp(prefix="idas_engine_", suffix=".err")
     try:
-        while True:
+        with os.fdopen(out_fd, "wb") as out_f, os.fdopen(err_fd, "wb") as err_f:
+            proc = subprocess.Popen(argv, stdout=out_f, stderr=err_f)
             try:
-                stdout, stderr = proc.communicate(timeout=0.2)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            if cancel_event is not None and cancel_event.is_set():
-                cancelled = True
-                break
-            if timeout_sec is not None and time.monotonic() - started_mono > timeout_sec:
-                timed_out = True
-                break
+                while True:
+                    try:
+                        proc.wait(timeout=0.2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                        break
+                    if timeout_sec is not None and time.monotonic() - started_mono > timeout_sec:
+                        timed_out = True
+                        break
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+        stdout = _read_capped_text(out_path)
+        stderr = _read_capped_text(err_path)
     finally:
-        if proc.poll() is None:
-            proc.terminate()
+        for path in (out_path, err_path):
             try:
-                out, err = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                out, err = proc.communicate()
-            stdout = stdout or out or ""
-            stderr = stderr or err or ""
+                os.remove(path)
+            except OSError:
+                pass
 
     exit_code = proc.returncode if not (timed_out or cancelled) else -1
     if timed_out:
@@ -274,12 +308,6 @@ def run_engine(input_path: str, output_dir: str, slack: bool = False,
         stderr += "\n[engine_adapter] 사용자가 취소함"
 
     finished_at = datetime.now()
-    # 경고가 수백만 건인 조작 파일은 stdout이 수백 MB가 된다. 앞·뒤만 남긴다(리뷰 #62).
-    if len(stdout) > _MAX_CAPTURED_OUTPUT:
-        stdout = (stdout[:_MAX_CAPTURED_OUTPUT // 2] + "\n… (출력이 길어 가운데를 생략함) …\n"
-                  + stdout[-_MAX_CAPTURED_OUTPUT // 2:])
-    if len(stderr) > _MAX_CAPTURED_OUTPUT:
-        stderr = stderr[:_MAX_CAPTURED_OUTPUT // 2] + "\n… (생략) …\n" + stderr[-_MAX_CAPTURED_OUTPUT // 2:]
     result = EngineRunResult(
         argv=argv, exit_code=exit_code, stdout=stdout, stderr=stderr,
         started_at=started_at, finished_at=finished_at, timed_out=timed_out, note=note,
@@ -287,6 +315,22 @@ def run_engine(input_path: str, output_dir: str, slack: bool = False,
     if cancelled:
         raise CancelledError("분석이 취소되었습니다.")
     return result
+
+
+def _read_capped_text(path: str, cap: int = _MAX_CAPTURED_OUTPUT) -> str:
+    """임시 출력 파일에서 앞·뒤 cap/2 바이트만 읽는다(가운데는 생략 표시). 전체를 메모리에 올리지 않는다."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size <= cap:
+                return f.read().decode("utf-8", "replace")
+            head = f.read(cap // 2)
+            f.seek(size - cap // 2)
+            tail = f.read()
+        return (head.decode("utf-8", "replace") + "\n… (출력이 길어 가운데를 생략함) …\n"
+                + tail.decode("utf-8", "replace"))
+    except OSError:
+        return ""
 
 
 def _f(value: Optional[str]) -> Optional[float]:
@@ -362,7 +406,11 @@ def load_timeline(csv_path: str) -> List[TrackPoint]:
                 z_g_cal=_f(row.get("z_g_cal")),
                 source_file=csv_path,
                 source_offset=_offset(row.get("source_offset")),
-                recovery_state="gap_carved" if (row.get("time_source") or "").strip() == "gap_carved_utc" else "",
+                # 엔진의 회수 행은 time_source로, 앱이 쓴 카빙 timeline(recovered_gps/)은 recovery_state·
+                # time_estimated 열로 표시한다 - 다시 열어도 처음 분석과 같은 상태가 되게(리뷰 #41).
+                recovery_state=((row.get("recovery_state") or "").strip()
+                                or ("gap_carved" if (row.get("time_source") or "").strip() == "gap_carved_utc" else "")),
+                time_estimated=bool(_b(row.get("time_estimated"))),
             ))
     _restore_timeline_trust(points, csv_path)
     return points
@@ -491,8 +539,23 @@ _NO_GPS_MARKERS = (
     "지원 text/subtitle handler(text/sbtl/subt) Track을 하나도 찾지 못함",
     "선택된 스트림이 없습니다",
 )
-# 엔진이 처리를 중단했다고 알리는 문구들(산출물이 일부 있어도 실패다, 리뷰 #39).
-_FAILURE_MARKERS = ("종료 코드", "예외:", "Traceback (most recent call last)", "처리할 수 없습니다", "No space left")
+# 엔진이 처리를 중단했다고 알리는 줄(산출물이 일부 있어도 실패다, 리뷰 #39). 줄 전체 형식으로 맞춘다 -
+# 문구 포함 여부로 보면 증거 파일의 자막·NMEA 미리보기 줄에 'Traceback'·'예외:'가 섞였을 때 정상 영상이
+# 실패가 되고, 반대로 MP4 예외 문구는 놓쳤다(리뷰 2026-10-11 #54). 데이터 미리보기 줄은 이 형식이 아니다.
+_FAILURE_LINE_RES = (
+    # integration_blackbox [전체 요약]: "  AVI 1개 -> 예외: …" / "  MP4 1개 -> integration_mp4.py가 종료 코드 1로 중단됨"
+    re.compile(r"^(?:AVI|MP4) \d+개 -> (?:예외: |integration_\w+\.py가 종료 코드 )"),
+    # integration_mp4: "[WARN] 예외 발생으로 처리 중단: …", integration_avi: "[WARN] <파일명>: 예외 발생으로 처리 중단: …"
+    re.compile(r"^\[WARN\] (?:[^:\n]{1,200}: )?(?:예외 발생으로 처리 중단: |처리 중단 \(종료 코드 )"),
+    # integration_mp4 [전체 요약] 실패 줄: "  SKIP <파일명>   exception: …" / "… 처리 실패(위 경고 참조)"
+    re.compile(r"^SKIP \S.*?(?:\sexception: |처리 실패\()"),
+    # integration_avi [전체 요약] 실패 줄: "  FAIL <파일명>   예외: …" / "… 처리 중단 (종료 코드 …)"
+    re.compile(r"^FAIL \S.*?(?:\s예외: |\s처리 중단 \()"),
+    # integration_avi: "<경로>: idx1도 movi도 찾지 못했습니다. 이 파일은 처리할 수 없습니다."
+    re.compile(r"이 파일은 처리할 수 없습니다\.$"),
+)
+_STDERR_FAILURE_MARKERS = ("Traceback (most recent call last)", "No space left on device")
+_FAILURE_MARKERS = ("종료 코드", "예외:", "Traceback (most recent call last)", "처리할 수 없습니다", "No space left")   # 하위 호환용 이름
 
 
 def _pending_track_ids(output_dir: str) -> List[int]:
@@ -543,9 +606,11 @@ def run_full_extraction(input_path: str, output_dir: str, slack: bool = False,
         ))
 
     points, primary = _load_points(output_dir)
-    # 헤더가 사라진 AVI는 재생 시각 없이 좌표만 온다. GPS UTC로 시간축을 추정한다(손상 파일 복구).
-    from core.damage_marks import estimate_times_from_utc
-    estimate_times_from_utc(points)
+    # 헤더가 사라진 AVI는 재생 시각 없이 좌표만 온다. GPS UTC(FineVu는 경과 초)로 시간축을 추정한다.
+    # 연속성이 끊긴 뒤쪽 행(옛 녹화 잔재)은 본 궤적에서 빼 슬랙으로 둔다(리뷰 #3·#74·#77).
+    warnings = _collect_warnings(output_dir)
+    excluded: List[TrackPoint] = []
+    estimated = _estimate_missing_times(points, excluded, warnings)
     points.sort(key=lambda p: (p.start_time_sec is None, p.start_time_sec or 0.0))
     time_source = next((p.time_source for p in points if p.time_source), "")
 
@@ -558,13 +623,58 @@ def run_full_extraction(input_path: str, output_dir: str, slack: bool = False,
         if get_duration_sec(input_path, routing.container):
             status, detail = STATUS_NO_GPS, "지원하는 GPS 메타데이터 트랙이 없습니다."
 
+    if estimated and status == STATUS_OK and detail == "":
+        detail = "재생 시각은 GPS 기록으로 추정한 값입니다."
+    engine_damage = parse_engine_damage(engine_runs, warnings)
     return ExtractionResult(
         routing=routing, points=points, engine_runs=engine_runs,
         used_input_path=input_path, primary_source_file=primary,
-        time_source=time_source, warnings=_collect_warnings(output_dir),
+        time_source=time_source, warnings=warnings,
         status=status, status_detail=detail,
-        slack_points=load_slack_points(output_dir) if slack else [],
+        slack_points=(load_slack_points(output_dir) if slack else []) + excluded,
+        engine_damage=engine_damage,
     )
+
+
+DAMAGE_JSON_PREFIX = "DAMAGE_JSON "
+
+
+def parse_engine_damage(engine_runs: List[EngineRunResult], warnings: Optional[List[str]] = None) -> Optional[dict]:
+    """엔진 stdout의 `DAMAGE_JSON {…}` 줄(마지막 것)을 dict로. boundary_uncertain·cut_reason은 경고로 올린다."""
+    found = None
+    for run in engine_runs:
+        for line in (run.stdout or "").splitlines():
+            if line.startswith(DAMAGE_JSON_PREFIX):
+                try:
+                    value = json.loads(line[len(DAMAGE_JSON_PREFIX):])
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    found = value
+    if found is None or warnings is None:
+        return found
+    if found.get("boundary_uncertain"):
+        warnings.append("색인 재구성: 녹화 끝 경계가 불확실합니다(옛 녹화 잔재와 구분 어려움). 경계 뒤는 슬랙으로 분리했습니다.")
+    if found.get("cut_reason"):
+        warnings.append(f"색인 재구성: 녹화 끝을 {found.get('cut_at')} 바이트에서 잘랐습니다 - {found['cut_reason']}")
+    return found
+
+
+def _estimate_missing_times(points: List[TrackPoint], excluded: List[TrackPoint],
+                            warnings: List[str]) -> bool:
+    """재생 시각이 전혀 없는 결과의 시간축 추정 + 안내(상태 줄·리포트가 쓸 경고 문구). 추정했으면 True."""
+    from core.damage_marks import TIME_ESTIMATED_WARNING, estimate_times_from_utc
+    if not estimate_times_from_utc(points, excluded):
+        # 카빙 timeline(recovered_gps/)처럼 시각이 이미 적혀 있어도 추정 표시가 남아 있으면 같은 안내를 띄운다.
+        if any(p.time_estimated for p in points):
+            warnings.append(TIME_ESTIMATED_WARNING)
+            return True
+        return False
+    warnings.append(TIME_ESTIMATED_WARNING)
+    if excluded:
+        warnings.append(f"GPS 시각의 연속성이 끊긴 행 {len(excluded)}건(다른 녹화의 잔재·기준 시각 이전·"
+                        "체크섬 실패)은 본 궤적에서 빼고 슬랙으로 두었습니다.")
+    return True
 
 
 def load_slack_points(output_dir: str) -> List[TrackPoint]:
@@ -640,11 +750,16 @@ def _classify_outcome(engine_runs: List[EngineRunResult], output_dir: str,
 
 
 def _explicit_failure_line(engine_runs: List[EngineRunResult]) -> str:
+    """엔진이 중단을 알린 줄(형식 일치). stdout은 줄 형식으로, stderr는 Traceback·디스크 부족만 본다."""
     for run in engine_runs:
         for line in (run.stdout or "").splitlines():
             stripped = line.strip()
-            if any(marker in stripped for marker in _FAILURE_MARKERS):
+            if any(rx.search(stripped) for rx in _FAILURE_LINE_RES):
                 return stripped[:300]
+        err = run.stderr or ""
+        if any(marker in err for marker in _STDERR_FAILURE_MARKERS):
+            lines = [ln.strip() for ln in err.splitlines() if ln.strip()]
+            return (lines[-1] if lines else "엔진 오류(stderr)")[:300]
     return ""
 
 
@@ -673,7 +788,11 @@ def _load_points(output_dir: str, include_slack: bool = False
     return points, primary
 
 
-def load_existing_results(output_dir: str) -> tuple[List[TrackPoint], Optional[str], str]:
+def load_existing_results(output_dir: str, excluded_out: Optional[List[TrackPoint]] = None,
+                          warnings_out: Optional[List[str]] = None
+                          ) -> tuple[List[TrackPoint], Optional[str], str]:
+    """저장된 산출물에서 행을 다시 읽는다. 헤더 소실 사건은 처음 분석과 같은 규칙으로 시각을 추정하고,
+    본 궤적에서 뺀 행은 excluded_out에, 안내 문구는 warnings_out에 넣는다(리뷰 #3·#41)."""
     timeline_paths = find_csvs(output_dir, "timeline.csv")
     primary = pick_primary_csv(timeline_paths)
     if primary is not None:
@@ -682,8 +801,9 @@ def load_existing_results(output_dir: str) -> tuple[List[TrackPoint], Optional[s
         coord_paths = find_csvs(output_dir, "coordinates.csv")
         primary = pick_primary_csv(coord_paths)
         points = load_coordinates_as_points(primary) if primary else []
-    from core.damage_marks import estimate_times_from_utc
-    estimate_times_from_utc(points)   # 헤더 소실 AVI 사건을 다시 열 때도 같은 시간축
+    excluded: List[TrackPoint] = [] if excluded_out is None else excluded_out
+    warnings: List[str] = [] if warnings_out is None else warnings_out
+    _estimate_missing_times(points, excluded, warnings)
     points.sort(key=lambda p: (p.start_time_sec is None, p.start_time_sec or 0.0))
     time_source = next((p.time_source for p in points if p.time_source), "")
     return points, primary, time_source

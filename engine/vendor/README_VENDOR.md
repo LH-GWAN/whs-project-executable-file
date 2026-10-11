@@ -78,3 +78,28 @@
   다음 정상 Box에서 이어 읽고 `DAMAGE_GAPS`에 구간을 남김, moof 없는 mdat(`UNINDEXED_MEDIA`)와 손상 구간의 RMC를
   `carve_gap_gps`가 UTC로 시간축에 되돌려 넣음(`time_source=gap_carved_utc`), timeline에 `source_offset`.
 - 앱이 읽는 열: `source_offset`(바이트 위치), `time_source`가 `gap_carved_utc`면 `recovery_state="gap_carved"`.
+
+## 2026-10-11 코드 리뷰 2차 반영 (whs-project와 동일 내용)
+
+- `integration_avi.py`: `_idx1_entries_plausible`은 색인 전체 표본(0으로 덮인 자리는 분모 제외)이 과반 일치하고 현재
+  movi의 첫 청크 사슬(`first_chunk_chain`)과 맞물릴 때만 받으며, 첫 청크 사슬에서 역산한 base 후보도 본다.
+  `find_idx1_fallback`은 검증을 통과한 후보 가운데 자기 영역 뒤 가장 앞의 idx1을 고른다(뒤에 붙은 옛 idx1 제외).
+  `find_top_level_sections_damaged`는 첫 청크 사슬 → movi → hdrl(movi보다 앞) 순. `recording_cut_at(mm, walked, gaps,
+  info=)`은 체크섬 맞고 날짜 있는 A 상태 RMC만 근거로 하고 근거가 없으면 `boundary_uncertain`(뒤는 `after_cut_uncertain`
+  슬랙). `walk_movi_chunks(..., tail_info=)`는 `LIST rec ` 안으로 들어가고 0 꼬리·잘린 꼬리를 gap에 넣지 않는다.
+  `synthesize_idx1` 빈 자리 수는 앞뒤 앵커 시각 차이 기준, placeholder는 index.csv에 `DAMAGED_PLACEHOLDER`.
+  `measured_video_duration`·`supplement_truncated_index`, `_count_avix_after`. `classify_payload`가 전부 0을 `empty`로.
+  `find_embedded_nmea_text`는 체크섬 맞는 RMC → GGA → 체크섬 없는 RMC → GGA 순. stdout `DAMAGE_JSON`에
+  `idx1_truncated`, `supplemented_entries`, `placeholders`, `cut_at`, `cut_reason`, `boundary_uncertain`, `zero_tail`,
+  `truncated_tail`, `last_chunk_end`, `measured_duration_sec`, `header_duration_sec`. decode_detection.csv에 `empty` 열.
+- `integration_mp4.py`: `scan_top_level_bounded(f, filesize, cancel_check=None)`가 moof마다 mfhd 순번·tfdt·GPS 날짜+UTC
+  (`_moof_probe`)를 보고 이어질 때만 받으며, 어긋나면 boundary_kind `mfhd`/`tfdt`/`gps`/`moov`/`moof`로 슬랙 경계. 이어지지
+  않는 moof 하나는 뒤 조각 2개를 미리 읽어 손상으로만 처리(`_lookahead_moofs`). 내부가 손상된 moof도 DAMAGE_GAPS.
+  끝까지 0인 꼬리는 `padding`. size 0은 최상위 mdat만, truncated는 알려진 Box 타입만. 카빙(`_carve_gap_gps`)은 EOF 꼬리
+  제외·날짜 일치·앞뒤 앵커 UTC 사이·영상 길이 안일 때만 받고 `CARVED_GPS_OFFSETS`로 슬랙 중복을 막는다. largesize mdat
+  잘림은 truncated. 혼합 fMP4의 moov 샘플 표 구간은 `_hybrid_moov_samples`(time_source `stts`). `assign_utc_elapsed_times`는
+  체크섬 실패 행을 UTC 없는 행으로. `_gps_rank`로 대표 문장 선택. 스캔 결과 LRU 캐시.
+- `integration_blackbox.py`: `sniff_damaged_container`가 앞 창에 흔적이 없으면 뒤 8MB도 보고, AVI 근거가 있으면 전체 MP4
+  탐색을 생략한다. RIFF formType이 깨진 파일은 알려진 다른 RIFF 형식만 거부하고 내용으로 판별한다. 배치 `main`은
+  `_SharedReservations`로 두 모듈의 출력 폴더 예약을 공유한다.
+- 앱은 `DAMAGE_JSON`을 `ExtractionResult.engine_damage`로 보관하고 `measured_duration_sec`로 AVI 길이를 보정한다.

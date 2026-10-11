@@ -6,9 +6,12 @@ from typing import Dict, Optional
 from PySide6.QtCore import QThread, Signal
 
 from core import hashing
-from core.pipeline import PipelineResult, run_analysis_pipeline, run_sequence_pipeline
+from core.pipeline import PipelineResult, reopen_case, run_analysis_pipeline, run_sequence_pipeline
 from engine.engine_adapter import CancelledError
-from storage.history_store import HistoryStore
+from storage.history_store import CaseRecord, HistoryStore
+
+# 취소로 보는 예외: 파이프라인·엔진은 CancelledError, core/damage 검사는 InterruptedError를 낸다(리뷰 #100).
+_CANCEL_EXCEPTIONS = (CancelledError, InterruptedError)
 
 
 class HashWorker(QThread):
@@ -103,7 +106,7 @@ class AnalysisWorker(QThread):
                     reference_path=self._reference_path,
                 )
             self.finished_ok.emit(result)
-        except CancelledError:
+        except _CANCEL_EXCEPTIONS:
             self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
@@ -112,13 +115,48 @@ class AnalysisWorker(QThread):
         self._cancel_event.set()
 
 
+class ReopenWorker(QThread):
+    """저장된 사건을 화면 밖에서 다시 연다(core/pipeline.reopen_case). manifest 대조·행 복원이 수십 초 걸릴 수
+    있어 GUI 스레드에서 부르면 응답이 멈췄다(리뷰 #45). 취소하면 cancelled."""
+
+    finished_ok = Signal(object)   # PipelineResult
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, case: CaseRecord, parent=None):
+        super().__init__(parent)
+        self._case = case
+        self._cancel_event = threading.Event()
+
+    @property
+    def case(self) -> CaseRecord:
+        return self._case
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            result = reopen_case(self._case, cancel_event=self._cancel_event)
+        except _CANCEL_EXCEPTIONS:
+            self.cancelled.emit()
+            return
+        except Exception as exc:  # noqa: BLE001 - 손상된 CSV·DB 등. 화면에 알린다(리뷰 #68)
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.finished_ok.emit(result)
+
+
 class TaskWorker(QThread):
     """오래 걸리는 함수 하나를 화면 밖에서 돌린다. fn(cancel_event, progress) 형태로 부르고,
-    진행 문구는 status, 결과는 finished_task로 낸다(연속 영상 검사 등)."""
+    진행 문구는 status, 결과는 finished_task로 낸다(연속 영상 검사·손상 검사 등). 취소로 끝나면
+    (CancelledError·InterruptedError) failed 대신 cancelled를 낸다 - 예전엔 손상 검사를 취소하면
+    'InterruptedError: cancelled' 오류 창이 떴다(리뷰 #100)."""
 
     status = Signal(str)
     finished_task = Signal(object)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, fn, parent=None):
         super().__init__(parent)
@@ -134,6 +172,9 @@ class TaskWorker(QThread):
     def run(self) -> None:
         try:
             result = self._fn(self._cancel, self.status.emit)
+        except _CANCEL_EXCEPTIONS:
+            self.cancelled.emit()
+            return
         except Exception as exc:  # noqa: BLE001 - 어떤 예외든 화면에 알린다
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return

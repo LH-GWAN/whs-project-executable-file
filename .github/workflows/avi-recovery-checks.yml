@@ -77,6 +77,11 @@ jobs:
           python -m compileall -q app.py core engine ui storage report tests
           python -m core.avi_recovery --help
           python -m core.mp4_recovery --help
+      # build_windows.bat cannot run on Linux, and on Windows it would start a real build. The
+      # checker in tests/test_review11_build_storage.py parses the ( ... ) blocks instead: an
+      # unquoted ")" inside a block ends it and broke every build (review #25).
+      - name: Check .bat block syntax
+        run: python -m pytest -q tests/test_review11_build_storage.py -k "bat_scripts"
       - name: Full pytest including real AVI/MP4 decode and Qt cases
         timeout-minutes: 5
         run: python -m pytest -vv -ra -o faulthandler_timeout=60 tests --junitxml=test-results.xml

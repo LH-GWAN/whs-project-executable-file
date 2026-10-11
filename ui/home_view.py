@@ -59,6 +59,7 @@ class HomeView(QWidget):
         # 전방/후방 같이 보기: 켜 두면 전방 파일을 고른 뒤 후방 파일을 하나 더 고른다.
         # 같은 폴더에 _F/_R 짝이 있으면 그 파일을 기본값으로 띄운다.
         self._dual_cb = QCheckBox("전방/후방 영상 같이 보기 (후방 영상 파일을 하나 더 고릅니다)")
+        self._pending_pair_check: dict = {}   # 손상 때문에 대조 없이 받은 후방의 기록(리뷰 #131)
         self._dual_cb.setToolTip(
             "전방 영상을 고른 뒤 후방 영상을 고르는 창이 한 번 더 뜹니다. 같은 폴더에\n"
             "…_F / …_R 처럼 짝이 되는 파일이 있으면 자동으로 골라 둡니다.\n"
@@ -209,9 +210,46 @@ class HomeView(QWidget):
                 return ""  # 대조를 취소하면 전방만 분석
             if check.ok:
                 return rear
+            if check.code == "damaged":
+                # 한쪽이 손상돼 GPS 대조를 못 했다. 확인 없이 통과시키지 않고, 받으면 사건 설정에 남긴다(리뷰 #131).
+                if self._confirm_unchecked_rear(front_path, rear, check):
+                    self._pending_pair_check = {
+                        "status": "damaged",
+                        "note": "손상된 영상이라 전·후방 대조를 하지 못함",
+                        "damaged_files": {k: list(v) for k, v in (check.damaged_files or {}).items()},
+                    }
+                    return rear
+                if not self._ask_repick_rear(front_path, rear, check.problems, check.notes):
+                    return ""
+                suggested = rear
+                continue
             if not self._ask_repick_rear(front_path, rear, check.problems, check.notes):
                 return ""
             suggested = rear
+
+    def take_pair_check(self) -> dict:
+        """마지막 _pick_rear가 '대조 불가(손상)'로 받은 후방의 기록. 한 번 가져가면 비운다(사건 설정에 넣는다)."""
+        record, self._pending_pair_check = self._pending_pair_check, {}
+        return record
+
+    def _confirm_unchecked_rear(self, front_path: str, rear_path: str, check: PairCheck) -> bool:
+        """손상 때문에 대조를 못 한 후방을 대조 없이 받을지 확인한다. 예면 True."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("전·후방 대조 불가 (손상)")
+        box.setText("손상된 영상이라 전·후방 대조를 할 수 없습니다. 대조 없이 후방으로 받겠습니까?\n"
+                    "(손상 검사·복구는 다음 단계에서)")
+        detail = [f"전방: {os.path.basename(front_path)}", f"후방: {os.path.basename(rear_path)}", ""]
+        for label, lines in (check.damaged_files or {}).items():
+            detail.append(f"• {label} 손상: " + " / ".join(lines))
+        detail += [f"• {p}" for p in check.problems]
+        detail += ["", "받으면 사건 설정에 '대조 불가(손상)'로 남고, 두 영상이 같은 녹화인지는 확인되지 않은 상태입니다."]
+        box.setInformativeText("\n".join(detail))
+        accept = box.addButton("대조 없이 후방으로 받기", QMessageBox.AcceptRole)
+        box.addButton("받지 않음", QMessageBox.RejectRole)
+        box.setDefaultButton(box.buttons()[-1])
+        box.exec()
+        return box.clickedButton() is accept
 
     def _run_pair_check(self, front_path: str, rear_path: str) -> Optional[PairCheck]:
         """전방/후방 대조를 워커에서 돌리고 진행 창을 띄운다. 사용자가 취소하면 None."""
@@ -444,7 +482,15 @@ class HomeView(QWidget):
                         QMessageBox.critical(self, f"{missing} 영상 대조", error)
                     continue
                 front, rear = (probe, have) if missing == "전방" else (have, probe)
-                check = check_pair_probes(front, rear)
+                # 같은 크기 파일은 전체 해시를 비교하므로 워커에서 돌린다(리뷰 #49).
+                check, error = self._run_task(
+                    f"{missing} 영상 대조", f"{os.path.basename(path)} 대조 중...",
+                    lambda cancel, _progress, f=front, r=rear: check_pair_probes(f, r, cancel_event=cancel))
+                if error:
+                    QMessageBox.critical(self, f"{missing} 영상 대조", error)
+                    continue
+                if check is None or check.cancelled:
+                    continue   # 취소: 다시 고르기로
                 if check.ok:
                     if missing == "전방":
                         slot.front = probe

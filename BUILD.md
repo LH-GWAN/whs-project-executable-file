@@ -48,11 +48,24 @@ one-file(단일 exe) 대신 one-dir(폴더)로 만든 이유는 `idas.spec` 상�
 
 ### 재빌드해도 남는 것 (2026-10-09)
 
-`build_windows.bat`은 `dist\`를 지우기 전에 `dist\IDAS\_internal\assets\`(빌드 뒤에 넣은 키 파일·배경지도)를
-`build_keep_assets\`에 복사했다가 빌드가 끝나면 되돌린다. 또 `assets\*.zip`으로 받은 배경지도는 빌드 전에
-풀어서(`core.basemap.extract_zipped_basemap`) `.pmtiles`가 번들되게 한다. 가상환경은 `activate.bat` 대신
-`.venv\Scripts\python.exe`를 직접 불러 폴더를 옮겨도 시스템 Python으로 빌드되지 않는다. 두 스크립트는
-UNC 경로(`\\server\share`)에서는 중단하고, `idas.spec`이 없는 폴더에서는 아무것도 지우지 않는다.
+`build_windows.bat`은 `dist\`를 지우기 전에 `dist\IDAS\_internal\assets\`에 빌드 뒤에 넣은 키 파일·배경지도를
+`build_keep_assets\`에 복사했다가 빌드가 끝나면 되돌린다. 보관하는 것은 **`assets\`에 없는 파일만**이다 -
+`assets\`에 있는 파일은 `idas.spec`이 새로 번들하므로, 키를 교체했는데 옛 사본이 그 위에 복원되는 일이
+없다(2026-10-11, 리뷰 #59). 빌드가 실패해 `build_keep_assets\`가 남으면 다음 빌드가 지우지 않고 그대로
+복원하며, 새 번들에 같은 이름이 이미 있으면 보관본은 덮어쓰지 않고 `build_keep_assets\`에 남겨 둔다
+(필요하면 직접 옮긴다). 이 폴더는 키가 들어 있을 수 있어 `.gitignore`에 올라 있다.
+또 `assets\*.zip`으로 받은 배경지도는 빌드 전에 풀어서(`core.basemap.extract_zipped_basemap`) `.pmtiles`가
+번들되게 한다. 가상환경은 `activate.bat` 대신 `.venv\Scripts\python.exe`를 직접 불러 폴더를 옮겨도 시스템
+Python으로 빌드되지 않는다. 두 스크립트는 `idas.spec`이 없는 폴더에서는 아무것도 지우지 않는다.
+
+**네트워크 경로(UNC, `\\server\share\...`)에서는 두 스크립트 모두 시작하지 않는다.** `pushd`가 UNC 경로를
+임시 드라이브 문자로 매핑해 빌드 자체는 진행되지만, 그러면 `.venv`와 `IDAS.lnk`가 재부팅 뒤 사라지는 드라이브를
+가리키게 된다(리뷰 #98). 프로젝트를 로컬 드라이브(C:\, D:\ 등)에 복사한 뒤 실행한다.
+
+cmd의 `( ... )` 블록 안에서는 따옴표 밖의 `)`가 블록을 닫아 버려 `echo` 문구의 괄호 하나로 빌드가 매번 구문
+오류로 멈췄다(리뷰 #25). 블록 안의 경로는 따옴표로 감싸고 문구에 괄호를 쓰지 않는다. CI와
+`tests/test_review11_build_storage.py`가 두 `.bat`의 블록을 검사하므로, 고친 뒤 `pytest tests/test_review11_build_storage.py -k bat_scripts`로
+확인한다(macOS/Linux에서는 `.bat`을 실행할 수 없어 이 검사가 유일한 확인 수단이다).
 
 ### clean 해도 남는 것
 

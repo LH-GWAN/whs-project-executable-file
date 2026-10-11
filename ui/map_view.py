@@ -5,7 +5,7 @@ import math
 import time
 from typing import List, Optional
 
-from PySide6.QtCore import QBuffer, QIODevice, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QBuffer, QEventLoop, QIODevice, Qt, QTimer, QUrl, Signal
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QVBoxLayout, QWidget
@@ -95,18 +95,35 @@ def _segment_ends(points: List[TrackPoint]) -> List[List[float]]:
     return [last[k] for k in sorted(last)] if len(last) > 1 else []
 
 
-DAMAGED_COLOR = "#e03131"
+# 손상 구간 선 색. 급가속(#e03131)과 같은 빨강이어서 범례에 같은 빨간 선이 두 줄 나왔다(리뷰 #55).
+# 지도 페이지(map.html / map_kakao.html)의 선 색과 같아야 한다.
+DAMAGED_COLOR = "#212529"
 INTERPOLATED_COLOR = "#9c36b5"
+_SYNTHETIC_STATES = ("damaged", "interpolated")
+
+
+def is_synthetic_point(p: TrackPoint) -> bool:
+    """손상 처리로 만든 합성 행인가 - 'damaged'(빈 행)·'interpolated'(추정 좌표). 실측이 아니므로 화면에서
+    '(손상 구간)'·'(추정)'으로 구분하고, 추정 좌표로는 주소 조회·외부 지도 링크를 하지 않는다(리뷰 #21).
+    'gap_carved'는 손상 구간에서 회수한 실측이라 합성이 아니다. TrackPoint.is_synthetic이 있으면 그 값을 쓴다."""
+    flag = getattr(p, "is_synthetic", None)
+    if isinstance(flag, bool):
+        return flag
+    try:
+        from core.acceleration import is_synthetic   # D2와 같은 판별
+        return is_synthetic(p)
+    except (ImportError, AttributeError):
+        return getattr(p, "recovery_state", "") in _SYNTHETIC_STATES
 
 
 def _damage_legend(points: List[TrackPoint]) -> List[List[str]]:
-    """손상 파일에서만 범례에 올린다."""
+    """손상 파일에서만 범례에 올린다. [이름, 색, 선 모양] - 지도 위 선과 같은 점선으로 그린다(리뷰 #55)."""
     states = {p.recovery_state for p in points}
     out = []
     if "interpolated" in states:
-        out.append(["임의 복구 구간(추정 좌표)", INTERPOLATED_COLOR])
+        out.append(["임의 복구 구간(추정 좌표)", INTERPOLATED_COLOR, "dotted"])
     if "damaged" in states:
-        out.append(["손상 구간(복구 안 함)", DAMAGED_COLOR])
+        out.append(["손상 구간(복구 안 함)", DAMAGED_COLOR, "dashed"])
     return out
 
 
@@ -206,17 +223,20 @@ class MapView(QWidget):
         return self._view.url().path().endswith("/" + ONLINE_PAGE)
 
     def _on_load_finished(self, ok: bool) -> None:
-        self._loaded = bool(ok)
         if not ok:
+            # acceptNavigationRequest가 막은 이동도 loadFinished(False)로 온다. 그때는 우리 페이지가 그대로
+            # 떠 있으므로 _loaded를 지우지 않는다 - 지우면 재생 위치가 지도에 전달되지 않았다(리뷰 #130).
+            # 우리 페이지 자체를 못 불러온 경우는 _load_page가 이미 False로 둔 상태다.
+            if self._view.url().toString().split("?", 1)[0] != self._page.allowed_url:
+                self._loaded = False
             return
+        self._loaded = True
         # 지금 허용된 페이지가 아니면(기록·드롭 등으로 다른 페이지가 열렸으면) 궤적을 주지 않고 되돌린다.
         if self._view.url().toString().split("?", 1)[0] != self._page.allowed_url:
             self._loaded = False
             QTimer.singleShot(0, self._load_page)
             return
         self._view.history().clear()   # 뒤로 가기로 이전(온라인) 페이지가 다시 열리지 않게
-        if time.monotonic() - self._last_crash_at > _RELOAD_RESET_SEC:
-            self._reload_attempts = 0   # 로드 성공만으로 되돌리면 궤적이 렌더러를 죽일 때 무한 반복했다(리뷰 #81)
         pending = self._pending_js
         self._pending_js = []
         if pending:
@@ -253,7 +273,13 @@ class MapView(QWidget):
 
     def _on_render_process_gone(self, status, exit_code: int) -> None:
         self._loaded = False
-        self._last_crash_at = time.monotonic()
+        now = time.monotonic()
+        # 지난 크래시 뒤 이만큼 조용했으면 새 사고로 보고 횟수를 되돌린다. 로드 성공 시점에 되돌리면
+        # 크래시→재로드가 늘 60초 안이라 영영 되돌아가지 않았고(리뷰 #109), 로드 성공만으로 되돌리면
+        # 궤적이 렌더러를 죽일 때 무한 반복했다(리뷰 #81). 크래시 시점끼리 비교하면 둘 다 피한다.
+        if now - self._last_crash_at > _RELOAD_RESET_SEC:
+            self._reload_attempts = 0
+        self._last_crash_at = now
         if self._reload_attempts >= self.MAX_RELOAD_ATTEMPTS:
             # 같은 궤적에서 계속 죽으면 그 궤적은 다시 넣지 않는다(리뷰 #81).
             self._last_track_js = None
@@ -355,13 +381,36 @@ class MapView(QWidget):
         if self._baseline_png is None and track_id == self._baseline_track_id:
             self._baseline_poll.start()  # 못 찍었으면 다시 기다린다
 
+    def _eval_js(self, script: str, timeout_ms: int = 1500):
+        """페이지 안의 식을 동기로 평가한다(응답이 없으면 None). 캡처처럼 결과를 바로 써야 하는 곳에서만 쓴다."""
+        if not self._loaded:
+            return None
+        loop = QEventLoop()
+        result = {"value": None, "done": False}
+
+        def on_value(value) -> None:
+            result["value"] = value
+            result["done"] = True
+            loop.quit()
+
+        self._view.page().runJavaScript(script, 0, on_value)
+        QTimer.singleShot(timeout_ms, loop.quit)
+        loop.exec()
+        return result["value"] if result["done"] else None
+
+    def is_map_ready(self) -> bool:
+        """페이지가 떠 있고 지도 라이브러리까지 준비돼 궤적이 그려진 상태인가. 온라인 지도는 SDK가 실패하면
+        페이지만 뜨고 궤적을 그리지 않으므로 페이지 로드 여부만으로는 모른다(리뷰 #56)."""
+        return self._eval_js("(window.__mapReady && window.__trackDrawn) ? 'yes' : 'no'") == "yes"
+
     def grab_png(self) -> Optional[bytes]:
         """현재 지도 화면을 PNG로 캡처한다. 리포트에 넣기 위한 것.
 
         지도가 아직 안 떴거나 그려지지 않았으면 None을 돌려준다 - 빈 이미지를
-        리포트에 넣는 것보다 아예 넣지 않는 편이 낫다.
+        리포트에 넣는 것보다 아예 넣지 않는 편이 낫다. 온라인 지도가 실패해 회색 화면만 있는 경우도
+        같다 - 예전엔 페이지 로드만 보고 빈 지도를 '전체 경로'로 리포트에 실었다(리뷰 #56).
         """
-        if not self._loaded:
+        if not self._loaded or not self.is_map_ready():
             return None
         pixmap = self._view.grab()
         if pixmap.isNull() or pixmap.width() < 2 or pixmap.height() < 2:

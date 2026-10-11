@@ -19,12 +19,12 @@ from core import geocode
 from core.driving_events import DrivingEvent, events_by_row
 from core.geocode import external_map_url
 from core.location_table import (COL_CHECK, COL_EVENT, COL_G, COL_LAT, COL_LINK, COL_LON,
-                                 COL_SPEED, COLUMNS, SEGMENT_HEADER, gps_slot_rows, has_frame_detail,
-                                 row_texts)
+                                 COL_SPEED, COLUMNS, IMPACT_G, SEGMENT_HEADER, gps_slot_rows,
+                                 has_frame_detail, row_texts)
 from engine.engine_adapter import TrackPoint
 from ui.address_resolver import AddressResolver
 from ui.dataset_view import COMPOSED_LABEL, DatasetView, fill_view_bar, make_view_bar
-from ui.map_view import MapView
+from ui.map_view import MapView, is_synthetic_point
 
 _EVENT_ROW_ALPHA = 60   # 위험운전 행 배경(종류별 색을 옅게)
 _OUTLIER_COLOR = QColor(200, 110, 0)
@@ -35,7 +35,7 @@ _MAP_LINK_COLUMN = COL_LINK
 _SEGMENT_COLUMN = len(COLUMNS)
 _DROPOUT_COLOR = QColor(190, 110, 40)
 _IMPACT_COLOR = QColor(200, 60, 60)
-_IMPACT_G = 2.0
+_IMPACT_G = IMPACT_G   # 충격 행 기준은 표·리포트와 같은 값(리뷰 #113)
 
 
 class LocationTab(QWidget):
@@ -112,8 +112,8 @@ class LocationTab(QWidget):
         if column != _MAP_LINK_COLUMN or not (0 <= row < len(self._row_index)):
             return
         point = self._points[self._row_index[row]]
-        if not point.has_fix:
-            return
+        if not point.has_fix or is_synthetic_point(point):
+            return   # 추정 좌표는 측정값이 아니라 외부 지도로 열지 않는다(리뷰 #21)
         QDesktopServices.openUrl(QUrl(external_map_url(point.latitude, point.longitude)))
 
     def grab_map_png(self):
@@ -134,12 +134,27 @@ class LocationTab(QWidget):
                 self._map.set_playback_time(point.start_time_sec)
             self._show_selected(index, point)
 
+    def _row_number(self, index: int) -> int:
+        """표 세로 머리글·선택 줄의 번호. 영상별 묶음도 리포트 '#'와 같은 전체 번호(리뷰 #119, #129)."""
+        offset = self._views[self.current_view()].row_offset if self._views else 0
+        return offset + index + 1
+
     def _show_selected(self, index: int, point: TrackPoint) -> None:
-        if not point.has_fix:
-            self._selected_label.setText(f"#{index + 1}: 좌표 없음")
+        number = self._row_number(index)
+        if point.recovery_state == "damaged":
+            self._selected_label.setText(f"#{number}: 좌표 없음 (손상 구간)")
             self._selected_key = None
             return
-        base = f"#{index + 1}: {point.latitude:.6f}, {point.longitude:.6f}"
+        if not point.has_fix:
+            self._selected_label.setText(f"#{number}: 좌표 없음")
+            self._selected_key = None
+            return
+        if is_synthetic_point(point):
+            # 임의 복구의 추정 좌표: 측정값이 아니므로 표시만 하고 주소 조회(외부 전송)는 하지 않는다(리뷰 #21).
+            self._selected_label.setText(f"#{number}: {point.latitude:.6f}, {point.longitude:.6f} (추정 - 임의 복구, 측정값 아님)")
+            self._selected_key = None
+            return
+        base = f"#{number}: {point.latitude:.6f}, {point.longitude:.6f}"
         if not geocode.is_available():
             self._selected_label.setText(base)
             self._selected_key = None
@@ -206,8 +221,8 @@ class LocationTab(QWidget):
             rec = records[index]
             here = row_events[index]
             texts = row_texts(rec, here)
-            # 1초 보기에서도 세로 머리글은 리포트 '#'와 같은 전체 지점 번호(리뷰 #129).
-            self._table.setVerticalHeaderItem(row, QTableWidgetItem(str(index + 1)))
+            # 1초 보기·영상별 묶음에서도 세로 머리글은 리포트 '#'와 같은 전체 지점 번호(리뷰 #129, #119).
+            self._table.setVerticalHeaderItem(row, QTableWidgetItem(str(view.row_offset + index + 1)))
             items = [QTableWidgetItem(t) for t in texts]
             lat_item, lon_item = items[COL_LAT], items[COL_LON]
             if rec.is_outlier:
@@ -234,9 +249,11 @@ class LocationTab(QWidget):
                 items[COL_G].setForeground(_IMPACT_COLOR)
             # 위경도만 보면 어디인지 바로 알기 어려워서, 외부 지도로 바로 열 수 있는
             # 칸을 둔다. 클릭하면 기본 브라우저에서 해당 좌표가 열린다.
-            if rec.has_fix:
+            if rec.has_fix and not is_synthetic_point(rec):
                 items[COL_LINK].setForeground(_LINK_COLOR)
                 items[COL_LINK].setToolTip("클릭하면 브라우저에서 이 좌표를 엽니다")
+            elif rec.has_fix:
+                items[COL_LINK].setToolTip("추정 좌표(임의 복구)는 측정값이 아니라 외부 지도로 열지 않습니다")
             items[COL_CHECK].setToolTip("실패 레코드는 지도·속도 통계·위험운전 판정에서 제외합니다. 원본 CSV는 보존합니다.")
             if here:
                 font = items[COL_EVENT].font()

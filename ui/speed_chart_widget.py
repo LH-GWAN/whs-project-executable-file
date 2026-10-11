@@ -8,7 +8,8 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
 from core import gpstime
-from core.acceleration import MAX_GAP_SEC, _distinct_fix_indices, compute_point_accelerations
+from core.acceleration import (EVENT_MAX_WINDOW_SEC, MAX_GAP_SEC, _distinct_fix_indices,
+                               compute_point_rate_windows, is_synthetic)
 from core.driving_events import EVENT_PRIORITY, DrivingEvent
 _PRIORITY = {k: n for n, k in enumerate(EVENT_PRIORITY)}
 from engine.engine_adapter import TrackPoint
@@ -85,7 +86,7 @@ class SpeedChartWidget(QWidget):
         self._events = events
         self._boundaries = list(boundaries or [])
         self._time_label = time_label
-        self._accels = compute_point_accelerations(records)
+        self._accels = compute_point_rate_windows(records)   # 행마다 (m/s², 창 초) 또는 None
         self._hover = None
         self._screen_pts = []
         self.update()
@@ -108,9 +109,16 @@ class SpeedChartWidget(QWidget):
         if clock:
             lines.append(f"GPS 시각 {clock}")
         lines.append(f"속도 {r.speed_kmh:.1f} km/h" if r.speed_kmh is not None else "속도 -")
-        accel = self._accels[index] if index < len(self._accels) else None
-        lines.append(f"가속도 {accel:+.2f} m/s² (초당 {accel * 3.6:+.1f} km/h)" if accel is not None
-                     else "가속도 - (1초 앞 측정 없음)")
+        window = self._accels[index] if index < len(self._accels) else None
+        if window is None:
+            lines.append("가속도 - (1초 앞 측정 없음)")
+        else:
+            accel, dt = window
+            if dt > EVENT_MAX_WINDOW_SEC:
+                # 긴 간격의 평균은 '초당' 값이 아니고 판정에도 쓰지 않는다(리뷰 #52).
+                lines.append(f"가속도 {accel:+.2f} m/s² ({dt:.1f}초 간격 평균, 판정 제외)")
+            else:
+                lines.append(f"가속도 {accel:+.2f} m/s² (초당 {accel * 3.6:+.1f} km/h)")
         if r.latitude is not None and r.longitude is not None:
             lines.append(f"위치 {r.latitude:.6f}, {r.longitude:.6f}")
         for ev in self._events:
@@ -359,8 +367,8 @@ class SpeedChartWidget(QWidget):
                 prev_t = self._records[prev_index].start_time_sec
                 broken = (self._records[index].segment_index != self._records[prev_index].segment_index
                           or (prev_t is not None and t - prev_t > MAX_GAP_SEC)   # 측정 공백은 잇지 않는다(리뷰 #91)
-                          or any(self._records[j].is_dropout or self._records[j].recovery_state
-                                 for j in range(prev_index + 1, index)))   # 손상 구간도 잇지 않는다
+                          or any(self._records[j].is_dropout or is_synthetic(self._records[j])
+                                 for j in range(prev_index + 1, index)))   # 합성 행(손상 구간)도 잇지 않는다 - gap_carved 실측 사이는 잇는다(리뷰 #4)
                 if broken and qpts:
                     runs.append((indices, qpts))
                     indices, qpts = [], []

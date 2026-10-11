@@ -17,6 +17,9 @@ assets/*.zip
 
 # 빌드 후 생성되는 실행 바로가기
 IDAS.lnk
+# build_windows.bat가 재빌드 동안 dist\IDAS\_internal\assets\의 키·지도를 잠시 옮겨 두는 폴더.
+# 빌드가 실패하면 남는데, 키가 들어 있으니 커밋되면 안 된다(리뷰 #59).
+/build_keep_assets/
 
 # 온라인 지도(카카오맵) API 키 - 저장소가 공개라 절대 커밋하지 않는다.
 # 빌드하는 PC의 assets/에만 두면 idas.spec이 번들에 넣는다. 앱은 assets/ 안의 .json/.txt 를

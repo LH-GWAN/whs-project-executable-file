@@ -11,12 +11,21 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Tuple
 
+from core.acceleration import RATE_WINDOW_SEC, RATE_WINDOW_TOLERANCE_SEC, is_synthetic
 from engine.engine_adapter import TrackPoint
 
 MAX_SPEED_KMH = 300.0        # 이 위는 차량 속도로 볼 수 없다
 MAX_JUMP_MPS = 100.0         # 두 측정 사이 이동 속도가 360 km/h를 넘으면 위치가 튄 것
 MIN_JUMP_M = 150.0           # 아주 짧은 dt로 나눠 커진 값이 아니라 실제로 멀리 튄 경우만
 MAX_SPEED_JUMP_KMH_S = 60.0  # 1초에 이만큼 넘게 속도가 튀었다가 되돌아오면 측정 오류(리뷰 #48)
+# 차량이 낼 수 없는 속도 변화율(km/h/s). 1 g = 35.3 km/h/s - 마른 노면에서 ABS 제동이 약 1.0 g, 양산차 가속은
+# 그 아래이고, 판정 기준표의 최대값은 초당 15 km/h다(core/driving_events.CRITERIA). 40은 1.13 g(11.1 m/s²)로
+# 그 위는 측정 오류거나 충돌 같은 외력이다. 되돌아오는 튐은 이상치로, 가속 쪽 상한 초과는 '검증 필요'로
+# 분리해 가짜 급가속·급출발이 되지 않게 한다. 감속 쪽은 되돌아오지 않으면(충돌 뒤 정지) 그대로 둔다 -
+# 측정 오류라는 근거가 없고 증거로 봐야 한다(리뷰 2026-10-11 #76).
+MAX_PHYSICAL_RATE_KMH_S = 40.0
+# 상한을 넘은 뒤 이 시간 안에 앞 속도와 맞는 값으로 돌아오면 그 사이는 튄 것이다(측정 공백 상한과 같다).
+RETURN_WINDOW_SEC = 5.0
 _EARTH_R = 6371000.0
 
 
@@ -41,10 +50,10 @@ def _coords_valid(p: TrackPoint) -> bool:
 
 
 def _fix_key(p: TrackPoint):
-    utc = (p.gps_utc_time or "").strip()
-    if utc:
-        return ("utc", p.gps_date or "", utc, p.latitude, p.longitude)
-    return ("val", p.latitude, p.longitude, p.speed_kmh)
+    """같은 측정이 반복 기록된 행을 묶는 열쇠. TrackPoint.record_key()(UTC > 기기 절대 시각·경과 초 > 값)에
+    좌표를 붙인다. 값으로만 묶으면 UTC 없는 기기(FineVu)의 정차 구간 전체가 한 묶음이 되어 dt가 정차
+    길이만큼 부풀고 정차 중 튄 점을 못 잡는다(리뷰 #7, 2026-10-11 #22)."""
+    return p.record_key() + (p.latitude, p.longitude)
 
 
 class _Group:
@@ -88,13 +97,81 @@ def _mark(points: List[TrackPoint], indices: List[int], reason: str) -> None:
         points[i].outlier_reason = reason
 
 
+# 속도 변화율은 1초 창으로 잰다(core/acceleration과 같은 창). 기기 시각이 1초 단위라 같은 초 안에서 값이 바뀐 행
+# (FineVu는 시각이 먼저 바뀌고 다음 행에서 값이 바뀐다)을 0.06초 간격으로 나누면 4 km/h 차이도 초당 70이 된다.
+_MIN_WINDOW_SEC = RATE_WINDOW_SEC - RATE_WINDOW_TOLERANCE_SEC
+
+
+def _ref_before(groups: List[_Group], gi: int) -> Optional[int]:
+    """gi보다 1초 창 이상 앞선 가장 가까운 묶음 번호."""
+    j = gi - 1
+    while j >= 0 and groups[gi].t - groups[j].t < _MIN_WINDOW_SEC:
+        j -= 1
+    return j if j >= 0 else None
+
+
+def _ref_after(groups: List[_Group], gi: int) -> Optional[int]:
+    j = gi + 1
+    while j < len(groups) and groups[j].t - groups[gi].t < _MIN_WINDOW_SEC:
+        j += 1
+    return j if j < len(groups) else None
+
+
+def _rate_ok(v_from: float, t_from: float, v_to: float, t_to: float) -> bool:
+    dt = t_to - t_from
+    return dt > 0 and abs(v_to - v_from) / dt <= MAX_PHYSICAL_RATE_KMH_S
+
+
+def _mark_impossible_rates(points: List[TrackPoint]) -> None:
+    groups = [g for g in _groups(points)
+              if points[g.indices[0]].speed_kmh is not None and not points[g.indices[0]].is_outlier]
+    speed = lambda g: points[g.indices[0]].speed_kmh  # noqa: E731
+    trusted: List[_Group] = []   # 신뢰한 측정(시간순). 비교 상대는 이 중 1초 창 이상 앞선 마지막 것.
+    gi = 0
+    while gi < len(groups):
+        g = groups[gi]
+        last_ok = next((r for r in reversed(trusted) if g.t - r.t >= _MIN_WINDOW_SEC), None)
+        if last_ok is None or _rate_ok(speed(last_ok), last_ok.t, speed(g), g.t):
+            trusted.append(g)
+            gi += 1
+            continue
+        # 변화가 불가능하다. RETURN_WINDOW_SEC 안에서 직전 신뢰 측정 쪽으로 돌아오는 점(물리적으로 직전 측정과
+        # 이어지고, 튄 값보다 직전 값에 가까운 점)을 찾는다. 60→0→0처럼 떨어진 채 머물면 돌아온 것이 아니다.
+        v0 = speed(last_ok)
+        back = None
+        for hj in range(gi + 1, len(groups)):
+            h = groups[hj]
+            if h.t - last_ok.t > RETURN_WINDOW_SEC:
+                break
+            if (_rate_ok(v0, last_ok.t, speed(h), h.t)
+                    and abs(speed(h) - v0) < abs(speed(h) - speed(g))):
+                back = hj
+                break
+        if back is not None:
+            for m in range(gi, back):
+                _mark(points, groups[m].indices,
+                      f"속도 급변 ({v0:.0f}→{speed(groups[m]):.0f}→{speed(groups[back]):.0f} km/h, "
+                      f"초당 {MAX_PHYSICAL_RATE_KMH_S:.0f} km/h 상한 초과 - 검증 필요)")
+            trusted.append(groups[back])
+            gi = back + 1
+            continue
+        if speed(g) > v0:
+            _mark(points, g.indices,
+                  f"가속 상한 초과 ({v0:.0f}→{speed(g):.0f} km/h를 {g.t - last_ok.t:.0f}초 만에, "
+                  f"초당 {MAX_PHYSICAL_RATE_KMH_S:.0f} km/h 이상 - 검증 필요)")
+            gi += 1
+            continue   # 직전 신뢰 측정은 그대로 둔다 - 뒤 점들은 그것과 다시 비교한다
+        # 급히 떨어진 뒤 돌아오지 않는 감속(충돌 뒤 정지 등)은 측정 오류라는 근거가 없다. 그대로 둔다.
+        trusted.append(g)
+        gi += 1
+
+
 def mark_outliers(points: List[TrackPoint]) -> int:
     """이상치를 표시하고 개수를 돌려준다. 다시 부르면 이전 표시를 지우고 새로 판정한다."""
     # 손상 처리로 만든 행(빈 행·임의 복구 좌표)은 측정이 아니다 - 이상치 판정에서 뺀다.
-    synthetic = [p for p in points if p.recovery_state in ("damaged", "interpolated")]
-    if synthetic:
-        real = [p for p in points if p.recovery_state not in ("damaged", "interpolated")]
-        return mark_outliers(real)
+    # gap_carved(회수한 실측)는 판정에 넣는다(리뷰 2026-10-11 #4).
+    if any(is_synthetic(p) for p in points):
+        return mark_outliers([p for p in points if not is_synthetic(p)])
     for p in points:
         p.is_outlier = False
         p.outlier_reason = ""
@@ -112,7 +189,10 @@ def mark_outliers(points: List[TrackPoint]) -> int:
     #     가짜 급가속·급감속이 두 건 확정된다(리뷰 #48).
     speed_groups = [g for g in _groups(points) if points[g.indices[0]].speed_kmh is not None]
     for gi in range(1, len(speed_groups) - 1):
-        a, b, c = speed_groups[gi - 1], speed_groups[gi], speed_groups[gi + 1]
+        ai, ci = _ref_before(speed_groups, gi), _ref_after(speed_groups, gi)   # 1초 창 앞뒤 측정과 비교
+        if ai is None or ci is None:
+            continue
+        a, b, c = speed_groups[ai], speed_groups[gi], speed_groups[ci]
         va, vb, vc = (points[g.indices[0]].speed_kmh for g in (a, b, c))
         dt_ab, dt_bc = b.t - a.t, c.t - b.t
         if dt_ab <= 0 or dt_bc <= 0:
@@ -120,6 +200,10 @@ def mark_outliers(points: List[TrackPoint]) -> int:
         up, down = (vb - va) / dt_ab, (vb - vc) / dt_bc
         if abs(up) > MAX_SPEED_JUMP_KMH_S and abs(down) > MAX_SPEED_JUMP_KMH_S and up * down > 0:
             _mark(points, b.indices, f"속도 급변 ({va:.0f}→{vb:.0f}→{vc:.0f} km/h, 앞뒤와 맞지 않음)")
+
+    # 1c) 물리 상한: 직전 신뢰 측정과 비교해 차량이 낼 수 없는 변화율이면 측정으로 보지 않는다. 되돌아오면
+    #     (한 점이든 여러 점이든) 그 사이가 튄 것이고, 가속 쪽은 되돌아오지 않아도 '검증 필요'다(리뷰 #76).
+    _mark_impossible_rates(points)
 
     # 2) 위치가 튄 측정: 직전 정상 측정에서 불가능한 속도로 멀어졌다가(그리고 다음 측정이
     #    다시 원래 자리 근처면) 그 한 점만 이상치로 본다. 다음 측정도 멀리 있으면 실제로

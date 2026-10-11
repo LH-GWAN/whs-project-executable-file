@@ -12,9 +12,18 @@ REM ============================================================
 
 setlocal
 REM "cd /d" fails silently on a UNC path and the delete loop below would then run in
-REM C:\Windows (review #128). Stop unless we are really in the project folder.
-pushd "%~dp0" || (
-    echo [ERROR] Cannot change to the script folder: %~dp0
+REM C:\Windows (review #128); pushd would map a temporary drive instead (review #98).
+REM Refuse UNC paths and stop unless we are really in the project folder. Paths inside
+REM ( ... ) blocks are quoted because an unquoted ")" there ends the block (review #25).
+set "SCRIPT_DIR=%~dp0"
+if "%SCRIPT_DIR:~0,2%"=="\\" (
+    echo [ERROR] The project is on a network path: "%SCRIPT_DIR%"
+    echo         Copy the project to a local drive and run the script there.
+    pause
+    exit /b 1
+)
+pushd "%SCRIPT_DIR%" || (
+    echo [ERROR] Cannot change to the script folder: "%SCRIPT_DIR%"
     pause
     exit /b 1
 )
@@ -39,6 +48,7 @@ echo.
 echo   .venv\          virtual environment
 echo   dist\           build output (including IDAS.exe)
 echo   build\          PyInstaller work folder
+echo   build_keep_assets\  key/basemap copies left by a failed build
 echo   IDAS.lnk   shortcut
 echo   __pycache__\    python caches
 echo.
@@ -55,6 +65,7 @@ echo.
 if exist ".venv\"        rmdir /s /q ".venv"
 if exist "dist\"         rmdir /s /q "dist"
 if exist "build\"        rmdir /s /q "build"
+if exist "build_keep_assets\" rmdir /s /q "build_keep_assets"
 if exist "IDAS.lnk" del /q "IDAS.lnk"
 for /d /r %%d in (__pycache__) do @if exist "%%d" rmdir /s /q "%%d"
 
@@ -74,7 +85,8 @@ echo (Only the map choice is removed from settings.json; key overrides stay.)
 choice /c YN /d N /t 15 /m "Reset app settings (auto-no in 15s)"
 if not errorlevel 2 (
     REM Same as the app's own Reset: drop only map_mode. Deleting the whole file
-    REM also threw away re-issued key overrides (review #127).
+    REM also threw away re-issued key overrides - review #127. No ")" in REM lines
+    REM inside a block: cmd may still treat it as the end of the block.
     if exist "%LOCALAPPDATA%\IDAS\settings.json" (
         powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Join-Path $env:LOCALAPPDATA 'IDAS\settings.json'; try { $j = Get-Content -Raw -Encoding UTF8 $p | ConvertFrom-Json } catch { exit 0 }; if ($j -and $j.PSObject.Properties['map_mode']) { $j.PSObject.Properties.Remove('map_mode'); $j | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $p }"
     )

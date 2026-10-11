@@ -288,10 +288,12 @@ def check_chain(slots: List[SequenceSlot]) -> Tuple[List[SequenceSlot], str, Lis
     return ordered, basis, problems, notes
 
 
-def check_pair_probes(front: ClipProbe, rear: ClipProbe) -> PairCheck:
-    """이미 읽어 둔 두 영상으로 전·후방 대조(core/video_pairs와 같은 기준)."""
-    check = compare_pair(front.path, rear.path)
-    if check.problems and "같은 파일" in check.problems[0]:
+def check_pair_probes(front: ClipProbe, rear: ClipProbe,
+                      cancel_event: Optional[threading.Event] = None) -> PairCheck:
+    """이미 읽어 둔 두 영상으로 전·후방 대조(core/video_pairs와 같은 기준). 같은 크기 파일의 전체 해시 비교는
+    cancel_event로 중단할 수 있다(그러면 cancelled=True, 리뷰 #49)."""
+    check = compare_pair(front.path, rear.path, cancel_event=cancel_event)
+    if check.cancelled or (check.problems and "같은 파일" in check.problems[0]):
         return check
     compare_gps(check, front.points, rear.points)
     return check

@@ -95,13 +95,20 @@ class PairCheck:
     rear_signature: Dict[str, str] = field(default_factory=dict)
     # GPS 대조 결과 (compare_pair_full)
     gps_checked: bool = False
-    front_gps_start: Optional[_dt.datetime] = None
+    # 어떤 시각으로 대조했는지: "utc"(GPS UTC) / "filename"(파일명 시각+경과 초, FineVu) / "elapsed"(경과 초만)
+    gps_time_basis: str = ""
+    front_gps_start: Optional[_dt.datetime] = None   # utc·filename 기준일 때(filename이면 naive·현지 시각)
     rear_gps_start: Optional[_dt.datetime] = None
     gps_start_offset_sec: Optional[float] = None
     matched_count: int = 0
     median_distance_m: Optional[float] = None
     max_distance_m: Optional[float] = None
     cancelled: bool = False
+    # 대조를 못 한 이유 코드. "" 정상 / "damaged" 한쪽이 손상돼 GPS를 못 읽음(손상 검사 결과는
+    # damaged_files) / "engine_failed" 손상은 못 찾았는데 분석이 실패. UI는 "damaged"면 '대조 불가'를
+    # 확인받고 진행할 수 있다(리뷰 #131).
+    code: str = ""
+    damaged_files: Dict[str, List[str]] = field(default_factory=dict)   # "전방"/"후방" → 손상 요약 줄
     problems: List[str] = field(default_factory=list)   # 하나라도 있으면 후방으로 받지 않는다
     notes: List[str] = field(default_factory=list)      # 참고 문구
 
@@ -281,10 +288,50 @@ def _same_file(a: str, b: str) -> bool:
     return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
 
-def compare_pair(front_path: str, rear_path: str) -> PairCheck:
+# 같은 크기의 두 파일을 사본인지 가릴 때 먼저 읽는 표본: 앞·가운데·끝 각 1MB.
+_SAMPLE_BYTES = 1024 * 1024
+
+
+def _sample_digest(path: str) -> str:
+    """크기 + 앞·가운데·끝 1MB의 SHA-256. 전체 해시 전에 거르는 용도 - 사전 할당된 1GB 짝을 고르면 USB에서
+    2GB를 끝까지 읽는 동안 응답이 없었다(리뷰 #49). 표본이 다르면 사본이 아니다."""
+    import hashlib
+    size = os.path.getsize(path)
+    digest = hashlib.sha256(str(size).encode("ascii"))
+    with open(path, "rb") as f:
+        for offset in sorted({0, max(0, size // 2 - _SAMPLE_BYTES // 2), max(0, size - _SAMPLE_BYTES)}):
+            f.seek(offset)
+            digest.update(f.read(_SAMPLE_BYTES))
+    return digest.hexdigest()
+
+
+def _same_content(front_path: str, rear_path: str,
+                  cancel_event: Optional[threading.Event] = None) -> Optional[bool]:
+    """두 파일의 내용이 같은가. 취소되면 None. 크기가 다르거나 표본이 다르면 전체를 읽지 않는다."""
+    from core import hashing
+    if os.path.getsize(front_path) != os.path.getsize(rear_path):
+        return False
+    if _sample_digest(front_path) != _sample_digest(rear_path):
+        return False
+
+    def keep_going(_done: int, _total: int) -> bool:
+        return not (cancel_event is not None and cancel_event.is_set())
+
+    digests = []
+    for path in (front_path, rear_path):
+        digest = hashing.sha256_file(path, progress_cb=keep_going)
+        if not digest:
+            return None
+        digests.append(digest)
+    return digests[0] == digests[1]
+
+
+def compare_pair(front_path: str, rear_path: str,
+                 cancel_event: Optional[threading.Event] = None) -> PairCheck:
     """빠른 검사(파일만 읽음): 컨테이너 종류·기기 정보, 길이, 컨테이너 녹화 시각, 파일명 시각.
     허용치를 넘으면 problems에 적힌다. 파일명 짝·같은 폴더 여부는 참고 문구다(기기마다 규칙이
-    달라서). GPS 대조까지 하려면 compare_pair_full()."""
+    달라서). GPS 대조까지 하려면 compare_pair_full(). 같은 크기 파일의 사본 검사(전체 해시)는
+    cancel_event로 중단할 수 있고, 그러면 cancelled=True."""
     from core import duration as _duration
     from core.format_sniffer import CONTAINER_MP4, sniff
 
@@ -317,14 +364,17 @@ def compare_pair(front_path: str, rear_path: str) -> PairCheck:
     if check.problems:
         return check
     # 내용이 같은 사본(복사본·링크)을 후방으로 고르면 좌표 중앙값 0 m로 통과했다(리뷰 #35).
+    # 표본 해시로 먼저 거르고, 전체 해시는 취소할 수 있다(리뷰 #49).
     try:
-        if os.path.getsize(front_path) == os.path.getsize(rear_path):
-            from core import hashing
-            if hashing.sha256_file(front_path) == hashing.sha256_file(rear_path):
-                check.problems.append("후방으로 고른 파일이 전방과 내용(SHA-256)이 같습니다 - 같은 영상의 사본입니다.")
-                return check
+        same = _same_content(front_path, rear_path, cancel_event)
     except OSError:
-        pass
+        same = False
+    if same is None:
+        check.cancelled = True
+        return check
+    if same:
+        check.problems.append("후방으로 고른 파일이 전방과 내용(SHA-256)이 같습니다 - 같은 영상의 사본입니다.")
+        return check
 
     fs, rs = check.front_signature, check.rear_signature
     if fs.get("container") and rs.get("container") and fs["container"] != rs["container"]:
@@ -369,33 +419,82 @@ def compare_pair(front_path: str, rear_path: str) -> PairCheck:
 
 
 # ---------- GPS 대조 (엔진을 두 파일에 돌린다) ----------
-def _gps_records(points) -> List[Tuple[_dt.datetime, Optional[float], Optional[float]]]:
-    """(UTC 시각, 위도, 경도) - GPS 기록이 있는 행만, 같은 시각은 첫 행만. 좌표 없는 행(끊김)은
-    좌표가 None."""
+BASIS_UTC = "utc"             # GPS UTC 시각(tz-aware datetime)
+BASIS_FILENAME = "filename"   # 파일명 시각 + 경과 초(기기가 만든 현지 시각, naive datetime) - FineVu
+BASIS_ELAPSED = "elapsed"     # 레코드 경과 초(float) - 파일명을 바꾼 사본처럼 절대 시각이 없을 때
+_BASIS_LABEL = {BASIS_UTC: "GPS UTC", BASIS_FILENAME: "파일명 시각", BASIS_ELAPSED: "경과 초"}
+
+
+def _record_keys(p) -> List[Tuple[str, object]]:
+    """한 행이 줄 수 있는 (기준, 키) 전부. UTC가 있으면 UTC, 기기가 준 절대 시각(파일명 기준)이 있으면
+    그것도, 경과 초가 있으면 그것도 - 전·후방 중 한쪽만 이름을 바꾼 사본이어도 공통 기준으로 대조하려고."""
     from core import gpstime
-    out = []
-    seen = set()
+    keys: List[Tuple[str, object]] = []
+    d, t = gpstime.parse_date(p.gps_date), gpstime.parse_time(p.gps_utc_time)
+    if d is not None and t is not None:
+        keys.append((BASIS_UTC, _dt.datetime.combine(d, t, tzinfo=_dt.timezone.utc)))
+    try:
+        keys.append((BASIS_FILENAME, _dt.datetime.strptime((p.gps_abs_time or "").strip(), "%Y-%m-%d %H:%M:%S")))
+    except ValueError:
+        pass
+    if p.gps_elapsed is not None:
+        try:
+            keys.append((BASIS_ELAPSED, float(int(round(float(p.gps_elapsed))))))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return keys
+
+
+_BASIS_ORDER = (BASIS_UTC, BASIS_FILENAME, BASIS_ELAPSED)
+
+
+def _gps_records_by_basis(points) -> Dict[str, List[Tuple[object, Optional[float], Optional[float]]]]:
+    """기준별 (시각 키, 위도, 경도) 목록 - GPS 기록이 있는 행만, 같은 시각은 첫 행만. 좌표 없는 행(끊김)은
+    좌표가 None. UTC가 없는 기기(FineVu)는 파일명 시각+경과 초로 대조했는데, 이름을 바꾼 사본은 절대 시각이
+    없어 '기록 없음'으로 막혔다(리뷰 #106) - 경과 초 기준도 함께 만들어 둔다."""
+    by_basis: Dict[str, List[Tuple[object, Optional[float], Optional[float]]]] = {}
+    seen: Dict[str, set] = {}
     for p in points:
         if not p.has_gps_record or p.start_time_sec is None:
             continue
-        d, t = gpstime.parse_date(p.gps_date), gpstime.parse_time(p.gps_utc_time)
-        if d is not None and t is not None:
-            when = _dt.datetime.combine(d, t, tzinfo=_dt.timezone.utc)
-        else:
-            # UTC가 없는 기기(FineVu): 기기가 파일명 시각 + 경과 초로 만든 절대 시각으로 대조한다.
-            # 전·후방이 같은 기준이라 비교에는 충분하다(리뷰 #36).
-            try:
-                when = _dt.datetime.strptime((p.gps_abs_time or "").strip(), "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                continue
-            when = when.replace(tzinfo=_dt.timezone.utc)
-        if when in seen:
-            continue
-        seen.add(when)
         lat, lon = (p.latitude, p.longitude) if p.has_coords else (None, None)
-        out.append((when, lat, lon))
-    out.sort(key=lambda r: r[0])
-    return out
+        for basis, key in _record_keys(p):
+            if key in seen.setdefault(basis, set()):
+                continue
+            seen[basis].add(key)
+            by_basis.setdefault(basis, []).append((key, lat, lon))
+    for records in by_basis.values():
+        records.sort(key=lambda r: r[0])
+    return by_basis
+
+
+def gps_record_basis(points) -> str:
+    """이 영상의 GPS 기록을 어떤 시각으로 대조할 수 있는지(가장 좋은 BASIS_*). 기록이 없으면 ""."""
+    by_basis = _gps_records_by_basis(points)
+    return next((b for b in _BASIS_ORDER if by_basis.get(b)), "")
+
+
+def _gps_records(points) -> List[Tuple[object, Optional[float], Optional[float]]]:
+    """가장 좋은 기준의 (시각 키, 위도, 경도) 목록(하위 호환용)."""
+    by_basis = _gps_records_by_basis(points)
+    return by_basis.get(gps_record_basis(points), [])
+
+
+def _key_diff_sec(a, b) -> float:
+    if isinstance(a, _dt.datetime) and isinstance(b, _dt.datetime):
+        return (a - b).total_seconds()
+    return float(a) - float(b)
+
+
+def _fmt_start(basis: str, key) -> str:
+    """시작 시각 표시. 파일명 기준은 현지 시각이라 UTC→KST 변환을 하면 9시간 틀렸다(리뷰 #106) -
+    그대로 쓰고 '파일명 기준'이라고 밝힌다."""
+    if basis == BASIS_UTC:
+        from core import gpstime
+        return gpstime.format_display(key.strftime("%Y-%m-%d"), key.strftime("%H:%M:%S"))
+    if basis == BASIS_FILENAME:
+        return f"{key:%Y-%m-%d %H:%M:%S} (파일명 기준)"
+    return f"경과 {float(key):.0f}초"
 
 
 def compare_gps(check: PairCheck, front_points, rear_points) -> None:
@@ -404,22 +503,33 @@ def compare_gps(check: PairCheck, front_points, rear_points) -> None:
     from core.outliers import haversine_m
 
     check.gps_checked = True
-    front = _gps_records(front_points)
-    rear = _gps_records(rear_points)
-    if not rear:
+    front_all, rear_all = _gps_records_by_basis(front_points), _gps_records_by_basis(rear_points)
+    if not any(rear_all.values()):
         check.problems.append("후방으로 선택한 영상에 GPS 기록이 없어 전방과 대조할 근거가 없습니다.")
         return
-    if not front:
+    if not any(front_all.values()):
         check.problems.append("전방 영상에 GPS 기록이 없어 후방과 대조할 수 없습니다.")
         return
-    check.front_gps_start, check.rear_gps_start = front[0][0], rear[0][0]
-    offset = (rear[0][0] - front[0][0]).total_seconds()
+    # 두 영상이 함께 가진 가장 좋은 기준으로 대조한다(한쪽만 이름을 바꾼 사본이면 경과 초).
+    fb = next((b for b in _BASIS_ORDER if front_all.get(b) and rear_all.get(b)), "")
+    if not fb:
+        f_label = _BASIS_LABEL[next(b for b in _BASIS_ORDER if front_all.get(b))]
+        r_label = _BASIS_LABEL[next(b for b in _BASIS_ORDER if rear_all.get(b))]
+        check.problems.append(f"두 영상의 GPS 시각 기준이 달라 대조할 수 없습니다: 전방 {f_label}, 후방 {r_label}")
+        return
+    front, rear = front_all[fb], rear_all[fb]
+    check.gps_time_basis = fb
+    if fb == BASIS_FILENAME:
+        check.notes.append("GPS에 UTC가 없는 기기라 파일명 시각+경과 초(기기 현지 시각) 기준으로 대조했습니다.")
+    elif fb == BASIS_ELAPSED:
+        check.notes.append("GPS에 절대 시각이 없어 기록의 경과 초 기준으로 대조했습니다(파일명 시각이 없는 사본).")
+    if fb in (BASIS_UTC, BASIS_FILENAME):
+        check.front_gps_start, check.rear_gps_start = front[0][0], rear[0][0]
+    offset = _key_diff_sec(rear[0][0], front[0][0])
     check.gps_start_offset_sec = offset
     if abs(offset) > GPS_START_TOLERANCE_SEC:
-        from core import gpstime
-        f_disp = gpstime.format_display(front[0][0].strftime("%Y-%m-%d"), front[0][0].strftime("%H:%M:%S"))
-        r_disp = gpstime.format_display(rear[0][0].strftime("%Y-%m-%d"), rear[0][0].strftime("%H:%M:%S"))
-        check.problems.append(f"GPS 시각이 다릅니다: 전방 {f_disp} 시작, 후방 {r_disp} 시작 ({_fmt_offset(offset)})")
+        check.problems.append(f"GPS 시각이 다릅니다: 전방 {_fmt_start(fb, front[0][0])} 시작, "
+                              f"후방 {_fmt_start(fb, rear[0][0])} 시작 ({_fmt_offset(offset)})")
 
     front_by_time = {t: (lat, lon) for t, lat, lon in front if lat is not None}
     distances = []
@@ -441,15 +551,28 @@ def compare_gps(check: PairCheck, front_points, rear_points) -> None:
         check.notes.append("같은 시각의 좌표가 3개 미만이라 좌표는 비교하지 않았습니다.")
 
 
+def _damage_summary(path: str, cancel_event: Optional[threading.Event] = None) -> Optional[List[str]]:
+    """엔진이 실패한 파일의 손상 검사 요약. 손상이 없거나 검사를 못 하면 None."""
+    try:
+        from core.damage import scan_damage
+        report = scan_damage(path, cancel_event=cancel_event)
+    except Exception:  # noqa: BLE001 - 검사 자체가 죽어도 대조 결과는 내야 한다
+        return None
+    return report.summary_lines() if report.damaged else None
+
+
 def compare_pair_full(front_path: str, rear_path: str, workdir: Optional[str] = None,
                       cancel_event: Optional[threading.Event] = None,
                       progress: Optional[Callable[[str], None]] = None) -> PairCheck:
     """빠른 검사 + 엔진을 두 파일에 돌려 GPS 시각·좌표 대조. workdir을 안 주면 임시 폴더를 만들고
-    끝나면 지운다. cancel_event가 서면 cancelled=True로 돌려준다."""
+    끝나면 지운다. cancel_event가 서면 cancelled=True로 돌려준다. 빠른 검사에서 이미 막혔으면 엔진을
+    돌리지 않는다(리뷰 #49)."""
     from engine import engine_adapter as _ea
 
-    check = compare_pair(front_path, rear_path)
-    if os.path.abspath(front_path) == os.path.abspath(rear_path):
+    if progress:
+        progress("파일 정보를 비교하는 중...")
+    check = compare_pair(front_path, rear_path, cancel_event=cancel_event)
+    if check.problems or check.cancelled or os.path.abspath(front_path) == os.path.abspath(rear_path):
         return check
     own_dir = workdir is None
     base = workdir or tempfile.mkdtemp(prefix="idas-pair-")
@@ -464,9 +587,25 @@ def compare_pair_full(front_path: str, rear_path: str, workdir: Optional[str] = 
             out_dir = os.path.join(base, "front" if label == "전방" else "rear")
             os.makedirs(out_dir, exist_ok=True)
             results[label] = _ea.run_full_extraction(path, out_dir, cancel_event=cancel_event)
-            if results[label].status not in ("ok", "no_gps"):
-                # 엔진 실패·시간 초과는 'GPS 기록 없음'이 아니다(리뷰 #100).
-                check.problems.append(f"{label} 영상 분석 실패: {results[label].status_message}")
+            # 엔진 실패·시간 초과·미지원만 실패다(리뷰 #100). gps_untrusted(측위 전 V 기록만 있는 정상 영상)는
+            # 엔진이 실패한 것이 아니라 시각 대조로 넘긴다(리뷰 #53).
+            if results[label].status not in (_ea.STATUS_OK, _ea.STATUS_NO_GPS, _ea.STATUS_GPS_UNTRUSTED):
+                if cancel_event is not None and cancel_event.is_set():
+                    check.cancelled = True
+                    return check
+                if progress:
+                    progress(f"{label} 영상의 손상 여부를 검사하는 중...")
+                # 손상 검사 전에 원본으로 대조하므로 손상된 전방은 여기서 막혔다(리뷰 #131). 손상이면 코드로
+                # 알려 UI가 '대조 불가'를 확인받고 진행할 수 있게 한다(검증 없이 조용히 통과시키지는 않는다).
+                summary = _damage_summary(path, cancel_event)
+                if summary:
+                    check.code = "damaged"
+                    check.damaged_files[label] = summary
+                    check.problems.append(f"{label} 영상이 손상돼 GPS 기록을 읽지 못해 대조할 수 없습니다 "
+                                          f"({' / '.join(summary)}).")
+                else:
+                    check.code = check.code or "engine_failed"
+                    check.problems.append(f"{label} 영상 분석 실패: {results[label].status_message}")
         if cancel_event is not None and cancel_event.is_set():
             check.cancelled = True
             return check
