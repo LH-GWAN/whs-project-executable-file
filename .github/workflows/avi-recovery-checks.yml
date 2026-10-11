@@ -1,0 +1,98 @@
+name: IDAS regression (AVI and MP4 recovery)
+
+on:
+  push:
+    branches: [avi-damage-recovery, mp4-damage-recovery]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-full
+            os: ubuntu-24.04
+          - name: windows-full
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QTWEBENGINE_DISABLE_SANDBOX: "1"
+      QTWEBENGINE_CHROMIUM_FLAGS: --disable-gpu
+      # Hosted runners have no reliable GPU decode surfaces; exercise real
+      # Qt playback with software decoding, including stop/release teardown.
+      QT_FFMPEG_DECODING_HW_DEVICE_TYPES: ","
+      QT_DISABLE_HW_TEXTURES_CONVERSION: "1"
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Linux FFmpeg and Qt libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libegl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0 libnss3 libasound2t64 libxss1 libxtst6 libxkbfile1 libdbus-1-3
+      - name: Install Windows FFmpeg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Pinned upstream-listed Gyan build, independent of the Chocolatey
+          # feed. Verify the publisher's archive hash before running binaries.
+          $archive = Join-Path $env:RUNNER_TEMP "ffmpeg-9.0.2.zip"
+          $unpack = Join-Path $env:RUNNER_TEMP "ffmpeg-9.0.2"
+          curl.exe --fail --location --retry 3 --retry-all-errors --connect-timeout 20 --max-time 180 --output $archive https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg download failed" }
+          $expected = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "FFmpeg archive SHA-256 mismatch" }
+          Expand-Archive -Path $archive -DestinationPath $unpack -Force
+          $exe = Get-ChildItem -Path $unpack -Filter ffmpeg.exe -Recurse -File | Select-Object -First 1
+          if (-not $exe -or -not (Test-Path (Join-Path $exe.DirectoryName "ffprobe.exe"))) { throw "FFmpeg/FFprobe not installed" }
+          $exe.DirectoryName | Add-Content $env:GITHUB_PATH
+          & $exe.FullName -version
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg cannot run" }
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "PySide6==6.11.2"
+      - name: Verify dependencies and Python syntax
+        run: |
+          python -m pip check
+          python --version
+          ffmpeg -version
+          ffprobe -version
+          node --version
+          python -m compileall -q app.py core engine ui storage report tests
+          python -m core.avi_recovery --help
+          python -m core.mp4_recovery --help
+      - name: Full pytest including real AVI/MP4 decode and Qt cases
+        timeout-minutes: 5
+        run: python -m pytest -vv -ra -o faulthandler_timeout=60 tests --junitxml=test-results.xml
+      - name: Require complete test execution
+        shell: python
+        run: |
+          import xml.etree.ElementTree as ET
+          suites = ET.parse("test-results.xml").getroot().findall("testsuite")
+          totals = {key: sum(int(s.get(key, 0)) for s in suites) for key in ("tests", "failures", "errors", "skipped")}
+          print(totals)
+          assert totals["tests"] >= 263, totals
+          assert totals["failures"] == totals["errors"] == totals["skipped"] == 0, totals
+      - name: Save test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-test-results
+          path: test-results.xml
+          if-no-files-found: warn
