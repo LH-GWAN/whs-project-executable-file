@@ -142,21 +142,27 @@ def test_reset_map_mode_removes_key_from_file(config_dir):
     assert "map_mode" not in json.loads((config_dir / "settings.json").read_text(encoding="utf-8"))
 
 
-def test_save_config_aborts_when_existing_file_unreadable(config_dir):
+def test_save_config_aborts_when_existing_file_unreadable(config_dir, monkeypatch):
+    """파일이 있는데 읽지 못하면(잠김·권한) 저장을 멈춘다. chmod는 Windows·root에서 읽기를 못 막으므로
+    open()이 그 파일에 대해 PermissionError를 내도록 바꿔 플랫폼과 무관하게 검사한다."""
+    import builtins
     from core import appconfig
     assert appconfig.save_config({"map_mode": "offline", "kakao_js_key": "keep-me"})
     path = config_dir / "settings.json"
-    if os.name == "nt":
-        pytest.skip("Windows는 chmod(0)으로 읽기를 막을 수 없다")
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        pytest.skip("root는 권한 검사를 거치지 않는다")
     original = path.read_bytes()
-    os.chmod(path, 0)
+    real_open = builtins.open
+
+    def locked_open(file, mode="r", *args, **kwargs):
+        if os.path.abspath(str(file)) == os.path.abspath(str(path)) and "r" in mode:
+            raise PermissionError(13, "Permission denied", str(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", locked_open)
     try:
         assert appconfig.save_config({"map_mode": "online"}) is False
         assert appconfig.reset_map_mode() is False
     finally:
-        os.chmod(path, 0o644)
+        monkeypatch.setattr(builtins, "open", real_open)
     assert path.read_bytes() == original        # 파일을 덮지 않았다(키 덮어쓰기 값 보존)
     assert appconfig.get_map_mode() == "offline"   # 캐시도 바꾸지 않았다
 
