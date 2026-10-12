@@ -161,7 +161,7 @@ REM The exe cannot be moved out of dist\IDAS on its own: a one-dir
 REM build needs the _internal folder sitting right next to it. So we put
 REM a shortcut here instead - double-click it and the app starts.
 set "APPDIR=%CD%\dist\IDAS"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%CD%\IDAS.lnk');$s.TargetPath='%APPDIR%\IDAS.exe';$s.WorkingDirectory='%APPDIR%';$s.Description='IDAS';$s.Save()"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%CD%\IDAS.lnk');$s.TargetPath='%APPDIR%\IDAS.exe';$s.WorkingDirectory='%APPDIR%';$s.Description='IDAS';$s.IconLocation='%APPDIR%\IDAS.exe,0';$s.Save()"
 if not exist "IDAS.lnk" (
     echo [WARN] Could not create the shortcut.
     echo        Run the app directly: dist\IDAS\IDAS.exe

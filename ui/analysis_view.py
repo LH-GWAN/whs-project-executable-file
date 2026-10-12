@@ -543,8 +543,8 @@ class AnalysisView(QWidget):
 
     # ---------- 무결성 표시등 ----------
     def _set_integrity(self, state: str, detail: str) -> None:
-        colors = {"pending": "#b0b0b0", "ok": "#2fb344", "bad": "#e03131", "none": "#b0b0b0"}
-        self._integrity_dot.setStyleSheet(f"color: {colors.get(state, '#b0b0b0')}; font-size: 14px;")
+        colors = {"pending": "#5e6873", "ok": "#3ddc97", "bad": "#ff5a5f", "none": "#5e6873"}
+        self._integrity_dot.setStyleSheet(f"color: {colors.get(state, '#5e6873')}; font-size: 14px;")
         tips = {
             "pending": "원본과 사본 해시 비교 중…",
             "ok": "원본 해시와 사건 폴더 사본의 해시가 같습니다 (무결성 확인)",

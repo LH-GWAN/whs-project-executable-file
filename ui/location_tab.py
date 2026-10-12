@@ -27,14 +27,14 @@ from ui.dataset_view import COMPOSED_LABEL, DatasetView, fill_view_bar, make_vie
 from ui.map_view import MapView, is_synthetic_point
 
 _EVENT_ROW_ALPHA = 60   # 위험운전 행 배경(종류별 색을 옅게)
-_OUTLIER_COLOR = QColor(200, 110, 0)
-_LINK_COLOR = QColor(30, 100, 200)
+_OUTLIER_COLOR = QColor("#f5b041")      # 어두운 배경용(이상치)
+_LINK_COLOR = QColor("#6fb7ff")
 _EVENT_COLUMN = COL_EVENT
 _MAP_LINK_COLUMN = COL_LINK
 # 이어보기의 "영상" 칸. 논리 번호는 맨 뒤(기존 칸 번호를 그대로 두려고)지만 화면에서는 맨 앞에 둔다.
 _SEGMENT_COLUMN = len(COLUMNS)
-_DROPOUT_COLOR = QColor(190, 110, 40)
-_IMPACT_COLOR = QColor(200, 60, 60)
+_DROPOUT_COLOR = QColor("#d99a5b")
+_IMPACT_COLOR = QColor("#ff5a5f")
 _IMPACT_G = IMPACT_G   # 충격 행 기준은 표·리포트와 같은 값(리뷰 #113)
 
 
@@ -73,7 +73,7 @@ class LocationTab(QWidget):
         # 고른 행의 주소. 표 전체에 주소 열을 두면 지점 수만큼(수천 건) 조회가 나가므로
         # 사용자가 고른 한 지점만 조회한다. 온라인 모드에서만 채워진다.
         self._selected_label = QLabel("")
-        self._selected_label.setStyleSheet("color: #555; padding: 2px 4px;")
+        self._selected_label.setStyleSheet("color: #9aa4ae; padding: 2px 4px;")
         self._selected_key = None
         self._resolver = AddressResolver.instance()
         self._resolver.resolved.connect(self._on_address_resolved)
@@ -85,7 +85,7 @@ class LocationTab(QWidget):
         # 손상 파일: 어느 구간이 손상이고 어떻게 처리했는지(임의복구/복구하지 않음) 표 위에 적는다.
         self._damage_label = QLabel("")
         self._damage_label.setWordWrap(True)
-        self._damage_label.setStyleSheet("color: #c92a2a; padding: 2px 4px;")
+        self._damage_label.setStyleSheet("color: #ff5a5f; padding: 2px 4px;")
         self._damage_label.hide()
         table_layout.addWidget(self._damage_label)
         table_layout.addWidget(self._selected_label)
@@ -238,11 +238,11 @@ class LocationTab(QWidget):
                 lon_item.setForeground(_DROPOUT_COLOR)
             elif rec.recovery_state == "damaged":
                 for it in items:
-                    it.setForeground(QColor("#c92a2a"))
+                    it.setForeground(QColor("#ff5a5f"))
                     it.setToolTip("손상 구간: 파일의 이 부분을 읽을 수 없어 기록이 없습니다.")
             elif rec.recovery_state == "interpolated":
                 for it in (lat_item, lon_item, items[COL_CHECK]):
-                    it.setForeground(QColor("#9c36b5"))
+                    it.setForeground(QColor("#b97cff"))
                     it.setToolTip("임의 복구: 손상 직전 좌표와 손상 뒤 첫 좌표를 직선으로 이은 추정값입니다. 측정값이 아닙니다.")
             g = rec.g_magnitude
             if g is not None and g >= _IMPACT_G:

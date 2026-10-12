@@ -36,7 +36,7 @@ class MapModeDialog(QDialog):
             "  · 사건 GPS 좌표가 외부로 나가지 않습니다.\n"
             "  · 지도 파일(수십~수백 MB)을 한 번 내려받아 넣어야 합니다."
         )
-        offline_desc.setStyleSheet("color: #555;")
+        offline_desc.setStyleSheet("color: #9aa4ae;")
 
         keys = online_keys()
         keys_ok = bool(keys["js"])
@@ -51,13 +51,13 @@ class MapModeDialog(QDialog):
             online_lines.append("  ※ API 키가 아직 없습니다. 고르면 발급·등록 방법을 안내하는 창이 뜨고,\n"
                                 "     키를 넣기 전까지는 오프라인 지도로 표시됩니다.")
         online_desc = QLabel("\n".join(online_lines))
-        online_desc.setStyleSheet("color: #555;")
+        online_desc.setStyleSheet("color: #9aa4ae;")
 
         warn = QLabel(
             "온라인 지도는 화면에 보이는 위치 범위가, 주소 표시는 해당 좌표가 카카오 서버로\n"
             "전송됩니다. 사건 자료의 기밀이 중요하다면 오프라인을 사용하세요."
         )
-        warn.setStyleSheet("color: #b34; padding-top: 6px;")
+        warn.setStyleSheet("color: #ff5a5f; padding-top: 6px;")
         warn.setWordWrap(True)
 
         if current == MAP_MODE_ONLINE:

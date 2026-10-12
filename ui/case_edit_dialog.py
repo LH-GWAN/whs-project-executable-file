@@ -38,7 +38,7 @@ class CaseEditDialog(QDialog):
 
         note = QLabel("사건 폴더 이름과 원본 사본·분석 결과는 바뀌지 않습니다. 이력 목록과 case.json, 리포트에 반영됩니다.")
         note.setWordWrap(True)
-        note.setStyleSheet("color: #666; font-size: 11px;")
+        note.setStyleSheet("color: #9aa4ae; font-size: 11px;")
 
         save_btn = QPushButton("저장")
         save_btn.setProperty("role", "primary")
@@ -65,7 +65,7 @@ class CaseEditDialog(QDialog):
     def _on_save(self) -> None:
         number = self._case_number.text().strip()
         if not number:
-            self._case_number.setStyleSheet("border: 1px solid red;")
+            self._case_number.setStyleSheet("border: 1px solid #ff5a5f;")
             return
         self.result_values = (number, self._examiner.text().strip(), self._memo.toPlainText().strip())
         self.accept()

@@ -141,7 +141,7 @@ class _VideoPane(QWidget):
         super().__init__(parent)
         self._caption = QLabel("")
         self._caption.setAlignment(Qt.AlignCenter)
-        self._caption.setStyleSheet("color: #8a8a8a; font-size: 11px;")
+        self._caption.setStyleSheet("color: #9aa4ae; font-size: 11px;")
         self._caption.setFixedHeight(16)
         self._caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         # QVideoWidget은 안에 네이티브 영상 창을 둔다. Windows에서 전방을 눌러 키우면 그 창이 커지며
@@ -368,7 +368,7 @@ class TrackerTab(QWidget):
         self._media_label = QLabel("")
         self._media_label.setWordWrap(True)
         self._media_label.setTextFormat(Qt.PlainText)
-        self._media_label.setStyleSheet("color: #b36b00;")
+        self._media_label.setStyleSheet("color: #f5b041;")
 
         # 영상 위: 재생 지점의 GPS 기록 시각. GPS는 UTC로 찍히므로 한국 시간으로 옮기고
         # "(UTC+9)"를 붙인다. GPS가 없는 순간에는 마지막 시각을 그대로 둔다.
@@ -398,13 +398,13 @@ class TrackerTab(QWidget):
         self._speed_label.setFont(speed_font)
         self._coord_label = QLabel("위치 -")
         self._addr_label = _ElideLabel()
-        self._addr_label.setStyleSheet("color: #666;")
+        self._addr_label.setStyleSheet("color: #9aa4ae;")
         self._addr_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._status_label = QLabel("")
         status_font = self._status_label.font()
         status_font.setBold(True)
         self._status_label.setFont(status_font)
-        self._status_label.setStyleSheet("color: #b36b00;")
+        self._status_label.setStyleSheet("color: #f5b041;")
         self._status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._speed_label.setFixedWidth(self._speed_label.fontMetrics().horizontalAdvance("속도 000.0 km/h") + 8)
         self._coord_label.setFixedWidth(self._coord_label.fontMetrics().horizontalAdvance("위치 -00.000000, -000.000000") + 8)
@@ -433,7 +433,7 @@ class TrackerTab(QWidget):
 
         # 이어보기에서 지금 재생 중인 영상(예: "영상 2/3 · video2"). 영상이 하나면 숨긴다.
         self._segment_label = QLabel("")
-        self._segment_label.setStyleSheet("color: #666;")
+        self._segment_label.setStyleSheet("color: #9aa4ae;")
         self._segment_label.hide()
         clock_row = QHBoxLayout()
         clock_row.setContentsMargins(0, 0, 0, 0)

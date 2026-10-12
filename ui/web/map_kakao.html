@@ -7,38 +7,38 @@
      출처를 항상 보내도록 고정한다(안 보내면 도메인 검사 이전에 다른 이유로 거절된다). -->
 <meta name="referrer" content="origin">
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; background: #eef1f4; overflow: hidden; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #0f1215; overflow: hidden; }
   #map { position: absolute; inset: 0; }
 
   /* 카카오 로고가 지도 왼쪽 아래에 그려진다(약관상 가리면 안 됨). 상태 표시는 그 오른쪽에 둔다. */
   #status {
     position: absolute; left: 96px; bottom: 8px; z-index: 5;
-    background: rgba(255,255,255,.92); border: 1px solid #ccc; border-radius: 3px;
-    padding: 4px 8px; font: 11px -apple-system, "Malgun Gothic", sans-serif; color: #444;
+    background: rgba(29,34,40,.94); border: 1px solid #2a3139; border-radius: 4px;
+    padding: 4px 8px; font: 11px -apple-system, "Malgun Gothic", sans-serif; color: #9aa4ae;
     max-width: 55%;
   }
   #legend {
     position: absolute; right: 8px; top: 8px; z-index: 5;
-    background: rgba(255,255,255,.92); border: 1px solid #ccc; border-radius: 3px;
-    padding: 6px 9px; font: 11px -apple-system, "Malgun Gothic", sans-serif; color: #333;
+    background: rgba(29,34,40,.94); border: 1px solid #2a3139; border-radius: 4px;
+    padding: 8px 10px; font: 11.5px -apple-system, "Malgun Gothic", sans-serif; color: #e8ecef;
   }
   #legend div { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
   #legend i { width: 16px; height: 0; border-top-width: 3px; border-top-style: solid; }
   #followBtn {
     position: absolute; right: 8px; bottom: 8px; z-index: 6;
-    border: 1px solid #ccc; border-radius: 3px; padding: 5px 10px; cursor: pointer;
-    font: 11px -apple-system, "Malgun Gothic", sans-serif;
-    background: rgba(255,255,255,.92); color: #666;
+    border: 1px solid #2a3139; border-radius: 4px; padding: 6px 12px; cursor: pointer;
+    font: 11.5px -apple-system, "Malgun Gothic", sans-serif;
+    background: rgba(29,34,40,.94); color: #9aa4ae;
   }
-  #followBtn.on { background: #1c7ed6; border-color: #1c7ed6; color: #fff; }
+  #followBtn.on { background: #3ddc97; border-color: #3ddc97; color: #07130d; font-weight: 600; }
 
   .trk-dot {
     width: 14px; height: 14px; border-radius: 50%;
     border: 2px solid #fff; box-shadow: 0 0 3px rgba(0,0,0,.45); box-sizing: border-box;
   }
-  .trk-start { background: #1a9e5c; }
+  .trk-start { background: #3ddc97; }
   .trk-end { background: #111111; }
-  .trk-pos { width: 18px; height: 18px; border-width: 3px; background: #1c7ed6; }
+  .trk-pos { width: 18px; height: 18px; border-width: 3px; background: #3ddc97; }
   /* 임의 복구의 추정 좌표 위에 있을 때(리뷰 #21) */
   .trk-wrap.est .trk-pos { background: #9c36b5; }
   .trk-wrap.est .trk-arrow svg path { fill: #9c36b5; }
@@ -46,7 +46,7 @@
   .trk-arrow { width: 26px; height: 26px; transform-origin: 50% 50%; }
   .trk-arrow svg { display: block; width: 26px; height: 26px; }
   #legend .lg-arrow { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent;
-    border-bottom: 12px solid #1c7ed6; display: inline-block; margin: 0 2px; }
+    border-bottom: 12px solid #3ddc97; display: inline-block; margin: 0 2px; }
   /* 위험운전 이름표: 지점 위에 말풍선처럼 단다. 마우스를 올리면 시각·판정 근거가 뜬다. */
   #legend #legend-events { display: block; margin: 0; }
   .ev-tag {
@@ -67,9 +67,9 @@
 <body>
 <div id="map"></div>
 <div id="legend">
-  <div><i style="border-color:#1a9e5c"></i> 주행 경로</div>
+  <div><i style="border-color:#3ddc97"></i> 주행 경로</div>
   <div id="legend-events"></div>
-  <div><i style="border-color:#9aa4ad; border-top-style:dashed"></i> GPS 끊김 구간</div>
+  <div><i style="border-color:#7d8790; border-top-style:dashed"></i> GPS 끊김 구간</div>
   <div><span class="lg-arrow"></span> 현재 위치 (진행 방향)</div>
 </div>
 <button id="followBtn" class="on" title="영상 재생에 맞춰 지도를 따라 움직입니다">따라가기 켜짐</button>
@@ -207,7 +207,7 @@ function makePosOverlay() {
   posWrapEl.className = "trk-wrap";
   posArrowEl = document.createElement("div");
   posArrowEl.className = "trk-arrow";
-  posArrowEl.innerHTML = '<svg viewBox="0 0 64 64"><path d="M32 4 L58 58 L32 45 L6 58 Z" fill="#1c7ed6" stroke="#ffffff" stroke-width="5" stroke-linejoin="round"/></svg>';
+  posArrowEl.innerHTML = '<svg viewBox="0 0 64 64"><path d="M32 4 L58 58 L32 45 L6 58 Z" fill="#3ddc97" stroke="#ffffff" stroke-width="5" stroke-linejoin="round"/></svg>';
   posDotEl = document.createElement("div");
   posDotEl.className = "trk-dot trk-pos";
   posDotEl.style.display = "none";
@@ -324,7 +324,7 @@ function buildRuns(points) {
 
 const LINE_STYLES = {
   dashed: { strokeWeight: 3, strokeColor: "#9aa4ad", strokeOpacity: 0.9, strokeStyle: "dashed", zIndex: 1 },
-  solid: { strokeWeight: 5, strokeColor: "#1a9e5c", strokeOpacity: 0.9, strokeStyle: "solid", zIndex: 2 },
+  solid: { strokeWeight: 5, strokeColor: "#3ddc97", strokeOpacity: 0.9, strokeStyle: "solid", zIndex: 2 },
   // 손상 파일: 임의 복구(추정 좌표)는 보라 점선, 복구하지 않은 손상 구간은 검정 긴 점선.
   // 색은 ui/map_view.py의 INTERPOLATED_COLOR / DAMAGED_COLOR와 같다(급가속 빨강과 겹치지 않게 - 리뷰 #55).
   interp: { strokeWeight: 5, strokeColor: "#9c36b5", strokeOpacity: 0.9, strokeStyle: "shortdash", zIndex: 2 },

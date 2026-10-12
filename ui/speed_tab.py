@@ -47,7 +47,7 @@ class SpeedTab(QWidget):
         # 손상 파일: 손상 구간은 그래프를 비우고 여기에 구간을 적는다(사용자 결정).
         self._damage_label = QLabel("")
         self._damage_label.setWordWrap(True)
-        self._damage_label.setStyleSheet("color: #c92a2a; padding: 2px 4px;")
+        self._damage_label.setStyleSheet("color: #ff5a5f; padding: 2px 4px;")
         self._damage_label.hide()
 
         layout = QVBoxLayout(self)

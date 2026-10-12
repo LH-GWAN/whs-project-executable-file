@@ -31,14 +31,14 @@ class SlackTab(QWidget):
             "시각은 슬랙 첫 기록을 0초로 둔 경과 초이며, 지도·표·그래프 모두 그 기준입니다.")
         note.setWordWrap(True)
         note.setAlignment(Qt.AlignCenter)
-        note.setStyleSheet("color: #666;")
+        note.setStyleSheet("color: #9aa4ae;")
         summary = QLabel(slack.summary)
         summary.setAlignment(Qt.AlignCenter)
         summary.setWordWrap(True)
 
         panel = QWidget()
         panel.setObjectName("SlackPanel")
-        panel.setStyleSheet("#SlackPanel { background: #111; border-radius: 4px; }")
+        panel.setStyleSheet("#SlackPanel { background: #161a1f; border: 1px solid #2a3139; border-radius: 4px; }")
         panel_layout = QVBoxLayout(panel)
         panel_layout.addStretch(1)
         panel_layout.addWidget(title)
@@ -47,7 +47,7 @@ class SlackTab(QWidget):
         panel_layout.addWidget(summary)
         panel_layout.addStretch(1)
         for w in (title, note, summary):
-            w.setStyleSheet(w.styleSheet() + " color: #ddd;")
+            w.setStyleSheet(w.styleSheet() + " color: #e8ecef;")
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(panel)

@@ -60,6 +60,11 @@ for _keys in _asset_files(".json", ".txt"):
     if os.path.basename(_keys).lower() != "readme.txt":
         web_datas.append((_keys, "assets"))
 
+# 앱 아이콘(창·작업 표시줄·시작 화면). exe 아이콘은 아래 EXE(icon=)이 같은 파일을 쓴다.
+_ICON = os.path.join(_ASSETS, "idas.ico")
+for _img in _asset_files(".ico", ".png"):
+    web_datas.append((_img, "assets"))
+
 a = Analysis(
     ["app.py"],
     pathex=[],
@@ -121,6 +126,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=_ICON if os.path.isfile(_ICON) else None,
 )
 
 coll = COLLECT(

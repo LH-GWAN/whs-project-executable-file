@@ -55,6 +55,7 @@ class HomeView(QWidget):
         self._upload_box.setMinimumSize(360, 220)
         upload_layout = QVBoxLayout(self._upload_box)
         upload_btn = QPushButton("Upload")
+        upload_btn.setProperty("role", "primary")   # 시안: 민트 강조 버튼
         upload_btn.clicked.connect(self._on_upload_clicked)
         # 전방/후방 같이 보기: 켜 두면 전방 파일을 고른 뒤 후방 파일을 하나 더 고른다.
         # 같은 폴더에 _F/_R 짝이 있으면 그 파일을 기본값으로 띄운다.
@@ -84,7 +85,7 @@ class HomeView(QWidget):
 
         history_heading = QLabel("History")
         hint = QLabel("더블클릭: 열기 · 우클릭: 사건 정보 수정/삭제 · Delete 키: 삭제 · Ctrl/Shift 클릭: 여러 개 선택")
-        hint.setStyleSheet("color: #777; font-size: 11px;")
+        hint.setStyleSheet("color: #5e6873; font-size: 11px;")
 
         self._history_list = QListWidget()
         self._history_list.setSelectionMode(QListWidget.ExtendedSelection)

@@ -121,12 +121,24 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     from ui.main_window import MainWindow
+    from ui.splash import SPLASH_SECONDS, app_icon, show_splash
     from ui.styles import APP_QSS
 
     app = QApplication(sys.argv)
     app.setStyleSheet(APP_QSS)
+    icon = app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
+    # 시작 화면: 아이콘 그림을 약 2초 보여 준 뒤 메인 창을 띄운다(창 준비 시간도 그 안에 포함).
+    splash = show_splash(app)
     window = MainWindow()
+    if icon is not None:
+        window.setWindowIcon(icon)
+    if splash is not None:
+        splash.wait_until(SPLASH_SECONDS)
     window.show()
+    if splash is not None:
+        splash.finish(window)
     return app.exec()
 
 
